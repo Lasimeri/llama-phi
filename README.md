@@ -16,7 +16,7 @@ the measurements. llama.cpp itself is used unmodified at a pinned commit.
 |---|---|---|
 | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | `4b77dee` | nothing: build flags only (`scripts/setup.sh`) |
 | [Lasimeri/Intel-Phi-AVX-512-C](https://github.com/Lasimeri/Intel-Phi-AVX-512-C) | `db092f6` | `patches/intel-phi-avx-512-c.patch`: card worker, ggml backend, preload |
-| [Lasimeri/Intel-Phi-7120A](https://github.com/Lasimeri/Intel-Phi-7120A) | `22712a2` | `patches/intel-phi-7120a-phitop.patch`: phitop shows the worker's DMA |
+| [Lasimeri/Intel-Phi-7120A](https://github.com/Lasimeri/Intel-Phi-7120A) | `22712a2` | `patches/intel-phi-7120a-phitop.patch`: phitop shows the worker's DMA; the card no longer swaps into host memory (`PHI_SWAP_HOSTMEM=1` opts in) |
 
 ## Measured
 
@@ -95,7 +95,9 @@ An NVIDIA GPU can take prompt prefill and the KV cache while the weights stay in
 host RAM and on the card: `scripts/serve.sh` (one llama-server, OpenAI API on
 127.0.0.1:8095). It also has CUDA kernels that drive the card worker by DMA
 and a two-server prefill/generation overlap. Layout, the scheduler setting it
-needs, and measurements: [docs/cuda.md](docs/cuda.md).
+needs, and measurements: [docs/cuda.md](docs/cuda.md). The DMA router that serves
+a model with its weights in host RAM and on the card while the GPU does every
+prompt (no disk reads during inference): [docs/router.md](docs/router.md).
 
 ## Use
 

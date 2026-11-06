@@ -176,7 +176,7 @@ index 4d66789..e511976 100644
    worker's (`vpu_worker.md`, "What a dispatch costs").
  - **The per-thread block**: the thread pointer convention wants the
 diff --git a/card/vpu/matmul.S b/card/vpu/matmul.S
-index 6451e1b..ea3a966 100644
+index 6451e1b..05651e7 100644
 --- a/card/vpu/matmul.S
 +++ b/card/vpu/matmul.S
 @@ -167,5 +167,6 @@ copy_pool:
@@ -246,7 +246,56 @@ index 6451e1b..ea3a966 100644
 +79:	leaq 63(%r12), %r15
  	shrq $6, %r15
  	xorl %eax, %eax
-@@ -3244,4 +3285,6 @@ r_big:	.skip 8
+@@ -1686,5 +1727,47 @@ vpu_matmul_run:
+ 	jmp .Lok
+ 
+-5:	# MATMUL, MATMUL_ID, MATMUL_MORE
++5:	cmpq $K_DOWNLOAD, r_kernel(%rip)
++	jne 59f
++	# K_DOWNLOAD (2026-11-06): bytes [a_off, a_off + bytes) of the resident
++	# a_id pushed to the window at d_off by push_data (the DMA channel
++	# first), so the host's GPU can take a card-held matrix back for a
++	# prompt's multiply without a copy of it in host memory
++	cmpq $0, MM_A_ID(%rbx)
++	je .Lbad
++	cmpq $0, MM_BYTES(%rbx)
++	je .Lbad
++	movq MM_A_OFF(%rbx), %rax
++	orq MM_D_OFF(%rbx), %rax
++	testq $VPU_BLOCK - 1, %rax
++	jnz .Lbad
++	movq MM_A_ID(%rbx), %rdi
++	call cache_find
++	testq %rax, %rax
++	js .Lbad
++	imulq $CE_SIZE, %rax, %r13
++	leaq g_cache(%rip), %rcx
++	addq %rcx, %r13				# the entry
++	movq MM_A_OFF(%rbx), %rax
++	addq MM_BYTES(%rbx), %rax
++	jc .Lbad
++	cmpq CE_BYTES(%r13), %rax
++	ja .Lbad
++	call now_ns
++	movq %rax, r_p0(%rip)
++	movq CE_MAP + MAP_P(%r13), %rdi
++	addq MM_A_OFF(%rbx), %rdi
++	movq MM_BYTES(%rbx), %rsi
++	movq MM_D_OFF(%rbx), %rdx
++	movl r_threads(%rip), %ecx
++	call push_data
++	testl %eax, %eax
++	jnz .Lpush
++	call now_ns
++	subq r_p0(%rip), %rax
++	movq r_ppush(%rip), %rcx
++	movq %rax, (%rcx)
++	jmp .Lok
++
++59:	# MATMUL, MATMUL_ID, MATMUL_MORE
+ 	cmpq $0, MM_M(%rbx)
+ 	je .Lbad_said
+@@ -3244,4 +3327,6 @@ r_big:	.skip 8
  r_rounds:	.skip 8
  r_i:	.skip 8
 +	.globl stat_dma_push
@@ -265,10 +314,18 @@ index 70eb5ef..f0177b0 100644
  	.set OWN_GROUPS_MAX, 512
  	.set MAP_POOL_MAX, 2097152
 diff --git a/card/vpu/matmul.md b/card/vpu/matmul.md
-index 16dc0cd..1f6e2a0 100644
+index 16dc0cd..4566295 100644
 --- a/card/vpu/matmul.md
 +++ b/card/vpu/matmul.md
-@@ -100,2 +100,16 @@ the C worker's after the timing fields are stripped. Defects met on the
+@@ -6,5 +6,6 @@ The card as a matrix-multiply engine for the ggml backend
+ mixture of experts, one matrix per column), `VPU_K_MATMUL_MORE` (several
+ matrices by the same activations in one request), `VPU_K_FFN` (a
+-feed-forward block's share in one request) and `VPU_K_FREE`, with the
++feed-forward block's share in one request), `VPU_K_DOWNLOAD` (a resident tensor's
++bytes back to the window) and `VPU_K_FREE`, with the
+ descriptors of `vpu_matmul.h` (their offsets in `proto.inc`). It replaces
+ `vpu_matmul.c`; the row loops are `rows.S`, the kernels `kernels.S`. The
+@@ -100,2 +101,16 @@ the C worker's after the timing fields are stripped. Defects met on the
  way are in `rows.md`; the fused feed-forward's down projection is the one
  that was here (a matrix pointer read through a clobbered register).
 +
@@ -286,15 +343,34 @@ index 16dc0cd..1f6e2a0 100644
 +`phi-vpu matmul-check` on the 7120A (every format ok, mixtures, up to
 +four matrices, the fused feed-forward) with channel 7 up throughout.
 diff --git a/card/vpu/proto.inc b/card/vpu/proto.inc
-index 8653d9b..6695e75 100644
+index 8653d9b..f497639 100644
 --- a/card/vpu/proto.inc
 +++ b/card/vpu/proto.inc
-@@ -13,4 +13,5 @@
+@@ -13,4 +13,6 @@
  	.set OFF_REPLY, 256
  	.set OFF_STATS, 320		# struct vpu_stats: the worker's running counters, rewritten after every reply (phitop reads them)
 +	.set OFF_CDMA_STATS, 192	# the card DMA channel's traffic (cdma_stats: bytes in, bytes out, copies in, copies out), rewritten after every reply (phitop reads it)
++	.set OFF_LOCK, 15360		# the doorbell lock: host-side clients only (vpu_proto.h)
  	.set OFF_DATA, 1048576
  	.set MAGIC_LO, 0x52454144
+@@ -28,4 +30,5 @@
+ 	.set K_FFN, 7
+ 	.set K_MATMUL_MORE, 8
++	.set K_DOWNLOAD, 32		# past the slot kinds K_PING..K_LAST (9..16)
+ 
+ # Status values.
+diff --git a/card/vpu/proto.md b/card/vpu/proto.md
+index 16d63fa..f873e67 100644
+--- a/card/vpu/proto.md
++++ b/card/vpu/proto.md
+@@ -3,5 +3,6 @@
+ The host/card contract as assembler constants: the offsets of the
+ control words, the request, reply and stats fields (`RQ_*`, `RP_*`,
+-`ST_*`), the request kinds and
++`ST_*`), the request kinds (`K_DOWNLOAD` is 32, clear of the slot kinds 9
++to 16) and
+ status values (`vpu_proto.h`), the seamless path's mailbox, descriptor,
+ register file and slots (`vpu_exec.h`), and the matrix service's
 diff --git a/card/vpu/resident.S b/card/vpu/resident.S
 index 470bd75..821b56d 100644
 --- a/card/vpu/resident.S
@@ -577,11 +653,35 @@ index ae09771..b6bd625 100644
 +`core_base` is 0 and its `core_count` `ncores - 1`, the slot sets
 +`mate_base` 2 so its threads pin to hardware threads 1 and 2, and the
 +slot's control thread pins to CPU 4 (ncores - 1) + 2.
+diff --git a/card/vpu/vpu_matmul.h b/card/vpu/vpu_matmul.h
+index 0df9c2a..e77e14b 100644
+--- a/card/vpu/vpu_matmul.h
++++ b/card/vpu/vpu_matmul.h
+@@ -16,4 +16,5 @@
+ #define VPU_K_FREE   5   /* drop a_id (0: everything) */
+ #define VPU_K_MATMUL_ID 6 /* the same, but a is one expert of a mixture chosen per column (ggml's MUL_MAT_ID) */
++#define VPU_K_DOWNLOAD 32 /* past the slot kinds VPU_K_PING..(9..16) of vpu_fexec.h; push bytes [a_off, a_off + bytes) of the resident a_id to the window at d_off (both block aligned): a card-held matrix back to the host */
+ 
+ #define VPU_OFF_MATMUL 13312   /* struct vpu_matmul, in the control area */
 diff --git a/card/vpu/vpu_matmul.md b/card/vpu/vpu_matmul.md
-index 40c6cb3..3f4c604 100644
+index 40c6cb3..677d761 100644
 --- a/card/vpu/vpu_matmul.md
 +++ b/card/vpu/vpu_matmul.md
-@@ -384,5 +384,7 @@ The section above, "Two threads per core, measured again", found the
+@@ -31,4 +31,13 @@ activations at `VPU_OFF_MORE`: "A layer's gate and up in one request").
+   across the pool's threads (`vpu_pool_map`).
+ - `VPU_K_FREE`: drop a tensor, or all of them.
++- `VPU_K_DOWNLOAD` (32, 2026-11-06): bytes `[a_off, a_off + bytes)` of the
++  resident `a_id` pushed to the window at `d_off` (both block aligned) by
++  `push_data`, the DMA channel first: a card-held matrix back to the host,
++  for a GPU that multiplies a prompt by weights the host does not keep. 32,
++  not 9, because 9 to 16 are the slot protocol's kinds (`K_PING` to
++  `K_LAST`, `vpu_fexec.h`). Measured 2026-11-06 on the 7120A: 10 downloads
++  of a 32 MiB matrix byte-identical to the upload, 0.81 GB/s card to window
++  (each 983,040-byte piece copied into the landing area, then one engine
++  copy, serially), the window to the GPU 13.40 GB/s.
+ 
+ Weight types (`VPU_MM_*`, `a_type`): float32 and float16 rows use the
+@@ -384,5 +393,7 @@ The section above, "Two threads per core, measured again", found the
  second thread no help on a prompt-sized batch (q6_K at n 64, 188 against
  209 GFLOP/s), and the service stayed capped at 58 slices (`POOL_SLOTS`,
 -`map_threads`). It is built for 114 now (`POOL_SLOTS`), because a
@@ -591,17 +691,28 @@ index 40c6cb3..3f4c604 100644
  second thread has issue to spare and a one-token request is issue and
  latency bound, and what stood in its way was fixed cost that grew with
 diff --git a/card/vpu/vpu_proto.h b/card/vpu/vpu_proto.h
-index e2c1ec6..a8e3657 100644
+index e2c1ec6..b60cacd 100644
 --- a/card/vpu/vpu_proto.h
 +++ b/card/vpu/vpu_proto.h
-@@ -35,4 +35,5 @@
+@@ -35,4 +35,6 @@
  #define VPU_OFF_REPLY 256     /* struct vpu_reply */
  #define VPU_OFF_STATS 320     /* struct vpu_stats: the worker's running counters, one line it rewrites after every reply (phitop reads it) */
 +#define VPU_OFF_CDMA_STATS 192   /* the card DMA channel's traffic: u64 bytes into the card, bytes out, copies in, copies out; one line rewritten after every reply (phitop reads it) */
++#define VPU_OFF_LOCK 15360   /* the doorbell lock (2026-11-06): one line host-side clients take (xchg 1) before a request and free (store 0) after its reply, so two of them never ring the card at once; the card never touches it */
  #define VPU_OFF_DATA  (1u << 20)   /* bulk data starts here, page aligned */
  
+diff --git a/card/vpu/vpu_proto.md b/card/vpu/vpu_proto.md
+index 455cd07..511c4e9 100644
+--- a/card/vpu/vpu_proto.md
++++ b/card/vpu/vpu_proto.md
+@@ -34,4 +34,5 @@ that stale memory can satisfy needs a control that fails.
+ | 256 | `struct vpu_reply`, 48 bytes |
+ | 320 | `struct vpu_stats`, 64 bytes: the worker's counters since it started (replies, errors, the sums of their total, compute, pull and push times, the last request's kind, threads and sequence number), rewritten whole after every reply; a host-side reader (the stack's phitop) takes two samples for the rates. The host never writes it |
++| 15360 | the doorbell lock (2026-11-06): a 32-bit test-and-set word host-side clients take before a request and free after its reply (`host/asm/common/window.md`), so two of them never use the one request slot at once; the card never touches it |
+ | 1 MiB | bulk data |
+ 
 diff --git a/card/vpu/worker.S b/card/vpu/worker.S
-index 4566f9d..d5cda6b 100644
+index 4566f9d..2681b92 100644
 --- a/card/vpu/worker.S
 +++ b/card/vpu/worker.S
 @@ -62,4 +62,10 @@ use_dma:	.skip 4			# -d: the card's own DMA channel for the pull (cdma.S)
@@ -704,7 +815,17 @@ index 4566f9d..d5cda6b 100644
 +	movq %rax, TLS_CORE(%rdi)
  	movq $3, TLS_MATE(%rdi)
  	movq %rdi, %rsi
-@@ -737,4 +769,8 @@ main_loop:
+@@ -576,6 +608,9 @@ main_loop:
+ 	cmpl $K_UPLOAD, %eax
+ 	jb .Lreq_poly_or_unknown
++	cmpl $K_DOWNLOAD, %eax
++	je .Lreq_matrix
+ 	cmpl $K_MATMUL_MORE, %eax
+ 	ja .Lreq_unknown
++.Lreq_matrix:
+ 	# the matrix service: (ctrl, kernel, threads, verbose, &compute, &pull, &push, &live)
+ 	subq $16, %rsp
+@@ -737,4 +772,8 @@ main_loop:
  	movl $1, %edx
  	call phi_copy64
 +	leaq OFF_CDMA_STATS(%rbx), %rdi		# the DMA channel's traffic beside it
@@ -713,7 +834,19 @@ index 4566f9d..d5cda6b 100644
 +	call phi_copy64
  	cmpl $0, trace(%rip)
  	je 6f
-@@ -802,5 +838,6 @@ main_loop:
+@@ -751,8 +790,11 @@ main_loop:
+ 	movl vpu_verbose(%rip), %eax
+ 	movl rq+RQ_KERNEL(%rip), %ecx
++	cmpl $K_DOWNLOAD, %ecx
++	je .Lv_matrix
+ 	cmpl $K_UPLOAD, %ecx
+ 	jb 4f
+ 	cmpl $K_MATMUL_MORE, %ecx
+ 	ja 4f
++.Lv_matrix:
+ 	cmpl $1, %eax
+ 	jle main_loop
+@@ -802,5 +844,6 @@ main_loop:
  
  # pool_start: edi pool threads. Counts each core's threads, then creates
 -# them core-major (thread t on core t mod 57, its slot from pool_slot).
@@ -721,14 +854,14 @@ index 4566f9d..d5cda6b 100644
 +# from pool_slot).
  pool_start:
  	pushq %rbx
-@@ -823,5 +860,5 @@ pool_start:
+@@ -823,5 +866,5 @@ pool_start:
  	xorl %ecx, %ecx
  	leaq core_threads(%rip), %rax
 -3:	cmpl $NCORES, %ebx
 +3:	cmpl ncores(%rip), %ebx
  	jge 4f
  	cmpl $0, (%rax,%rbx,4)
-@@ -903,9 +940,11 @@ create_thread:
+@@ -903,9 +946,11 @@ create_thread:
  # pool_slot: the hardware thread of slot esi on core edi: a core's first two
  # threads go to hardware threads 0 and 3, keeping 1 and 2 (where the
 -# card's block-device pollers run) free; core 56's thread 3 is the
@@ -743,7 +876,7 @@ index 4566f9d..d5cda6b 100644
 +	cmpl %eax, %edi
  	je 1f
  	leaq slot_order(%rip), %rax
-@@ -915,4 +954,48 @@ pool_slot:
+@@ -915,4 +960,48 @@ pool_slot:
  	ret
  
 +# count_cores: ncores = -N when given, else the CPUs this process may run
@@ -792,7 +925,7 @@ index 4566f9d..d5cda6b 100644
 +
  # pin_cpu: this thread onto CPU edi.
  pin_cpu:
-@@ -945,8 +1028,11 @@ pool_thread:
+@@ -945,8 +1034,11 @@ pool_thread:
  	movq %fs:TLS_CORE, %r13		# core
  	movq %fs:TLS_MATE, %rsi
 +	addl mate_base(%rip), %esi		# a slot under -O: hardware threads 1 and 2
@@ -805,7 +938,7 @@ index 4566f9d..d5cda6b 100644
 +	cmpl %eax, %edi
  	jb 1f
  	xorl %edi, %edi
-@@ -1311,7 +1397,7 @@ vpu_pool_cores:
+@@ -1311,7 +1403,7 @@ vpu_pool_cores:
  	movl nthreads(%rip), %eax
  	incl %eax
 -	cmpl $NCORES, %eax
@@ -815,7 +948,7 @@ index 4566f9d..d5cda6b 100644
 +	movl ncores(%rip), %eax
  1:	ret
  
-@@ -1662,8 +1748,8 @@ trace_note:
+@@ -1662,8 +1754,8 @@ trace_note:
  	leaq s_tr9(%rip), %rsi
  	call w_str
 -	# its CPU: 1 + 4 core + slot, core = t mod 57, slot from pool_slot
@@ -826,20 +959,20 @@ index 4566f9d..d5cda6b 100644
 +	movl ncores(%rip), %ecx
  	divl %ecx
  	movl %edx, %edi
-@@ -1777,4 +1863,5 @@ stage_note:
+@@ -1777,4 +1869,5 @@ stage_note:
  slot_order:	.byte 0, 3, 1, 2
  s_v:	.asciz "-v"
 +s_O:	.asciz "-O"
  s_t:	.asciz "-t"
  s_s:	.asciz "-s"
-@@ -1787,4 +1874,5 @@ s_C:	.asciz "-C"
+@@ -1787,4 +1880,5 @@ s_C:	.asciz "-C"
  s_T:	.asciz "-T"
  s_R:	.asciz "-R"
 +s_N:	.asciz "-N"
  s_cdma:	.asciz "cdma: "
  s_cdma_up:	.asciz "channel 7 carries the pull: ring and landing area at "
 diff --git a/card/vpu/worker.md b/card/vpu/worker.md
-index 638ed11..d3fad7e 100644
+index 638ed11..97c1de9 100644
 --- a/card/vpu/worker.md
 +++ b/card/vpu/worker.md
 @@ -10,8 +10,12 @@ pole after the whole-expert placement). No libc: system calls direct
@@ -878,7 +1011,16 @@ index 638ed11..d3fad7e 100644
 +  run, free; the last core in order 0..3), pinned by `sched_setaffinity` from
    inside the thread, with a 64 KiB alternate signal stack for the exec
    engine's handlers and a 256 KiB stack. A thread is `clone` with
-@@ -172,2 +176,37 @@ CPU 4c + h + 1 for c < 56; core 56's are CPUs 225, 226, 227 and 0. The
+@@ -78,5 +82,7 @@ dispatches or requests (below).
+   request line in one 64-byte vector load (`phi_copy64`; field by field
+   would be a link round trip each), then by kind: `K_EXEC` to
+-  `vpu_exec_run`, the matrix kinds to `vpu_matmul_run` (the C
++  `vpu_exec_run`, the matrix kinds (`K_UPLOAD` to `K_MATMUL_MORE`, 3 to 8,
++  and `K_DOWNLOAD`, 32, matched exactly so the slot kinds 9 to 16 stay
++  unknown here) to `vpu_matmul_run` (the C
+   signature: control area, kind, threads, verbosity, and pointers for
+   the compute, pull and push times and the slices run), `K_POLY30` here
+@@ -172,2 +178,37 @@ CPU 4c + h + 1 for c < 56; core 56's are CPUs 225, 226, 227 and 0. The
  worker reserves the program's address range first thing
  ([`resident.md`](resident.md)).
 +
@@ -916,8 +1058,63 @@ index 638ed11..d3fad7e 100644
 +After every reply the worker also stores `cdma_stats` at `OFF_CDMA_STATS`
 +(192, `vpu_proto.h`): the DMA channel's bytes and copies each way, which
 +phitop shows on its pcie line (2026-11-06).
+diff --git a/host/asm/common/window.S b/host/asm/common/window.S
+index fd876d8..5a3d586 100644
+--- a/host/asm/common/window.S
++++ b/host/asm/common/window.S
+@@ -180,4 +180,10 @@ wait_ready:
+ 	.globl doorbell
+ doorbell:
++	# the doorbell lock (OFF_LOCK, 2026-11-06): one host-side client at a time;
++	# wait_reply frees it, the card has one request slot
++	pushq %rdi
++	leaq OFF_LOCK(%rdi), %rdi
++	call lock_take
++	popq %rdi
+ 	movq OFF_REQ + RQ_SEQ(%rdi), %rax
+ 	incq %rax				# seq
+@@ -234,5 +240,6 @@ wait_reply:
+ 	jmp 1b
+ 8:	movl $1, %eax
+-9:	popq %r15
++9:	movl $0, OFF_LOCK(%rbx)		# the doorbell lock, freed on every return
++	popq %r15
+ 	popq %r14
+ 	popq %r13
+diff --git a/host/asm/common/window.md b/host/asm/common/window.md
+index a06d5a5..91a70c9 100644
+--- a/host/asm/common/window.md
++++ b/host/asm/common/window.md
+@@ -18,6 +18,6 @@ uncached.
+ | `window_open` | rdi index, rsi len | rax the mapping (read-write, shared), or 0 with the negated errno in rdx and ecx 0 when `open` failed, 1 when `mmap` did |
+ | `wait_ready` | rdi base, rsi timeout ns | the readiness word cleared, then waited for (a live worker re-asserts it within a millisecond; a dead one's stale word would otherwise satisfy a plain read); eax 1 when the worker is polling, 0 on timeout; looks every millisecond |
+-| `doorbell` | rdi base, esi kernel, edx threads | a request for the kernel whose descriptor is already in the control area: the request's fields, a fence, then the sequence number (the one word the card polls), a fence; rax the number |
+-| `wait_reply` | rdi base, rsi seq, rdx timeout ns, rcx out | waits for the reply to the request; the 48-byte reply copied to rcx; eax the reply's status (0 ok, negative a card error), or 1 on timeout |
++| `doorbell` | rdi base, esi kernel, edx threads | takes the doorbell lock at `OFF_LOCK` (2026-11-06), then a request for the kernel whose descriptor is already in the control area: the request's fields, a fence, then the sequence number (the one word the card polls), a fence; rax the number |
++| `wait_reply` | rdi base, rsi seq, rdx timeout ns, rcx out | waits for the reply to the request; the 48-byte reply copied to rcx; eax the reply's status (0 ok, negative a card error), or 1 on timeout; frees the doorbell lock on every return |
+ 
+ `wait_reply` spins with `pause` for `spin_ns` nanoseconds of the wait
+@@ -27,2 +27,18 @@ the largest value, a spin throughout, as it always had), then naps
+ writes its reply fields and then the echoed sequence number last, so
+ seeing the number means the rest of the reply is there.
++
++## The doorbell lock (2026-11-06)
++
++The card has one request slot, and a second host-side client in the same window
++(the DMA router's fault handler, `tools/tridma_router.c` in llama-phi, issuing
++`VPU_K_DOWNLOAD` from its own thread) must not ring it between another client's
++request and its reply. `doorbell` therefore takes a test-and-set lock at
++`OFF_LOCK` (15360, a control-area line the card never touches; `lock.S`
++`lock_take`) before it reads the sequence number, and `wait_reply` frees it at its
++single exit, which every return (the reply, a card error, the timeout) goes
++through. Every request this library makes is a `doorbell` followed by a
++`wait_reply` on the same window (`ring` / `wait_card` in `backend.S`, and the
++feed-forward request in `ffn.S`), so a lock taken is always freed; between the
++two the backend computes the host's rows, which never touch the router's
++card-backed pages. `phi_ggml_open` clears the word when it maps the window, since
++a client killed between a request and its reply leaves it taken.
 diff --git a/host/asm/ggml-phi/backend.S b/host/asm/ggml-phi/backend.S
-index 9f25cff..ce2f2d5 100644
+index 9f25cff..bf3ea1c 100644
 --- a/host/asm/ggml-phi/backend.S
 +++ b/host/asm/ggml-phi/backend.S
 @@ -65,4 +65,6 @@ tg_only:	.skip 8			# PHI_GGML_TG_ONLY=K: a multiply of more than K tokens stays
@@ -927,20 +1124,38 @@ index 9f25cff..ce2f2d5 100644
 +stream_on:	.skip 4			# PHI_GGML_STREAM: the weights stay in the window (host RAM), the card pulls them per multiply
  unmapped_said:	.skip 4
  ids_env:	.skip 4			# PHI_GGML_IDS set
-@@ -239,4 +241,5 @@ e_tg_only:	.asciz "PHI_GGML_TG_ONLY"
+@@ -172,4 +174,6 @@ pa_m:	.skip 8
+ pa_nb_a:	.skip 8
+ pa_experts:	.skip 8
++tb_fn:	.skip 8			# tridma_back from the process (back_or_drop), 0 when it has none
++tb_tried:	.skip 8		# 1 once looked up
+ pa_nb_a2:	.skip 8
+ pa_f:	.skip 8
+@@ -237,6 +241,8 @@ e_judge:	.asciz "PHI_GGML_JUDGE"
+ e_pp_only:	.asciz "PHI_GGML_PP_ONLY"
+ e_tg_only:	.asciz "PHI_GGML_TG_ONLY"
++s_tridma_back:	.asciz "tridma_back"
  e_min_bytes:	.asciz "PHI_GGML_MIN_BYTES"
  e_pp_adapt:	.asciz "PHI_GGML_PP_ADAPT"
 +e_stream:	.asciz "PHI_GGML_STREAM"
  e_act:	.asciz "PHI_GGML_ACT"
  e_ffn_h16:	.asciz "PHI_GGML_FFN_H16"
-@@ -286,4 +289,6 @@ s_nocards:	.asciz "no card is up with a worker polling; nothing to share the wor
+@@ -286,4 +292,6 @@ s_nocards:	.asciz "no card is up with a worker polling; nothing to share the wor
  s_clear:	.asciz "could not clear card "
  s_allrows_needs:	.asciz "PHI_GGML_ALL_ROWS needs PHI_GGML_OFFLOAD=1 (the judgement needs host rows): ignored"
 +s_stream_on:	.asciz "stream: every weight stays in host RAM, in the window above the transfer areas; each multiply has the card pull its rows (no upload into the card's memory, no fused feed-forward, no pairs)"
 +s_stream_full:	.asciz "stream: the window is full; this tensor stays with the host"
  s_experts_host:	.asciz "whole experts without the offload: the host keeps its copy of every expert (a batch handed to a GPU reads it) and skips the cards' at a generation step; the judge is off"
  s_experts_err1:	.asciz "PHI_GGML_EXPERTS: "
-@@ -1201,5 +1206,17 @@ phi_ggml_open:
+@@ -906,4 +914,7 @@ open_card:
+ 	call card_at
+ 	movq %r13, CD_BASE(%rax)
++	# the doorbell lock starts free: a client killed between a request and its
++	# reply leaves it taken, and this backend is the card's only client now
++	movl $0, OFF_LOCK(%r13)
+ 	movq %rbx, CD_INDEX(%rax)
+ 	movl threads(%rip), %ecx
+@@ -1201,5 +1212,17 @@ phi_ggml_open:
  	call say
  	movl $0, all_rows(%rip)
 -81:	# whole experts
@@ -959,7 +1174,58 @@ index 9f25cff..ce2f2d5 100644
 +85:	# whole experts
  	movl $0, place_any(%rip)
  	leaq e_experts(%rip), %rdi
-@@ -3125,5 +3142,42 @@ upload_area:
+@@ -1968,4 +1991,50 @@ drop_pages:
+ 	ret
+ 
++
++# back_or_drop(addr rdi, len rsi, id rdx): the card's rows of a dense
++# matrix, just uploaded under id, handed to the DMA router when the
++# process has one (tridma_back, an LD_PRELOAD library: the pages then come
++# back from the card by K_DOWNLOAD on a fault, not from the disk), else
++# given to MADV_PAGEOUT as before (drop_pages); the bytes in rax
++# (2026-11-06). A mixture's experts always go to drop_pages.
++	.globl back_or_drop
++back_or_drop:
++	pushq %rbx
++	pushq %r12
++	pushq %r13
++	movq %rdi, %rbx
++	movq %rsi, %r12
++	movq %rdx, %r13
++	cmpq $1, pa_experts(%rip)
++	jne 8f
++	cmpl $0, tb_tried(%rip)
++	jne 1f
++	movl $1, tb_tried(%rip)
++	xorl %edi, %edi				# RTLD_DEFAULT
++	leaq s_tridma_back(%rip), %rsi
++	call dlsym@PLT
++	movq %rax, tb_fn(%rip)
++1:	cmpq $0, tb_fn(%rip)
++	je 8f
++	xorl %edi, %edi
++	call card_at				# the first card
++	# tridma_back(addr, len, id, a_off 0, window base, threads)
++	movq CD_BASE(%rax), %r8
++	movl CD_THREADS(%rax), %r9d
++	movq %rbx, %rdi
++	movq %r12, %rsi
++	movq %r13, %rdx
++	xorl %ecx, %ecx
++	call *tb_fn(%rip)
++	testq %rax, %rax
++	jnz 9f
++8:	movq %rbx, %rdi
++	movq %r12, %rsi
++	call drop_pages
++9:	popq %r13
++	popq %r12
++	popq %rbx
++	ret
++
+ # ---- the host taking everything ----
+ 
+@@ -3125,5 +3194,42 @@ upload_area:
  	movq %rdi, %rbx
  	movq %rsi, %r12
 -	call mm_clear
@@ -1003,7 +1269,15 @@ index 9f25cff..ce2f2d5 100644
 +5:	call mm_clear
  	movq CD_NEXT_ID(%rbx), %r13
  	leaq mm_buf(%rip), %rax
-@@ -4632,5 +4686,9 @@ issue:
+@@ -3386,5 +3492,6 @@ plan:
+ 	subq SP_R0(%rbx), %rsi
+ 	imulq pa_nb_a(%rip), %rsi
+-	call drop_pages
++	movq SP_ID(%rbx), %rdx			# the first card's id of the slice
++	call back_or_drop
+ 	addq %rax, %r14
+ 	incq -88(%rbp)
+@@ -4632,5 +4739,9 @@ issue:
  	movq RDW_CI(%r15), %rcx
  	movq SP_ID(%rax,%rcx,8), %rax
 -	movq %rax, MM_A_ID(%rdi)
@@ -1014,7 +1288,7 @@ index 9f25cff..ce2f2d5 100644
 +1:	movq %rax, MM_A_ID(%rdi)
  	movl RD_A_TYPE(%rbx), %eax
  	movl %eax, MM_A_TYPE(%rdi)
-@@ -4901,5 +4959,9 @@ work_max:
+@@ -4901,5 +5012,9 @@ work_max:
  	.globl phi_ggml_begin_id_pair
  phi_ggml_begin_id_pair:
 -	pushq %rbp
@@ -1025,19 +1299,32 @@ index 9f25cff..ce2f2d5 100644
 +1:	pushq %rbp
  	movq %rsp, %rbp
  	pushq %rbx
-@@ -5657,4 +5719,5 @@ phi_ggml_free_all:
+@@ -5657,4 +5772,5 @@ phi_ggml_free_all:
  	movq $0, CD_UPLOADED(%rbx)
  	movl $0, CD_FULL(%rbx)
 +	movq $0, CD_STREAM_AT(%rbx)		# the streamed weights' places, forgotten with the splits
  	incl %r12d
  	jmp 1b
 diff --git a/host/asm/ggml-phi/backend.md b/host/asm/ggml-phi/backend.md
-index 41e6344..2a21f91 100644
+index 41e6344..7607765 100644
 --- a/host/asm/ggml-phi/backend.md
 +++ b/host/asm/ggml-phi/backend.md
-@@ -156,2 +156,24 @@ backend. The backend loaded with no tensor allowed on a card
+@@ -156,2 +156,37 @@ backend. The backend loaded with no tensor allowed on a card
  the CPU alone's 7.76 and 7.92, interleaved: the hand-offs, not the
  cards, cost about 30 ms a token (`docs/results/2026-10-07-rack-generation.md`).
++
++## The card rows handed to a DMA router (`back_or_drop`, 2026-11-06)
++
++Under `PHI_GGML_OFFLOAD`, after a dense matrix's card rows are uploaded (the
++range from row `SP_R0` to the last, card byte 0 of the slice, id `SP_ID`),
++`back_or_drop` looks up `tridma_back` once with `dlsym(RTLD_DEFAULT, ...)`
++(`imports.list` has `dlsym`; ggml loads this library `RTLD_LOCAL`, so the router
++is an `LD_PRELOAD` library and this side passes it the window base and the thread
++count). When the process has it, the range goes to the router, which backs those
++pages with the card (`VPU_K_DOWNLOAD` on a fault) instead of the disk; else, and
++always for a mixture's experts, the pages go to `MADV_PAGEOUT` as before
++(`drop_pages`). `phi_ggml_open` also clears the window's doorbell lock
++(`OFF_LOCK`, see `../common/window.md`) when it maps a card.
 +
 +## Streamed weights (`PHI_GGML_STREAM`, 2026-11-06)
 +
@@ -1128,6 +1415,14 @@ index d839796..f6e8276 100644
 +  `K_FFN` names resident slices).
  - views, reshapes, permutes and transposes are ggml's own and pass.
  
+diff --git a/host/asm/ggml-phi/imports.list b/host/asm/ggml-phi/imports.list
+index f318856..5f96201 100644
+--- a/host/asm/ggml-phi/imports.list
++++ b/host/asm/ggml-phi/imports.list
+@@ -1,2 +1,3 @@
++dlsym
+ ggml_add
+ ggml_backend_buft_is_host
 diff --git a/host/asm/phi512/card.S b/host/asm/phi512/card.S
 index aaabc22..d8a0229 100644
 --- a/host/asm/phi512/card.S
@@ -1218,6 +1513,26 @@ index 581f1fd..cd96f3a 100644
 +stack could not be made, keeps the old behaviour. `sigill_lock` (a test-and-test-and-set spin taken after
  the prologue, released at `.Lout`, where every path ends) serializes the
  threads, since the translation, the region path ([`region.md`](region.md):
+diff --git a/host/crates/phi-vpu/src/proto.rs b/host/crates/phi-vpu/src/proto.rs
+index 2e00618..6888f42 100644
+--- a/host/crates/phi-vpu/src/proto.rs
++++ b/host/crates/phi-vpu/src/proto.rs
+@@ -23,4 +23,7 @@ pub const OFF_REPLY: usize = 256;
+ /// rewrites after every reply; the stack's phitop reads it for its rates.
+ pub const OFF_STATS: usize = 320;
++/// Window offset of the doorbell lock: host-side clients take it before a
++/// request and free it after the reply; the card never touches it.
++pub const OFF_LOCK: usize = 15360;
+ /// Where bulk data starts. Everything below is control words.
+ pub const OFF_DATA: u64 = 1 << 20;
+@@ -482,4 +485,7 @@ pub struct Ffn {
+ /// dispatch, one push per result (`struct vpu_more`, vpu_matmul.h).
+ pub const K_MATMUL_MORE: u32 = 8;
++/// Bytes [a_off, a_off + bytes) of the resident a_id pushed to the window at
++/// d_off (both block aligned): a card-held matrix back to the host.
++pub const K_DOWNLOAD: u32 = 32;
+ /// Window offset of the further-matrices descriptor, after the
+ /// feed-forward one.
 diff --git a/scripts/bench/common.md b/scripts/bench/common.md
 index 12652db..3d406ec 100644
 --- a/scripts/bench/common.md
@@ -1364,3 +1679,13 @@ index 88cdd3f..4f35afe 100755
 +        PHI_VPU_ARGS="${PHI_VPU_ARGS:-${PHI512_V3:+-S 1 -C $((cores - 2)) -T 2 -R 128 -s 1000}}" "$root/scripts/phi-vpu.sh" -c "$card" start "$cores" >&2 </dev/null || {
              echo "phi512: could not start the worker on card $card (is the card up? phi -c $card status)" >&2
              exit 1
+diff --git a/tools/vpu-layout-check.c b/tools/vpu-layout-check.c
+index dade4d7..79ade7e 100644
+--- a/tools/vpu-layout-check.c
++++ b/tools/vpu-layout-check.c
+@@ -119,4 +119,5 @@ int main(void)
+ 	check("VPU_OFF_NONCE", VPU_OFF_NONCE, 128);
+ 	check("VPU_OFF_REPLY", VPU_OFF_REPLY, 256);
++	check("VPU_OFF_LOCK", VPU_OFF_LOCK, 15360);
+ 	check("VPU_OFF_STATS", VPU_OFF_STATS, 320);
+ 	check("sizeof(vpu_stats)", sizeof(struct vpu_stats), 64);

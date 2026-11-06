@@ -1,3 +1,52 @@
+diff --git a/card/initramfs/README.md b/card/initramfs/README.md
+index 2137d9a..f652ba2 100644
+--- a/card/initramfs/README.md
++++ b/card/initramfs/README.md
+@@ -68,7 +68,9 @@ then bind `/data/{etc,var,opt/phi,root,home}` over their mount points;
+ install `/etc` from the skeleton and set the hostname and `TZ` from it;
+ create the `/var` tree and link `/var/run` and `/var/lock` into `/run`;
+ start `syslogd` and `klogd` on `/var/log/messages`; wait up to 3 s for
+-`/dev/phiblk1` and `mkswap`/`swapon` it (host memory is volatile, so it is
++`/dev/phiblk1` and, only when the kernel command line says `PHI_SWAP_HOSTMEM=1`
++(off since 2026-11-06: the region is the co-processor's window and host RAM the
++host needs), `mkswap`/`swapon` it (host memory is volatile, so it is
+ reformatted every boot; a region of 4 GiB or more is shared with the
+ AVX-512 co-processor's window, so the swap then sits on `/dev/loop0`,
+ the region above 2 GiB, and the window keeps the first part); bring up
+diff --git a/card/initramfs/build.md b/card/initramfs/build.md
+index d577be2..6a97a42 100644
+--- a/card/initramfs/build.md
++++ b/card/initramfs/build.md
+@@ -54,7 +54,8 @@ before.
+ 
+ When the host serves memory (`phictl boot --host-mem SIZE`, kernel patch
+ 0026), `/dev/phiblk1` appears within a few seconds of init; `init` runs
+-`mkswap` and `swapon` on it every boot (host RAM is volatile), which
++`mkswap` and `swapon` on it every boot when `PHI_SWAP_HOSTMEM=1` is on the
++kernel command line (off by default since 2026-11-06), which
+ extends the card's 6 GB by that size at DMA speed. `/dev/phihost` maps the
+ same memory for direct access.
+ 
+diff --git a/card/initramfs/init b/card/initramfs/init
+index 4bbb550..3e5d304 100755
+--- a/card/initramfs/init
++++ b/card/initramfs/init
+@@ -145,10 +145,13 @@ fi
+ # /dev/phiblk1 is host RAM served over the ring (kernel patch 0026, phictl
+ # boot --host-mem). Volatile, so it is formatted at every boot; it extends the
+ # card's GDDR5 (6 GB on a 3120, 16 GB on the 7120A).
+-swap="no host memory"
++# Off unless the kernel command line says PHI_SWAP_HOSTMEM=1 (2026-11-06): the
++# region is the co-processor's window, and swap in it is host RAM the host
++# cannot use for anything else.
++swap="no swap (host memory swap off; PHI_SWAP_HOSTMEM=1 turns it on)"
+ i=0
+ while [ $i -lt 3 ] && [ ! -b /dev/phiblk1 ]; do $BB sleep 1; i=$((i+1)); done
+-if [ -b /dev/phiblk1 ]; then
++if [ -b /dev/phiblk1 ] && [ "${PHI_SWAP_HOSTMEM:-0}" = 1 ]; then
+ 	# A region of 4 GiB or more is shared with the AVX-512 co-processor,
+ 	# whose window is the region's first part (at most 768 MiB used): the
+ 	# swap then takes the half above 2 GiB through a loop device, so the
 diff --git a/host/asm/phitop/defs.inc b/host/asm/phitop/defs.inc
 index d2aa2b9..8e662b0 100644
 --- a/host/asm/phitop/defs.inc
