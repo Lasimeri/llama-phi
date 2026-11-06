@@ -1,0 +1,1366 @@
+diff --git a/card/vpu/cdma.S b/card/vpu/cdma.S
+index c23026b..a8d70ea 100644
+--- a/card/vpu/cdma.S
++++ b/card/vpu/cdma.S
+@@ -65,4 +65,8 @@
+ 
+ 	.bss
++	.balign 64
++	.globl cdma_stats, cdma_dir
++cdma_stats:	.skip 64	# the engine's traffic: bytes into the card, bytes out, copies in, copies out (OFF_CDMA_STATS)
++cdma_dir:	.skip 8		# the copy being posted: 0 into the card (cdma_submit), 1 out of it (cdma_push)
+ 	.balign 64
+ 	.globl cdma_ready, cdma_regs, cdma_page, cdma_page_phys, cdma_land
+@@ -452,4 +456,14 @@ cdma_submit:
+ 	ja 90f
+ 	movq %rdx, %r10			# bytes
++	movq cdma_win_phys(%rip), %rax
++	addq %rax, %rdi			# the source: the window
++	movq cdma_page_phys(%rip), %rax
++	addq $CD_LAND, %rax
++	addq %rax, %rsi			# the destination: the landing area
++	movq $0, cdma_dir(%rip)		# into the card
++	# cdma_post (rdi = source, rsi = destination, card physical addresses
++	# the caller checked; r10 = bytes): the copy and its status, shared
++	# by cdma_submit (window to card) and cdma_push (card to window)
++cdma_post:
+ 	# room in the ring
+ 1:	movq cdma_seq(%rip), %rax
+@@ -473,6 +487,5 @@ cdma_submit:
+ 	addq cdma_page(%rip), %r8	# the line of descriptors
+ 	# memcpy: src[39:0] | lines << 46; dst[39:0] | 1 << 60
+-	movq cdma_win_phys(%rip), %rax
+-	addq %rdi, %rax
++	movq %rdi, %rax
+ 	movq %r10, %rcx
+ 	shrq $6, %rcx
+@@ -480,7 +493,5 @@ cdma_submit:
+ 	orq %rcx, %rax
+ 	movq %rax, 0(%r8)
+-	movq cdma_page_phys(%rip), %rax
+-	addq $CD_LAND, %rax
+-	addq %rsi, %rax
++	movq %rsi, %rax
+ 	movabsq $1 << 60, %rcx
+ 	orq %rcx, %rax
+@@ -507,9 +518,55 @@ cdma_submit:
+ 	movq cdma_regs(%rip), %rcx
+ 	movl %eax, R_DHPR(%rcx)
+-3:	movq %r11, %rax
++3:	movq cdma_dir(%rip), %rax		# the counters by direction (OFF_CDMA_STATS):
++	leaq cdma_stats(%rip), %rcx		# bytes at 0 and 8, copies at 16 and 24
++	addq %r10, (%rcx,%rax,8)
++	incq 16(%rcx,%rax,8)
++	movq %r11, %rax
+ 	ret
+ 90:	xorl %eax, %eax
+ 	ret
+ 
++	.globl cdma_push
++# cdma_push(rdi = landing offset, rsi = window offset, rdx = bytes) ->
++# rax = the copy's sequence number, or 0 when refused: the other
++# direction of cdma_submit (card memory to the host window), the same
++# checks with the roles swapped (the source inside the landing area, the
++# destination inside the window), the same ring and completion
++# (cdma_wait). Clobbers rcx, rdx, rsi, rdi, r8 to r11.
++cdma_push:
++	cmpq $0, cdma_ready(%rip)
++	je 91f
++	movq %rdi, %rax
++	orq %rsi, %rax
++	orq %rdx, %rax
++	testq $63, %rax
++	jnz 91f
++	testq %rdx, %rdx
++	jz 91f
++	cmpq $CD_LEN_MAX, %rdx
++	ja 91f
++	cmpq $CD_LAND_MAX, %rdi
++	jae 91f
++	movq $CD_LAND_MAX, %rax
++	subq %rdi, %rax
++	cmpq %rax, %rdx
++	ja 91f
++	movq cdma_win_bytes(%rip), %rax
++	cmpq %rax, %rsi
++	jae 91f
++	subq %rsi, %rax
++	cmpq %rax, %rdx
++	ja 91f
++	movq %rdx, %r10			# bytes
++	movq cdma_page_phys(%rip), %rax
++	addq $CD_LAND, %rax
++	addq %rax, %rdi			# the source: the landing area
++	movq cdma_win_phys(%rip), %rax
++	addq %rax, %rsi			# the destination: the window
++	movq $1, cdma_dir(%rip)		# out of the card
++	jmp cdma_post
++91:	xorl %eax, %eax
++	ret
++
+ 	.globl cdma_poll
+ # cdma_poll -> rax = the last completed sequence number (the status word),
+diff --git a/card/vpu/cdma.md b/card/vpu/cdma.md
+index 553b7bc..1f21237 100644
+--- a/card/vpu/cdma.md
++++ b/card/vpu/cdma.md
+@@ -139,2 +139,20 @@ second the destination with the type (Linux `drivers/dma/mic_x100_dma.c`,
+ addresses, System Software Developer's Guide 2.1.8.2.1). Used by
+ `res_push` for `K_PUSH`.
++
++## The other direction: `cdma_push` (2026-11-06)
++
++`cdma_push(landing offset, window offset, bytes)` copies card memory to
++the host window with the same engine: the checks of `cdma_submit` with
++the roles swapped (the source inside the landing area, the destination
++inside the window), then the shared `cdma_post` (the ring's room, one
++line of copy, status and two NOPs, the doorbell), completed by
++`cdma_wait` like a pull. `cdma_submit` now resolves its two offsets to
++card physical addresses and falls into `cdma_post` too; the descriptor it
++writes is unchanged. The engine takes either direction: the memcpy
++descriptor is a 40-bit source and a 40-bit destination (`dma.md`).
++
++`cdma_stats` (64 bytes, first in the section): bytes into the card,
++bytes out, copies in, copies out, added by `cdma_post` once a copy is
++posted (direction from `cdma_dir`, set by `cdma_submit` 0 and `cdma_push`
++1). The worker stores the line at `OFF_CDMA_STATS` (192) after every
++reply, beside `OFF_STATS`; phitop shows it as `card dma in, out`.
+diff --git a/card/vpu/defs.inc b/card/vpu/defs.inc
+index a93e007..40eac19 100644
+--- a/card/vpu/defs.inc
++++ b/card/vpu/defs.inc
+@@ -29,4 +29,5 @@
+ 	.set SYS_futex, 202
+ 	.set SYS_sched_setaffinity, 203
++	.set SYS_sched_getaffinity, 204
+ 	.set SYS_clock_gettime, 228
+ 	.set SYS_exit_group, 231
+@@ -91,9 +92,10 @@
+ 	.set EAGAIN, 11
+ 
+-# The card: 57 cores of four hardware threads; CPU 0 is core 56 thread 3,
+-# CPUs 1 + 4k .. 4 + 4k are core k (vpu_worker.md). The dispatcher lives on
+-# CPU 0; the pool takes the other 227 hardware threads at most.
+-	.set NCORES, 57
+-	.set MAX_POOL, 227
++# The card: ncores cores of four hardware threads (worker.S counts them at
++# start: 57 on a 3120A, 61 on a 7120A), at most NCORES_MAX; CPU 0 is the
++# last core's, CPUs 1 + 4k .. 4 + 4k are core k (vpu_worker.md). The
++# dispatcher lives on CPU 0; the pool takes the other hardware threads.
++	.set NCORES_MAX, 64
++	.set MAX_POOL, 4 * NCORES_MAX - 1
+ 	.set SPIN_ROUNDS, 2000
+ 	.set WAIT_DELAY, 64
+diff --git a/card/vpu/defs.md b/card/vpu/defs.md
+index 4d66789..e511976 100644
+--- a/card/vpu/defs.md
++++ b/card/vpu/defs.md
+@@ -14,9 +14,14 @@ number names its source here; the protocol with the host is `proto.inc`.
+   address; `CLONE_THREAD_FLAGS` is what a thread sharing everything with
+   its own `fs` needs, the set glibc and musl use without the tid words.
+-- **The card**: 57 cores of four hardware threads, CPU 0 being core 56
+-  thread 3 and CPUs `1 + 4k` to `4 + 4k` core k (Intel Xeon Phi
+-  Coprocessor System Software Developers Guide, the topology section, and
+-  `/proc/cpuinfo` on the card); `MAX_POOL` is every hardware thread but
+-  the dispatcher's; the pool's spin and delay constants are the C
++- **The card**: `ncores` cores of four hardware threads, counted by the
++  worker at start (`worker.S`, `count_cores`): 57 on a 3120A, 61 on a
++  7120A, at most `NCORES_MAX` (64). CPU 0 is one of the last core's
++  threads and CPUs `1 + 4k` to `4 + 4k` are core k (Intel Xeon Phi
++  Coprocessor System Software Developers Guide, the topology section;
++  `/proc/cpuinfo` on the card: on the 7120A CPU 0 is APIC 240, core 60,
++  and CPUs 241 to 243 are that core's other threads, measured
++  2026-10-22); `MAX_POOL` is every hardware thread of the largest card
++  but the dispatcher's; `SYS_sched_getaffinity` is 204 (the card kernel's
++  `arch/x86/entry/syscalls/syscall_64.tbl`); the pool's spin and delay constants are the C
+   worker's (`vpu_worker.md`, "What a dispatch costs").
+ - **The per-thread block**: the thread pointer convention wants the
+diff --git a/card/vpu/matmul.S b/card/vpu/matmul.S
+index 6451e1b..ea3a966 100644
+--- a/card/vpu/matmul.S
++++ b/card/vpu/matmul.S
+@@ -167,5 +167,6 @@ copy_pool:
+ 	jmp vpu_pool_map
+ 
+-# map_threads: edi clamped to 1..min(pool + 1, POOL_SLOTS), in eax.
++# map_threads: edi clamped to 1..min(pool + 1, two threads on each of the
++# card's cores: 114 on a 3120A, 122 on a 7120A), in eax.
+ map_threads:
+ 	pushq %rdi
+@@ -173,8 +174,12 @@ map_threads:
+ 	popq %rdi
+ 	incl %eax
+-	cmpl $POOL_SLOTS, %eax
++	pushq %rcx
++	movl ncores(%rip), %ecx
++	addl %ecx, %ecx
++	cmpl %ecx, %eax
+ 	jle 1f
+-	movl $POOL_SLOTS, %eax
+-1:	cmpl %eax, %edi
++	movl %ecx, %eax
++1:	popq %rcx
++	cmpl %eax, %edi
+ 	jg 2f
+ 	movl %edi, %eax
+@@ -259,5 +264,41 @@ push_data:
+ 	movq %rdx, %r13
+ 	movl %ecx, %r14d
+-	leaq 63(%r12), %r15
++	# the card's own DMA channel first, whatever the size (2026-11-06):
++	# each piece copied into the landing area in card memory, then one
++	# engine copy to the window (cdma_push), instead of the cores' 64-byte
++	# stores through the uncached mapping; a refusal or a timeout sends the
++	# rest the way it went before
++70:	cmpq $0, cdma_ready(%rip)
++	je 79f
++71:	testq %r12, %r12
++	jle 78f
++	movq %r12, %r15
++	cmpq $983040, %r15			# 15360 lines: under the length field and the landing area
++	jbe 72f
++	movq $983040, %r15
++72:	movq cdma_land(%rip), %rdi
++	movq %rbx, %rsi
++	leaq 63(%r15), %rdx
++	shrq $6, %rdx
++	call phi_copy64
++	xorl %edi, %edi
++	movq %r13, %rsi
++	leaq 63(%r15), %rdx
++	andq $-64, %rdx
++	call cdma_push
++	testq %rax, %rax
++	jz 79f
++	movq %rax, %rdi
++	call cdma_wait
++	testl %eax, %eax
++	jz 79f
++	addq %r15, %rbx
++	addq %r15, %r13
++	subq %r15, %r12
++	incq stat_dma_push(%rip)
++	jmp 71b
++78:	xorl %eax, %eax
++	jmp 9f
++79:	leaq 63(%r12), %r15
+ 	shrq $6, %r15
+ 	xorl %eax, %eax
+@@ -3244,4 +3285,6 @@ r_big:	.skip 8
+ r_rounds:	.skip 8
+ r_i:	.skip 8
++	.globl stat_dma_push
++stat_dma_push:	.skip 8			# result pushes carried by the DMA channel (push_data)
+ 
+ 	.section .rodata
+diff --git a/card/vpu/matmul.inc b/card/vpu/matmul.inc
+index 70eb5ef..f0177b0 100644
+--- a/card/vpu/matmul.inc
++++ b/card/vpu/matmul.inc
+@@ -109,5 +109,5 @@
+ 	.set ROW_CHUNK, 32
+ 	.set ROW_CHUNK_MAX, 64
+-	.set POOL_SLOTS, 114
++	# (the pool slots a matrix request may use: two threads a core, 2 ncores, map_threads in matmul.S)
+ 	.set OWN_GROUPS_MAX, 512
+ 	.set MAP_POOL_MAX, 2097152
+diff --git a/card/vpu/matmul.md b/card/vpu/matmul.md
+index 16dc0cd..1f6e2a0 100644
+--- a/card/vpu/matmul.md
++++ b/card/vpu/matmul.md
+@@ -100,2 +100,16 @@ the C worker's after the timing fields are stripped. Defects met on the
+ way are in `rows.md`; the fused feed-forward's down projection is the one
+ that was here (a matrix pointer read through a clobbered register).
++
++## Results by the engine (2026-11-06)
++
++`push_data` sends every result through the card's DMA channel first,
++whatever its size: pieces of at most 983,040 bytes (15,360 lines, under
++the descriptor's length field and the landing area) are copied into the
++landing area in card memory (`phi_copy64`), then one `cdma_push` to the
++window and `cdma_wait`; `stat_dma_push` counts them. A refusal or a
++timeout sends the rest the way it went before (the mapping or the block
++device), and a failed copy closes the channel, said once in the log.
++Lengths round up to whole lines: the window's result area is whole 4 KiB
++blocks and the card's buffers keep `SLACK` past their data. Gated by
++`phi-vpu matmul-check` on the 7120A (every format ok, mixtures, up to
++four matrices, the fused feed-forward) with channel 7 up throughout.
+diff --git a/card/vpu/proto.inc b/card/vpu/proto.inc
+index 8653d9b..6695e75 100644
+--- a/card/vpu/proto.inc
++++ b/card/vpu/proto.inc
+@@ -13,4 +13,5 @@
+ 	.set OFF_REPLY, 256
+ 	.set OFF_STATS, 320		# struct vpu_stats: the worker's running counters, rewritten after every reply (phitop reads them)
++	.set OFF_CDMA_STATS, 192	# the card DMA channel's traffic (cdma_stats: bytes in, bytes out, copies in, copies out), rewritten after every reply (phitop reads it)
+ 	.set OFF_DATA, 1048576
+ 	.set MAGIC_LO, 0x52454144
+diff --git a/card/vpu/resident.S b/card/vpu/resident.S
+index 470bd75..821b56d 100644
+--- a/card/vpu/resident.S
++++ b/card/vpu/resident.S
+@@ -1016,5 +1016,5 @@ s_rmf3:	.asciz ": resv_free 0 or mremap gave "
+ # pulls the units as before). The host applies them byte by byte against
+ # its own shadow, as it did with the pulled units.
+-	.set WD_SLICES_MAX, 110			# the slot's whole pool (2 threads on each of 55 cores): the compare is memory-bound (rs12: card 72.7% busy, 1.87 ms a request with 32)
++	# WD slices: the slot's whole pool at most, 2 threads on each core but the last two (110 on a 3120A, 118 on a 7120A): the compare is memory-bound (rs12: card 72.7% busy, 1.87 ms a request with 32)
+ 	.set WD_TAB_MAX, (SD_WB - SD_WB_TAB) / 16
+ 	.bss
+@@ -1207,5 +1207,7 @@ wb_card_diff:
+ 	cmpq $0, wsh_base(%rip)
+ 	je 91f
+-	movl $WD_SLICES_MAX, %edx
++	movl ncores(%rip), %edx
++	subl $2, %edx
++	addl %edx, %edx			# the WD slices at most
+ 	movl nthreads(%rip), %eax
+ 	cmpl %eax, %edx
+diff --git a/card/vpu/resident.md b/card/vpu/resident.md
+index e396148..91a609f 100644
+--- a/card/vpu/resident.md
++++ b/card/vpu/resident.md
+@@ -191,6 +191,7 @@ back (306); every region of the three gates took the card's list, none
+ overflowed.
+ 
+-The diff runs over up to 110 slices (`WD_SLICES_MAX`: the slot's whole
+-pool, two threads on each of 55 cores): the compare is memory-bound (with
++The diff runs over up to 2 (ncores - 2) slices (110 on a 3120A, 118 on a
++7120A: the slot's whole
++pool, two threads on each core but the last two): the compare is memory-bound (with
+ 32, card 0 was 72.7% busy at 1.87 ms a request in llama-server's first
+ decode; graph reservation 74.7 s with 32, 58.6 s with 110 and callee
+diff --git a/card/vpu/rows.S b/card/vpu/rows.S
+index a278b51..ba31861 100644
+--- a/card/vpu/rows.S
++++ b/card/vpu/rows.S
+@@ -15,8 +15,8 @@
+ 	.text
+ 
+-# slice_rows: rows i0..i1 of m (rdx) for slice edi of esi: with 57 slices
+-# every core has one; with 114 the slices s and s + 57 share a core and
+-# take alternate rows of the same chunk (mate, nmates). Returns rax i0,
+-# rdx i1, ecx mate, r8d nmates.
++# slice_rows: rows i0..i1 of m (rdx) for slice edi of esi: with ncores
++# slices (57 on a 3120A, 61 on a 7120A) every core has one; with 2 ncores
++# the slices s and s + ncores share a core and take alternate rows of the
++# same chunk (mate, nmates). Returns rax i0, rdx i1, ecx mate, r8d nmates.
+ 	.globl slice_rows
+ slice_rows:
+@@ -26,19 +26,19 @@ slice_rows:
+ 	xorl %ecx, %ecx				# mate
+ 	movl $1, %r8d				# nmates
+-	cmpl $NCORES, %esi
++	cmpl ncores(%rip), %esi
+ 	jle 1f
+ 	movl %esi, %eax
+ 	xorl %edx, %edx
+-	movl $NCORES, %esi
++	movl ncores(%rip), %esi
+ 	divl %esi
+ 	testl %edx, %edx
+ 	jnz 1f
+-	movl $NCORES, %r9d
+-	movl %eax, %r8d				# nslices / 57
++	movl ncores(%rip), %r9d
++	movl %eax, %r8d				# nslices / ncores
+ 	movl %edi, %eax
+ 	xorl %edx, %edx
+ 	divl %esi
+-	movl %edx, %r10d			# slice % 57
+-	movl %eax, %ecx				# slice / 57
++	movl %edx, %r10d			# slice % ncores
++	movl %eax, %ecx				# slice / ncores
+ 1:	movq %r11, %rax
+ 	movl %r10d, %esi
+@@ -539,9 +539,9 @@ copy_share:
+ 	xorl %r13d, %r13d			# mate
+ 	movl $1, %r14d				# nmates
+-	cmpl $NCORES, %edx
++	cmpl ncores(%rip), %edx
+ 	jle 1f
+ 	movl %edx, %eax
+ 	xorl %edx, %edx
+-	movl $NCORES, %ecx
++	movl ncores(%rip), %ecx
+ 	divl %ecx
+ 	testl %edx, %edx
+@@ -615,10 +615,10 @@ fused_setup:
+ 	movl $1, %r9d				# per_core
+ 	movl %r8d, %r10d			# most
+-	cmpl $NCORES, %r8d
++	cmpl ncores(%rip), %r8d
+ 	jle 1f
+ 	pushq %rdx
+ 	movl %r8d, %eax
+ 	xorl %edx, %edx
+-	movl $NCORES, %r11d
++	movl ncores(%rip), %r11d
+ 	divl %r11d
+ 	testl %edx, %edx
+@@ -626,5 +626,5 @@ fused_setup:
+ 	jnz 1f
+ 	movl %eax, %r9d
+-	movl $NCORES, %r10d
++	movl ncores(%rip), %r10d
+ 1:	movq %rcx, %rax
+ 	shrq $5, %rax				# n64 / PULL_LINES
+@@ -1247,5 +1247,5 @@ rows_slice_q:
+ 	movl %r12d, %eax
+ 	xorl %edx, %edx
+-	movl $NCORES, %r9d
++	movl ncores(%rip), %r9d
+ 	divl %r9d
+ 	movl %edx, %r9d				# core
+@@ -1315,5 +1315,5 @@ rows_slice_multi:
+ 3:	movl %r12d, %eax
+ 	xorl %edx, %edx
+-	movl $NCORES, %r9d
++	movl ncores(%rip), %r9d
+ 	divl %r9d
+ 	movl %edx, %r9d				# core
+diff --git a/card/vpu/rows.md b/card/vpu/rows.md
+index ae56096..98fd291 100644
+--- a/card/vpu/rows.md
++++ b/card/vpu/rows.md
+@@ -11,6 +11,7 @@ this document says what the assembly keeps and what it must reproduce
+ exactly.
+ 
+-- `slice_rows`: rows `i0..i1` of slice `s` of `n`: with 57 slices every
+-  core has one; with 114 (two threads a core) the slices `s` and `s + 57`
++- `slice_rows`: rows `i0..i1` of slice `s` of `n`: with `ncores` slices
++  (the card's cores, `worker.S`: 57 on a 3120A, 61 on a 7120A) every
++  core has one; with twice that (two threads a core) the slices `s` and `s + ncores`
+   share a core and take alternate rows of the same chunk, so the
+   activation block they read is one and the same in their shared L1.
+diff --git a/card/vpu/sched.S b/card/vpu/sched.S
+index 3639727..6c6ac13 100644
+--- a/card/vpu/sched.S
++++ b/card/vpu/sched.S
+@@ -90,11 +90,11 @@ slots_start:
+ 	movl $1, %edx
+ 	call phi_copy64
+-	# the slots' cores: core 56 is the dispatcher's and stays out of them
++	# the slots' cores: the last core is the dispatcher's and stays out of them
+ 	movl nslots(%rip), %r12d
+ 	movl slot_cores(%rip), %eax
+ 	imull %r12d, %eax
+-	cmpl $NCORES, %eax
++	cmpl ncores(%rip), %eax
+ 	jle 2f
+-	movl $NCORES, %eax
++	movl ncores(%rip), %eax
+ 	xorl %edx, %edx
+ 	divl slot_cores(%rip)
+@@ -123,5 +123,8 @@ slots_start:
+ 	movl slot_cores(%rip), %eax
+ 	movl %eax, core_count(%rip)
+-	movl %r13d, %edi
++	cmpl $0, overlap(%rip)			# -O: this slot's threads on hardware
++	je 41f					# threads 1 and 2 of its cores
++	movl $2, mate_base(%rip)
++41:	movl %r13d, %edi
+ 	jmp sched_main
+ 4:	movq %r13, %rcx
+@@ -131,16 +134,25 @@ slots_start:
+ 	jmp 3b
+ 5:	# this process's pool: the cores after the slots'; when the slots
+-	# took every core (-S 1 -C 57: a single-threaded program's whole
+-	# card) it keeps the last core beside them, where its threads sleep
+-	# on a futex until a legacy job comes
++	# took every core (-S 1 -C 57 on a 3120A: a single-threaded program's
++	# whole card) it keeps the last core beside them, where its threads
++	# sleep on a futex until a legacy job comes
+ 	movl slot_cores(%rip), %eax
+ 	imull %r12d, %eax
+-	cmpl $NCORES - 1, %eax
++	movl ncores(%rip), %ecx
++	decl %ecx
++	cmpl $0, overlap(%rip)			# -O: the pool keeps hardware threads 0
++	je 50f					# and 3 of every core but the last, beside
++	xorl %eax, %eax				# the slots' 1 and 2
++	jmp 51f
++50:	cmpl %ecx, %eax
+ 	jle 51f
+-	movl $NCORES - 1, %eax
++	movl %ecx, %eax
+ 51:	movl %eax, core_base(%rip)
+-	movl $NCORES, %ecx
++	movl ncores(%rip), %ecx
+ 	subl %eax, %ecx
+-	movl %ecx, core_count(%rip)
++	cmpl $0, overlap(%rip)			# -O: cores 0 to ncores - 2, two threads
++	je 52f					# each; the last core is the control plane's
++	decl %ecx
++52:	movl %ecx, core_count(%rip)
+ 	call l_begin
+ 	leaq s_sl_up1(%rip), %rsi
+@@ -441,24 +453,37 @@ sched_main:
+ 	# this thread's CPU: never one of its pool's (a spinning thread beside
+ 	# a spinning thread is time-sliced by the kernel, milliseconds a
+-	# dispatch, measured 2026-10-13): core 56's hardware thread 1 (CPU 226)
+-	# when the slots leave core 56 to the control plane and this is the
+-	# only slot, else the first core's hardware thread 1 (the pool takes 0
+-	# and 3; the block-device pollers live on core 55 only)
+-	movl core_base(%rip), %edi
++	# dispatch, measured 2026-10-13): the last core's hardware thread 1
++	# (CPU 4 (ncores - 1) + 2: 226 on a 3120A) when the slots leave the last
++	# core to the control plane and this is the only slot, else the first
++	# core's hardware thread 1 (the pool takes 0 and 3; the block-device
++	# pollers live on the core before the last only); under -O every core
++	# but the last is taken by the pool and the slots, so the last core's
++	# hardware thread 1 (CPU 4 (ncores - 1) + 2: 242 on a 7120A)
++	cmpl $0, overlap(%rip)
++	je 3f
++	movl ncores(%rip), %edi
++	decl %edi
++	leal 2(,%rdi,4), %edi
++	jmp 2f
++3:	movl core_base(%rip), %edi
+ 	addl core_count(%rip), %edi		# the first core after the pool
+-	cmpl $NCORES - 2, %edi
++	movl ncores(%rip), %eax
++	subl $2, %eax
++	cmpl %eax, %edi
+ 	ja 1f
+ 	cmpl $1, nslots(%rip)
+ 	jne 1f
+ 	shll $2, %edi				# its hardware thread 0: a core of its
+-	addl $1, %edi				# own (core 56 is the dispatcher's, whose
+-	jmp 2f					# PCIe polling slows a neighbour 5 to 12x)
++	addl $1, %edi				# own (the last core is the dispatcher's,
++	jmp 2f					# whose PCIe polling slows a neighbour 5 to 12x)
+ 1:	movl core_base(%rip), %edi
+ 	addl core_count(%rip), %edi
+-	cmpl $NCORES - 1, %edi
++	movl ncores(%rip), %eax
++	decl %eax
++	cmpl %eax, %edi
+ 	ja 11f
+ 	cmpl $1, nslots(%rip)
+ 	jne 11f
+-	movl $226, %edi
++	leal 2(,%rax,4), %edi
+ 	jmp 2f
+ 11:	movl core_base(%rip), %edi
+diff --git a/card/vpu/sched.md b/card/vpu/sched.md
+index ae09771..b6bd625 100644
+--- a/card/vpu/sched.md
++++ b/card/vpu/sched.md
+@@ -24,6 +24,7 @@ open and before its own pool exists (a fork copies no threads),
+    line the slot writes and the slot's counters on a third line, so no
+    line has two writers;
+-2. clamps the slots so their cores stay below core 56, which is the
+-   dispatcher's (CPU 0 is core 56's last hardware thread,
++2. clamps the slots so their cores stay below the last core (`ncores - 1`:
++   core 56 on a 3120A, 60 on a 7120A), which is the
++   dispatcher's (CPU 0 is one of the last core's hardware threads,
+    [`vpu_worker.md`](vpu_worker.md));
+ 3. forks once per slot; the child sets `slot_index`, `core_base =
+@@ -108,7 +109,9 @@ median at most 8 us, p99 at most 20 us. The numbers measured are in
+ A slot's main thread never shares a CPU with a spinning thread: with one
+ slot leaving cores free it takes the first free core's hardware thread 0
+-(`-S 1 -C 55`: CPU 221; the pollers of the block devices live on core
+-55's threads 1 and 2 only), else core 56's thread 1 when the slot leaves
+-only core 56, else its first core's thread 1. Two spinners on one CPU are
++(`-S 1 -C 55` on a 3120A: CPU 221, `-C 59` on a 7120A: CPU 237; the
++pollers of the block devices live on the core before the last, core
++55 or 59, threads 1 and 2 only), else the last core's thread 1 (CPU
++4 (ncores - 1) + 2) when the slot leaves
++only the last core, else its first core's thread 1. Two spinners on one CPU are
+ time-sliced by the card's kernel at milliseconds: a 114-slice dispatch
+ cost 3.5 ms flat before (the main thread sat on pool thread 57's CPU);
+@@ -121,2 +124,7 @@ dispatcher's engine (`res_push`) with the slot waiting for the copy
+ (`land_wait`); the slot's reply carries the copy's number in `exit_aux`
+ and the wait's result in `exit_rip` when it refuses.
++
++Under `-O` (`worker.md`, slots beside the pool) the wide pool's
++`core_base` is 0 and its `core_count` `ncores - 1`, the slot sets
++`mate_base` 2 so its threads pin to hardware threads 1 and 2, and the
++slot's control thread pins to CPU 4 (ncores - 1) + 2.
+diff --git a/card/vpu/vpu_matmul.md b/card/vpu/vpu_matmul.md
+index 40c6cb3..3f4c604 100644
+--- a/card/vpu/vpu_matmul.md
++++ b/card/vpu/vpu_matmul.md
+@@ -384,5 +384,7 @@ The section above, "Two threads per core, measured again", found the
+ second thread no help on a prompt-sized batch (q6_K at n 64, 188 against
+ 209 GFLOP/s), and the service stayed capped at 58 slices (`POOL_SLOTS`,
+-`map_threads`). It is built for 114 now (`POOL_SLOTS`), because a
++`map_threads`). It is built for 114 now (`POOL_SLOTS`; since 2026-10-22 two
++threads on each of the card's cores, 2 ncores: 114 on a 3120A, 122 on a
++7120A), because a
+ second thread has issue to spare and a one-token request is issue and
+ latency bound, and what stood in its way was fixed cost that grew with
+diff --git a/card/vpu/vpu_proto.h b/card/vpu/vpu_proto.h
+index e2c1ec6..a8e3657 100644
+--- a/card/vpu/vpu_proto.h
++++ b/card/vpu/vpu_proto.h
+@@ -35,4 +35,5 @@
+ #define VPU_OFF_REPLY 256     /* struct vpu_reply */
+ #define VPU_OFF_STATS 320     /* struct vpu_stats: the worker's running counters, one line it rewrites after every reply (phitop reads it) */
++#define VPU_OFF_CDMA_STATS 192   /* the card DMA channel's traffic: u64 bytes into the card, bytes out, copies in, copies out; one line rewritten after every reply (phitop reads it) */
+ #define VPU_OFF_DATA  (1u << 20)   /* bulk data starts here, page aligned */
+ 
+diff --git a/card/vpu/worker.S b/card/vpu/worker.S
+index 4566f9d..d5cda6b 100644
+--- a/card/vpu/worker.S
++++ b/card/vpu/worker.S
+@@ -62,4 +62,10 @@ use_dma:	.skip 4			# -d: the card's own DMA channel for the pull (cdma.S)
+ nthreads:	.skip 4			# pool threads; the dispatcher is one more
+ busy_cores:	.skip 4
++# The card's cores: its CPUs (this process may run on all of them at start)
++# over four, or -N; 57 on a 3120A, 61 on a 7120A. The last is the
++# dispatcher's (CPU 0 is one of its hardware threads).
++	.globl ncores
++ncores:	.skip 4
++ncores_arg:	.skip 4		# -N: the count, 0 to count the CPUs
+ # Protocol v3 (sched.S): -S slot processes of -C cores each, -T threads a
+ # core; the pool of this process is laid over cores core_base ..
+@@ -72,4 +78,7 @@ core_base:	.skip 4
+ core_count:	.skip 4
+ slot_index:	.skip 4			# -1 in the dispatcher, the slot's index in a slot process
++	.globl overlap, mate_base
++overlap:	.skip 4			# -O: the slots share the wide pool's cores, on hardware threads 1 and 2 (sched.md)
++mate_base:	.skip 4			# added to a pool thread's place on its core before pool_slot: 2 in a slot under -O
+ shared:	.skip 8			# the page every process shares (SH_*, proto.inc)
+ 	.balign 64
+@@ -94,6 +103,6 @@ pool_done:	.skip DONE_GROUPS * 64
+ pool_parked:	.skip 4			# pool threads asleep in the kernel
+ 	.balign 64
+-cores:	.skip NCORES * 64		# each core's count of threads finished, on a line of its own
+-core_threads:	.skip NCORES * 4
++cores:	.skip NCORES_MAX * 64		# each core's count of threads finished, on a line of its own
++core_threads:	.skip NCORES_MAX * 4
+ 	.balign 64
+ jobs:	.skip (MAX_POOL + 1) * JOB_BYTES
+@@ -146,6 +155,5 @@ _start:
+ 	movl $1, slot_tpc(%rip)
+ 	movl $-1, slot_index(%rip)
+-	movl $NCORES, core_count(%rip)
+-	movl $57, %r13d			# max_threads (the dispatcher included)
++	xorl %r13d, %r13d		# max_threads (the dispatcher included): 0 = the card's cores, set after the arguments
+ 	# argv: (rsp) argc, 8(rsp) argv[0], ...
+ 	movq (%rsp), %r12
+@@ -158,7 +166,14 @@ _start:
+ 	call str_eq
+ 	testl %eax, %eax
+-	jz 2f
++	jz 20f
+ 	incl vpu_verbose(%rip)
+ 	jmp 8f
++20:	movq (%rbx), %rsi
++	leaq s_O(%rip), %rdi
++	call str_eq
++	testl %eax, %eax
++	jz 2f
++	movl $1, overlap(%rip)
++	jmp 8f
+ 2:	movq (%rbx), %rsi
+ 	leaq s_t(%rip), %rdi
+@@ -258,4 +273,12 @@ _start:
+ 	jmp 8f
+ 74:	movq (%rbx), %rsi
++	leaq s_N(%rip), %rdi
++	call str_eq
++	testl %eax, %eax
++	jz 76f
++	call opt_value
++	movl %eax, ncores_arg(%rip)
++	jmp 8f
++76:	movq (%rbx), %rsi
+ 	call parse_u64
+ 	testq %rdx, %rdx
+@@ -265,10 +288,17 @@ _start:
+ 	decq %r12
+ 	jmp 1b
+-9:	cmpl $1, %r13d
++9:	call count_cores
++	movl ncores(%rip), %eax
++	movl %eax, core_count(%rip)
++	testl %r13d, %r13d
++	jnz 91f
++	movl %eax, %r13d
++91:	cmpl $1, %r13d
+ 	jge 10f
+ 	movl $1, %r13d
+-10:	cmpl $MAX_POOL + 1, %r13d
++10:	shll $2, %eax			# every hardware thread of the card at most
++	cmpl %eax, %r13d
+ 	jle 11f
+-	movl $MAX_POOL + 1, %r13d
++	movl %eax, %r13d
+ 11:
+ 	# /dev/phihost: the control area (16 KiB) and the whole window.
+@@ -318,9 +348,11 @@ _start:
+ 
+ 	# The dispatcher: its block as fs (slot MAX_POOL), pinned to CPU 0,
+-	# which is core 56's last hardware thread.
++	# one of the last core's hardware threads.
+ 	leaq tls_blocks + MAX_POOL * TLS_BYTES(%rip), %rdi
+ 	movq %rdi, TLS_SELF(%rdi)
+ 	movq $-1, TLS_INDEX(%rdi)
+-	movq $56, TLS_CORE(%rdi)
++	movl ncores(%rip), %eax
++	decl %eax
++	movq %rax, TLS_CORE(%rdi)
+ 	movq $3, TLS_MATE(%rdi)
+ 	movq %rdi, %rsi
+@@ -737,4 +769,8 @@ main_loop:
+ 	movl $1, %edx
+ 	call phi_copy64
++	leaq OFF_CDMA_STATS(%rbx), %rdi		# the DMA channel's traffic beside it
++	leaq cdma_stats(%rip), %rsi
++	movl $1, %edx
++	call phi_copy64
+ 	cmpl $0, trace(%rip)
+ 	je 6f
+@@ -802,5 +838,6 @@ main_loop:
+ 
+ # pool_start: edi pool threads. Counts each core's threads, then creates
+-# them core-major (thread t on core t mod 57, its slot from pool_slot).
++# them core-major (thread t on core core_base + t mod core_count, its slot
++# from pool_slot).
+ pool_start:
+ 	pushq %rbx
+@@ -823,5 +860,5 @@ pool_start:
+ 	xorl %ecx, %ecx
+ 	leaq core_threads(%rip), %rax
+-3:	cmpl $NCORES, %ebx
++3:	cmpl ncores(%rip), %ebx
+ 	jge 4f
+ 	cmpl $0, (%rax,%rbx,4)
+@@ -903,9 +940,11 @@ create_thread:
+ # pool_slot: the hardware thread of slot esi on core edi: a core's first two
+ # threads go to hardware threads 0 and 3, keeping 1 and 2 (where the
+-# card's block-device pollers run) free; core 56's thread 3 is the
+-# dispatcher's, so there the order is 0, 1, 2, 3. Returns eax.
++# card's block-device pollers run) free; the last core's thread 3 is the
++# dispatcher's (CPU 0), so there the order is 0, 1, 2, 3. Returns eax.
+ pool_slot:
+ 	andl $3, %esi
+-	cmpl $56, %edi
++	movl ncores(%rip), %eax
++	decl %eax
++	cmpl %eax, %edi
+ 	je 1f
+ 	leaq slot_order(%rip), %rax
+@@ -915,4 +954,48 @@ pool_slot:
+ 	ret
+ 
++# count_cores: ncores = -N when given, else the CPUs this process may run
++# on (every online CPU at start) over four, at most NCORES_MAX; a failed
++# query or a count that is not a whole number of cores leaves 57, the
++# 3120A's. Uses the affinity buffer, which pin_cpu fills again later.
++count_cores:
++	pushq %rbx
++	movl ncores_arg(%rip), %eax
++	testl %eax, %eax
++	jnz 5f
++	xorl %edi, %edi
++	movl $128, %esi
++	leaq affinity(%rip), %rdx
++	SYS SYS_sched_getaffinity
++	testq %rax, %rax
++	jle 7f
++	movl %eax, %ecx			# bytes the kernel wrote
++	leaq affinity(%rip), %rsi
++	xorl %ebx, %ebx			# CPUs
++1:	movzbl (%rsi), %eax
++2:	testl %eax, %eax
++	jz 3f
++	movl %eax, %edx
++	andl $1, %edx
++	addl %edx, %ebx
++	shrl $1, %eax
++	jmp 2b
++3:	incq %rsi
++	decl %ecx
++	jnz 1b
++	testl $3, %ebx
++	jnz 7f
++	movl %ebx, %eax
++	shrl $2, %eax
++	jz 7f
++5:	cmpl $NCORES_MAX, %eax
++	jbe 6f
++	movl $NCORES_MAX, %eax
++6:	movl %eax, ncores(%rip)
++	popq %rbx
++	ret
++7:	movl $57, ncores(%rip)
++	popq %rbx
++	ret
++
+ # pin_cpu: this thread onto CPU edi.
+ pin_cpu:
+@@ -945,8 +1028,11 @@ pool_thread:
+ 	movq %fs:TLS_CORE, %r13		# core
+ 	movq %fs:TLS_MATE, %rsi
++	addl mate_base(%rip), %esi		# a slot under -O: hardware threads 1 and 2
+ 	movl %r13d, %edi
+ 	call pool_slot
+ 	leal 1(%rax,%r13,4), %edi
+-	cmpl $228, %edi
++	movl ncores(%rip), %eax
++	shll $2, %eax			# past the last CPU: the last core's thread 3 is CPU 0
++	cmpl %eax, %edi
+ 	jb 1f
+ 	xorl %edi, %edi
+@@ -1311,7 +1397,7 @@ vpu_pool_cores:
+ 	movl nthreads(%rip), %eax
+ 	incl %eax
+-	cmpl $NCORES, %eax
++	cmpl ncores(%rip), %eax
+ 	jle 1f
+-	movl $NCORES, %eax
++	movl ncores(%rip), %eax
+ 1:	ret
+ 
+@@ -1662,8 +1748,8 @@ trace_note:
+ 	leaq s_tr9(%rip), %rsi
+ 	call w_str
+-	# its CPU: 1 + 4 core + slot, core = t mod 57, slot from pool_slot
++	# its CPU: 1 + 4 core + slot, core = t mod ncores, slot from pool_slot
+ 	movl %ebp, %eax
+ 	xorl %edx, %edx
+-	movl $NCORES, %ecx
++	movl ncores(%rip), %ecx
+ 	divl %ecx
+ 	movl %edx, %edi
+@@ -1777,4 +1863,5 @@ stage_note:
+ slot_order:	.byte 0, 3, 1, 2
+ s_v:	.asciz "-v"
++s_O:	.asciz "-O"
+ s_t:	.asciz "-t"
+ s_s:	.asciz "-s"
+@@ -1787,4 +1874,5 @@ s_C:	.asciz "-C"
+ s_T:	.asciz "-T"
+ s_R:	.asciz "-R"
++s_N:	.asciz "-N"
+ s_cdma:	.asciz "cdma: "
+ s_cdma_up:	.asciz "channel 7 carries the pull: ring and landing area at "
+diff --git a/card/vpu/worker.md b/card/vpu/worker.md
+index 638ed11..d3fad7e 100644
+--- a/card/vpu/worker.md
++++ b/card/vpu/worker.md
+@@ -10,8 +10,12 @@ pole after the whole-expert placement). No libc: system calls direct
+ 
+ ```
+-phi-vpu-worker [-v] [-t N] [-s MS] [-i US] [-e N] [-m 0|1] [-d 0|1] [-S slots] [-C cores] [-T threads] [-R pages] [threads]
++phi-vpu-worker [-v] [-O] [-t N] [-s MS] [-i US] [-e N] [-m 0|1] [-d 0|1] [-S slots] [-C cores] [-T threads] [-R pages] [-N cores] [threads]
+ ```
+ 
+-`threads` 1 to 228 (57): the dispatcher plus the pool. `-v` logs each
++`threads` 1 to every hardware thread of the card (default and 0: one a
++core, 57 on a 3120A, 61 on a 7120A): the dispatcher plus the pool.
++`-N cores` sets the card's core count instead of counting its CPUs
++(`count_cores`: the CPUs this process may run on at start over four; a
++failed count leaves 57). `-v` logs each
+ request (the matrix service's at `-v -v`, since a line costs its reply
+ 35 to 60 us on the host-backed disk); `-s MS` spins that long after a
+@@ -33,7 +37,7 @@ dispatches or requests (below).
+   opens `/dev/phiblk1` with `O_DIRECT` (the page cache would serve the
+   host's stale bytes otherwise), sets its own per-thread block as `fs`
+-  (`arch_prctl`), pins itself to CPU 0 (core 56's last hardware thread,
++  (`arch_prctl`), pins itself to CPU 0 (one of the last core's threads,
+   so the pool's core-major fill never lands a worker on its core until
+-  all 227 others are taken), calibrates its clock, opens the card's DMA
++  every other is taken), calibrates its clock, opens the card's DMA
+   channel for the pull (`cdma_open`, `cdma.md`; one log line says
+   whether it is up, with the DCR and tail it found, or why not; `-d 0`
+@@ -44,8 +48,8 @@ dispatches or requests (below).
+   (`SCRATCH_DISP`, the same in every thread's block), then `VPU_MAGIC`
+   at `OFF_READY`.
+-- **The pool.** Thread `t` lives on core `t mod 57`, its hardware
++- **The pool.** Thread `t` lives on core `core_base + t mod core_count`, its hardware
+   thread from `pool_slot` (a core's first two threads on hardware
+   threads 0 and 3, keeping 1 and 2, where the block devices' pollers
+-  run, free; core 56 in order 0..3), pinned by `sched_setaffinity` from
++  run, free; the last core in order 0..3), pinned by `sched_setaffinity` from
+   inside the thread, with a 64 KiB alternate signal stack for the exec
+   engine's handlers and a 256 KiB stack. A thread is `clone` with
+@@ -172,2 +176,37 @@ CPU 4c + h + 1 for c < 56; core 56's are CPUs 225, 226, 227 and 0. The
+ worker reserves the program's address range first thing
+ ([`resident.md`](resident.md)).
++
++## The same layout on a 7120A (2026-10-22)
++
++The worker counts the card's cores at start (`ncores`, 61 on a 7120A), so
++the layout above is `-S 1 -C 59 -T 2 -R 128 -s 1000` there (the scripts
++pass `-C` as the card's cores less two): 118 pool threads, two on each of
++cores 0 to 58 (hardware threads 0 and 3), the slot's control thread on
++core 59's thread 0 (CPU 237), the dispatcher on CPU 0 (core 60) with the
++wide pool asleep on cores 59 and 60. Measured on the 7120A, every task's
++`Cpus_allowed_list` against `/proc/cpuinfo`'s APIC IDs: exactly that, no
++thread unpinned; and `/proc/stat` before and after the region gate: both
++pool threads of each of the 59 cores on the CPU for the whole run (341 to
++343 ticks), hardware threads 1 and 2 idle. With `-N 57 -C 55` the worker
++pins every thread where the 57-core worker of 2026-10-14 did (the same
++CPU for each of its 120 threads), the check that a 3120A's layout is
++unchanged.
++
++## Slots beside the pool (`-O`, 2026-11-06)
++
++`-O` lets the slots share the wide pool's cores instead of taking cores
++of their own. Each core has four hardware threads; the pool keeps
++threads 0 and 3 (`pool_slot`, `slot_order` 0, 3, 1, 2) of cores 0 to
++`ncores - 2`, and a slot's threads take threads 1 and 2 of its cores
++(`mate_base` 2 added to `TLS_MATE` before `pool_slot`, set in the slot
++process). The slot's control thread goes to the last core's hardware
++thread 1 (CPU 4 (ncores - 1) + 2, 242 on a 7120A), the dispatcher stays
++on CPU 0. On a 7120A, `-O -S 1 -C 59 -T 2` with 121 threads gives the
++translated regions 118 threads on cores 0 to 58 beside the matrix
++service's 120 on cores 0 to 59; core 59's threads 1 and 2 stay with the
++block-device pollers. `-T` above 2 would wrap onto the pool's threads
++and is not meant with `-O`.
++
++After every reply the worker also stores `cdma_stats` at `OFF_CDMA_STATS`
++(192, `vpu_proto.h`): the DMA channel's bytes and copies each way, which
++phitop shows on its pcie line (2026-11-06).
+diff --git a/host/asm/ggml-phi/backend.S b/host/asm/ggml-phi/backend.S
+index 9f25cff..ce2f2d5 100644
+--- a/host/asm/ggml-phi/backend.S
++++ b/host/asm/ggml-phi/backend.S
+@@ -65,4 +65,6 @@ tg_only:	.skip 8			# PHI_GGML_TG_ONLY=K: a multiply of more than K tokens stays
+ pp_only:	.skip 8			# PHI_GGML_PP_ONLY: tokens a multiply must exceed to reach a card (0: off)
+ all_rows:	.skip 4
++	.globl stream_on
++stream_on:	.skip 4			# PHI_GGML_STREAM: the weights stay in the window (host RAM), the card pulls them per multiply
+ unmapped_said:	.skip 4
+ ids_env:	.skip 4			# PHI_GGML_IDS set
+@@ -239,4 +241,5 @@ e_tg_only:	.asciz "PHI_GGML_TG_ONLY"
+ e_min_bytes:	.asciz "PHI_GGML_MIN_BYTES"
+ e_pp_adapt:	.asciz "PHI_GGML_PP_ADAPT"
++e_stream:	.asciz "PHI_GGML_STREAM"
+ e_act:	.asciz "PHI_GGML_ACT"
+ e_ffn_h16:	.asciz "PHI_GGML_FFN_H16"
+@@ -286,4 +289,6 @@ s_nocards:	.asciz "no card is up with a worker polling; nothing to share the wor
+ s_clear:	.asciz "could not clear card "
+ s_allrows_needs:	.asciz "PHI_GGML_ALL_ROWS needs PHI_GGML_OFFLOAD=1 (the judgement needs host rows): ignored"
++s_stream_on:	.asciz "stream: every weight stays in host RAM, in the window above the transfer areas; each multiply has the card pull its rows (no upload into the card's memory, no fused feed-forward, no pairs)"
++s_stream_full:	.asciz "stream: the window is full; this tensor stays with the host"
+ s_experts_host:	.asciz "whole experts without the offload: the host keeps its copy of every expert (a batch handed to a GPU reads it) and skips the cards' at a generation step; the judge is off"
+ s_experts_err1:	.asciz "PHI_GGML_EXPERTS: "
+@@ -1201,5 +1206,17 @@ phi_ggml_open:
+ 	call say
+ 	movl $0, all_rows(%rip)
+-81:	# whole experts
++81:	# the weights streamed from host RAM (PHI_GGML_STREAM)
++	leaq e_stream(%rip), %rdi
++	xorl %esi, %esi
++	call env_u64
++	testq %rax, %rax
++	setnz %al
++	movzbl %al, %eax
++	movl %eax, stream_on(%rip)
++	testl %eax, %eax
++	jz 85f
++	leaq s_stream_on(%rip), %rsi
++	call say
++85:	# whole experts
+ 	movl $0, place_any(%rip)
+ 	leaq e_experts(%rip), %rdi
+@@ -3125,5 +3142,42 @@ upload_area:
+ 	movq %rdi, %rbx
+ 	movq %rsi, %r12
+-	call mm_clear
++	cmpl $0, stream_on(%rip)
++	je 5f
++	# streamed: the staged area goes to this card's next place in the
++	# window above the transfer areas (host RAM) and stays there; no
++	# upload. The id is that window offset with bit 63 set, which issue
++	# turns into a_id 0 and a_off (the card's own path for a in the window).
++	movq %r12, %rdi
++	call round_up
++	movq %rax, %r13				# whole blocks
++	movq CD_STREAM_AT(%rbx), %rax
++	testq %rax, %rax
++	jnz 2f
++	movq $WINDOW_LEN, %rax			# the first place: above OFF_D + D_MAX
++2:	leaq (%rax,%r13), %rcx
++	cmpq CD_WIN_LEN(%rbx), %rcx
++	ja 3f
++	movq %rcx, CD_STREAM_AT(%rbx)
++	movq CD_BASE(%rbx), %rdi
++	addq %rax, %rdi
++	movq CD_BASE(%rbx), %rsi
++	addq $OFF_A, %rsi
++	movq %r12, %rdx
++	call mem_copy
++	movq CD_STREAM_AT(%rbx), %rax
++	subq %r13, %rax
++	btsq $63, %rax
++	popq %r13
++	popq %r12
++	popq %rbx
++	ret
++3:	leaq s_stream_full(%rip), %rsi
++	call say
++	xorl %eax, %eax
++	popq %r13
++	popq %r12
++	popq %rbx
++	ret
++5:	call mm_clear
+ 	movq CD_NEXT_ID(%rbx), %r13
+ 	leaq mm_buf(%rip), %rax
+@@ -4632,5 +4686,9 @@ issue:
+ 	movq RDW_CI(%r15), %rcx
+ 	movq SP_ID(%rax,%rcx,8), %rax
+-	movq %rax, MM_A_ID(%rdi)
++	btrq $63, %rax				# a streamed slice: its window offset (upload_area)
++	jnc 1f
++	movq %rax, MM_A_OFF(%rdi)
++	xorl %eax, %eax				# a_id 0: the card pulls a from the window
++1:	movq %rax, MM_A_ID(%rdi)
+ 	movl RD_A_TYPE(%rbx), %eax
+ 	movl %eax, MM_A_TYPE(%rdi)
+@@ -4901,5 +4959,9 @@ work_max:
+ 	.globl phi_ggml_begin_id_pair
+ phi_ggml_begin_id_pair:
+-	pushq %rbp
++	cmpl $0, stream_on(%rip)		# streamed weights: no pairs (K_MATMUL_MORE names
++	je 1f					# resident slices), the two go one by one
++	movq $-2, %rax
++	ret
++1:	pushq %rbp
+ 	movq %rsp, %rbp
+ 	pushq %rbx
+@@ -5657,4 +5719,5 @@ phi_ggml_free_all:
+ 	movq $0, CD_UPLOADED(%rbx)
+ 	movl $0, CD_FULL(%rbx)
++	movq $0, CD_STREAM_AT(%rbx)		# the streamed weights' places, forgotten with the splits
+ 	incl %r12d
+ 	jmp 1b
+diff --git a/host/asm/ggml-phi/backend.md b/host/asm/ggml-phi/backend.md
+index 41e6344..2a21f91 100644
+--- a/host/asm/ggml-phi/backend.md
++++ b/host/asm/ggml-phi/backend.md
+@@ -156,2 +156,24 @@ backend. The backend loaded with no tensor allowed on a card
+ the CPU alone's 7.76 and 7.92, interleaved: the hand-offs, not the
+ cards, cost about 30 ms a token (`docs/results/2026-10-07-rack-generation.md`).
++
++## Streamed weights (`PHI_GGML_STREAM`, 2026-11-06)
++
++`PHI_GGML_STREAM=1` keeps every weight in host RAM: `upload_area` copies
++the slice it was handed (staged at `OFF_A`, the layout an upload would
++send) to this card's next place in the window above the transfer areas
++(`WINDOW_LEN`, 768 MiB, up to the mapped file's length `CD_WIN_LEN`; the
++place advances in `CD_STREAM_AT`) and sends no `K_UPLOAD`. The id it
++returns is that window offset with bit 63 set; the callers keep it in
++`SP_ID` as before. `issue` turns such an id into `a_id` 0 and `a_off`,
++the card's own path for a matrix in the window
++(`card/vpu/vpu_matmul.h`: "with a cached (a_id) or in the window
++(a_off)"; `matmul.S` grows `g_a` and pulls `m * nb_a` bytes through
++`vpu_pull`, the block device whose DMA is the stack's host channels,
++3.58 GB/s measured on the desktop link, then computes). A slice that
++does not fit what is left of the window stays with the host
++(`stream: the window is full; ...`). Pairs (`phi_ggml_begin_id_pair`
++answers -2) and the fused feed-forward (`ffn_enabled` in `glue.S`) are
++off while streaming, because `K_MATMUL_MORE` and `K_FFN` name resident
++slices. `phi_ggml_free_all` rewinds `CD_STREAM_AT` with the splits. A
++`K_FREE` of a streamed id finds nothing on the card and is answered OK.
++The card pulls a whole matrix and then computes (no overlap yet).
+diff --git a/host/asm/ggml-phi/defs.inc b/host/asm/ggml-phi/defs.inc
+index b072199..7b12a16 100644
+--- a/host/asm/ggml-phi/defs.inc
++++ b/host/asm/ggml-phi/defs.inc
+@@ -59,4 +59,5 @@
+ 	.set CD_F_N, 168
+ 	.set CD_WIN_LEN, 176
++	.set CD_STREAM_AT, 184		# PHI_GGML_STREAM: the next free byte of the window above WINDOW_LEN (0: none placed yet)
+ 	.set CD_BYTES, 256
+ 
+diff --git a/host/asm/ggml-phi/defs.md b/host/asm/ggml-phi/defs.md
+index 1f163eb..f55efc3 100644
+--- a/host/asm/ggml-phi/defs.md
++++ b/host/asm/ggml-phi/defs.md
+@@ -44,5 +44,7 @@ state) so the payload offsets begin at 16.
+   `CD_P_LO2`, `CD_P_ROWS2`, `CD_P_OFF2`, and `CD_P_NIDS` the ids sent
+   with whole experts), the fused request in flight (`CD_F_HAS`,
+-  `CD_F_SEQ`, `CD_F_MOUT`, `CD_F_N`). Rust's `Card::ids` (the tensor's
++  `CD_F_SEQ`, `CD_F_MOUT`, `CD_F_N`), and `CD_STREAM_AT` (184), the
++  next free byte of the window above `WINDOW_LEN` for streamed weights
++  (`PHI_GGML_STREAM`, 0 until the first is placed; `backend.md`). Rust's `Card::ids` (the tensor's
+   id on the card) lives in the split instead, `SP_ID[ci]`, which is the
+   same map keyed the same way.
+diff --git a/host/asm/ggml-phi/ggml_layout.inc b/host/asm/ggml-phi/ggml_layout.inc
+index e6cea99..eff46a7 100644
+--- a/host/asm/ggml-phi/ggml_layout.inc
++++ b/host/asm/ggml-phi/ggml_layout.inc
+@@ -20,5 +20,5 @@
+ 	.set CG_N_NODES, 4
+ 	.set CG_NODES, 16
+-	.set BUF_BUFT, 88
++	.set BUF_BUFT, 112
+ 	.set REG_BYTES, 48
+ 	.set REG_API_VERSION, 0
+@@ -93,5 +93,5 @@
+ 	.set GGML_OP_MUL_MAT, 29
+ 	.set GGML_OP_MUL_MAT_ID, 30
+-	.set GGML_OP_GLU, 100
++	.set GGML_OP_GLU, 101
+ 	.set GGML_GLU_OP_SWIGLU, 2
+ 	.set GGML_TENSOR_FLAG_OUTPUT, 2
+diff --git a/host/asm/ggml-phi/glue.S b/host/asm/ggml-phi/glue.S
+index 96cc2b9..4d34711 100644
+--- a/host/asm/ggml-phi/glue.S
++++ b/host/asm/ggml-phi/glue.S
+@@ -199,5 +199,9 @@ weight_readable:
+ # ffn_enabled: PHI_GGML_FFN=1, off under PHI_GGML_OFFLOAD (said once).
+ ffn_enabled:
+-	cmpl $-1, ffn_on(%rip)
++	cmpl $0, stream_on(%rip)		# streamed weights: K_FFN names resident slices
++	je 8f
++	xorl %eax, %eax
++	ret
++8:	cmpl $-1, ffn_on(%rip)
+ 	jne 9f
+ 	pushq %rbx
+diff --git a/host/asm/ggml-phi/glue.md b/host/asm/ggml-phi/glue.md
+index d839796..f6e8276 100644
+--- a/host/asm/ggml-phi/glue.md
++++ b/host/asm/ggml-phi/glue.md
+@@ -46,5 +46,6 @@ hands out a backend from a pool of eight (`BE_SLOT`, `BE_USED`).
+ - `GLU` (SwiGLU, split) when `PHI_GGML_FFN` is on and the node is part
+   of a fusable block (`ffn_enabled`; off under `PHI_GGML_OFFLOAD` with
+-  the message the C gave).
++  the message the C gave; off while `PHI_GGML_STREAM` is on, since
++  `K_FFN` names resident slices).
+ - views, reshapes, permutes and transposes are ggml's own and pass.
+ 
+diff --git a/host/asm/phi512/card.S b/host/asm/phi512/card.S
+index aaabc22..d8a0229 100644
+--- a/host/asm/phi512/card.S
++++ b/host/asm/phi512/card.S
+@@ -29,5 +29,5 @@ stat_resident_bytes:	.skip 8
+ stat_push_ns:	.skip 8
+ 	.globl fexec_threads
+-fexec_threads:	.skip 8			# PHI512_THREADS: card threads an instance may split over (114)
++fexec_threads:	.skip 8			# PHI512_THREADS: card threads an instance may split over (256: the card clamps it to its slot's pool plus one, fexec.S)
+ 
+ 	.section .rodata
+@@ -76,5 +76,5 @@ cards_init:
+ 	movq $0, ncards(%rip)
+ 	leaq s_env_threads(%rip), %rdi
+-	movl $114, %esi
++	movl $256, %esi			# every thread the slot has (two a core: 111 on a 3120A, 119 on a 7120A)
+ 	call env_u64
+ 	movq %rax, fexec_threads(%rip)
+diff --git a/host/asm/phi512/card.md b/host/asm/phi512/card.md
+index 1e5b425..4300dcd 100644
+--- a/host/asm/phi512/card.md
++++ b/host/asm/phi512/card.md
+@@ -33,5 +33,7 @@ The register file into the slot's `SD_REGS_IN` with the stripe's counter
+ and bound in the seed's registers; the request: `fn_id` = seed index +
+ 1, `entry` 0 (a hand-translated blob starts at the fault point),
+-`threads` from `PHI512_THREADS` (114), the split (`ind_reg`,
++`threads` from `PHI512_THREADS` (256 by default since 2026-10-22, was 114:
++the card clamps it to its slot's pool plus one, 111 on a 3120A, 119 on a
++7120A), the split (`ind_reg`,
+ `bound_reg`, `step` from the seed). The caller waits when every card's
+ instance is posted.
+diff --git a/host/asm/phi512/sigill.S b/host/asm/phi512/sigill.S
+index dede21c..90025d6 100644
+--- a/host/asm/phi512/sigill.S
++++ b/host/asm/phi512/sigill.S
+@@ -95,5 +95,10 @@ phi512_sigill:
+ 	jnz 97b
+ 	call alt_check				# on this thread's alternate stack? (one made if none)
+-	pushq %rax
++	cmpl $2, %eax				# made just now: this SIGILL runs on the program's stack, where
++	jne 99f					# a region's frames below rsp minus 128 never come back; nothing
++	cmpl $4, 72(%rsp)			# has run yet, so return and let the instruction fault again on
++	je .Lout				# the new stack (its floor 256 KiB lower: region.md)
++	xorl %eax, %eax				# a SIGTRAP keeps the program's stack, as before
++99:	pushq %rax
+ 	call maps_invalidate			# the mappings read afresh once per fault (elf.S maps_load)
+ 	popq %rax
+@@ -1006,5 +1011,6 @@ alt_install:
+ # alt_check: eax 1 when this fault's handler runs on the thread's
+ # alternate stack; a thread without one gets one for its next faults
+-# (this one runs on the program's stack: eax 0).
++# (eax 2: made just now, this fault still on the program's stack; eax 0:
++# none could be made).
+ alt_check:
+ 	subq $40, %rsp
+@@ -1022,4 +1028,9 @@ alt_check:
+ 	ret
+ 1:	call alt_install
++	testl %eax, %eax
++	jnz 2f
++	movl $2, %eax
++	addq $40, %rsp
++	ret
+ 2:	xorl %eax, %eax
+ 	addq $40, %rsp
+diff --git a/host/asm/phi512/sigill.md b/host/asm/phi512/sigill.md
+index 581f1fd..cd96f3a 100644
+--- a/host/asm/phi512/sigill.md
++++ b/host/asm/phi512/sigill.md
+@@ -51,7 +51,17 @@ The handler runs on the faulting thread's stack (no altstack yet), one
+ call at a time, on an alternate signal stack (2026-10-14: `SA_ONSTACK`,
+ `alt_install` for the main thread in the constructor and for any other
+-thread at its first fault, which itself still runs on the program's
+-stack; `alt_check` tells the region path, `on_alt`, so it may write
+-back below the frame's rsp: [`region.md`](region.md)). `sigill_lock` (a test-and-test-and-set spin taken after
++thread at its first fault; `alt_check` tells the region path, `on_alt`,
++so it may write back below the frame's rsp: [`region.md`](region.md)).
++Since 2026-11-06 that first fault runs nothing: `alt_check` returns 2
++when it made the stack just now, and the handler goes straight to
++`.Lout`, so the instruction faults again and its region runs on the new
++stack with the 256 KiB floor. Before, the first region of a thread ran
++on the program's stack with the floor at rsp minus 128, and frames its
++in-card callees wrote below that were lost: llama-bench on Qwen3.8-2B
++Q8_0 (llama.cpp 4b77dee, `-mavx512f`) took a divide error at
++`ggml_compute_forward_mul_mat+0x356`, `idiv` by a stack slot that never
++came back, right after "a region left rsp below its stack floor"
++(kernel journal 2026-11-06 00:44:25). A SIGTRAP, or a thread whose
++stack could not be made, keeps the old behaviour. `sigill_lock` (a test-and-test-and-set spin taken after
+ the prologue, released at `.Lout`, where every path ends) serializes the
+ threads, since the translation, the region path ([`region.md`](region.md):
+diff --git a/scripts/bench/common.md b/scripts/bench/common.md
+index 12652db..3d406ec 100644
+--- a/scripts/bench/common.md
++++ b/scripts/bench/common.md
+@@ -16,4 +16,5 @@ there).
+   a process holding one of the cards (production's `llama-server`), unless
+   `FORCE=1`; otherwise restarts each card's worker in slot mode:
+-  `PHI_VPU_HUGEPAGES=$HP PHI_VPU_ARGS="-S 1 -C 55 -T 2 -R $R -e 0 -s 1000"
+-  phi-vpu.sh -c N start 57`.
++  `PHI_VPU_HUGEPAGES=$HP PHI_VPU_ARGS="-S 1 -C $((n - 2)) -T 2 -R $R -e 0 -s 1000"
++  phi-vpu.sh -c N start $n` with `n` the card's cores (`phi-vpu.sh cores`: 57 on a
++  3120A, 61 on a 7120A).
+diff --git a/scripts/bench/common.sh b/scripts/bench/common.sh
+index d10368c..75e7f4d 100755
+--- a/scripts/bench/common.sh
++++ b/scripts/bench/common.sh
+@@ -32,5 +32,7 @@ bench_workers() {
+     for c in ${cards//,/ }; do
+         "$root/scripts/phi-vpu.sh" -c "$c" stop > /dev/null 2>&1
+-        PHI_VPU_HUGEPAGES=$HP PHI_VPU_ARGS="-S 1 -C 55 -T 2 -R $R -e 0 -s 1000" "$root/scripts/phi-vpu.sh" -c "$c" start 57 2>&1 | grep -iv "^worker started" | head -2
++        # two threads on every core but the last two: -C 55 on a 3120A, 59 on a 7120A
++        n=$("$root/scripts/phi-vpu.sh" -c "$c" cores)
++        PHI_VPU_HUGEPAGES=$HP PHI_VPU_ARGS="-S 1 -C $((n - 2)) -T 2 -R $R -e 0 -s 1000" "$root/scripts/phi-vpu.sh" -c "$c" start "$n" 2>&1 | grep -iv "^worker started" | head -2
+     done
+ }
+diff --git a/scripts/gates.md b/scripts/gates.md
+index adea0d0..78c9af6 100644
+--- a/scripts/gates.md
++++ b/scripts/gates.md
+@@ -39,5 +39,6 @@ and in the script.
+    and runs the AVX2 twin's op-test natively for the reference.
+ 4. For each gate: `phi-vpu.sh stop`, then
+-   `PHI_VPU_ARGS="-S 1 -C 55 -T 2 -R 128 -s 1000" phi-vpu.sh start 57`,
++   `PHI_VPU_ARGS="-S 1 -C $((cores - 2)) -T 2 -R 128 -s 1000" phi-vpu.sh start $cores`
++   (`cores` from `phi-vpu.sh cores`: `-C 55` and 57 on a 3120A, 59 and 61 on a 7120A),
+    then the program with `PHI512_CARD_ATOMICS=1 PHI512_CARDS=N
+    LD_PRELOAD=lib.so` under a 900 s timeout.
+diff --git a/scripts/gates.sh b/scripts/gates.sh
+index 93f858b..2fa1d4c 100755
+--- a/scripts/gates.sh
++++ b/scripts/gates.sh
+@@ -66,7 +66,10 @@ case " $only " in *" op "*) ggml op-512 ggml-op-test.c "$b512" && ggml op-avx2 g
+ prev_hp=$("$vpu" -c "$card" config 2>/dev/null | awk '/^hugepages/ {print $2}')
+ prev_w=$("$vpu" -c "$card" config 2>/dev/null | awk '/^worker/ {$1 = ""; sub(/^ +-v */, ""); print}')
++# One slot with two threads on every core but the last two (-C 55 on a
++# 3120A, 59 on a 7120A), the wide pool and the dispatcher on those.
++cores=$("$vpu" -c "$card" cores)
+ fresh() {
+     "$vpu" -c "$card" stop > /dev/null 2>&1
+-    PHI_VPU_ARGS="-S 1 -C 55 -T 2 -R 128 -s 1000" "$vpu" -c "$card" start 57 > "$logs/worker-$1.txt" 2>&1
++    PHI_VPU_ARGS="-S 1 -C $((cores - 2)) -T 2 -R 128 -s 1000" "$vpu" -c "$card" start "$cores" > "$logs/worker-$1.txt" 2>&1
+ }
+ # NAME EXPECTED_OK EXTRA_ENV BIN [ARGS]: a fresh worker, the program under
+diff --git a/scripts/phi-vpu.md b/scripts/phi-vpu.md
+index a71e5ac..6f0dcd6 100644
+--- a/scripts/phi-vpu.md
++++ b/scripts/phi-vpu.md
+@@ -3,5 +3,6 @@
+ ```
+ scripts/phi-vpu.sh [-c N] deploy        build the worker on the host (GNU as and ld, audited) and put it on the card
+-scripts/phi-vpu.sh [-c N] start [T]     start the worker with T threads (default 114, two per core)
++scripts/phi-vpu.sh [-c N] cores         the card's cores: its CPUs over four (57 on a 3120A, 61 on a 7120A)
++scripts/phi-vpu.sh [-c N] start [T]     start the worker with T threads (default two per core: 114 on a 3120A, 122 on a 7120A)
+ scripts/phi-vpu.sh [-c N] stop          stop the worker and release the huge pages
+ scripts/phi-vpu.sh [-c N] status        worker process on the card, control words on the host
+diff --git a/scripts/phi-vpu.sh b/scripts/phi-vpu.sh
+index 7875b73..941a433 100755
+--- a/scripts/phi-vpu.sh
++++ b/scripts/phi-vpu.sh
+@@ -3,5 +3,6 @@
+ #
+ #   scripts/phi-vpu.sh [-c N] deploy        build the worker on the host (GNU as and ld, audited) and put it on the card
+-#   scripts/phi-vpu.sh [-c N] start [T]     start the worker with T threads (default 114, two per core);
++#   scripts/phi-vpu.sh [-c N] cores         the card's cores (its CPUs over four: 57 on a 3120A, 61 on a 7120A)
++#   scripts/phi-vpu.sh [-c N] start [T]     start the worker with T threads (default two per core: 114, 122);
+ #                                           PHI_VPU_ARGS="-s MS -i US" passes worker options
+ #                                           PHI_VPU_HUGEPAGES=N huge pages reserved on the card at start (768)
+@@ -27,5 +28,7 @@ phi_env "$@"
+ set -- "${PHI_ARGS[@]}"
+ dir=${PHI_VPU_DIR:-/opt/phi/vpu}
+-threads_default=114   # two threads on each of the 57 cores (card/vpu/vpu_worker.md, "Two threads per core")
++# The default thread count: two threads on each of the card's cores
++# (card/vpu/vpu_worker.md, "Two threads per core"), asked of the card when
++# a start needs it.
+ 
+ # The card over the stack's control socket (`phi run`, `phi put`, `phi get`:
+@@ -54,4 +57,7 @@ pat='phi-vpu-worke[r]'
+ 
+ running() { ssh_ "pgrep -f '$pat' >/dev/null"; }
++# The card's cores: four hardware threads each (the worker counts them the
++# same way, card/vpu/worker.S count_cores).
++card_cores() { echo $(( $(ssh_ nproc) / 4 )); }
+ 
+ driver() {
+@@ -94,5 +100,5 @@ case "$cmd" in
+     start)
+         refuse_if_swapping
+-        n=${1:-$threads_default}
++        n=${1:-$(( 2 * $(card_cores) ))}
+         # The worker takes its buffers from 2 MiB huge pages when the card has
+         # them (one block record per 512 KiB instead of one per scattered
+@@ -126,4 +132,7 @@ case "$cmd" in
+         ssh_ "echo 0 > /proc/sys/vm/nr_hugepages"
+         ;;
++    cores)
++        card_cores
++        ;;
+     status)
+         if running; then echo "card $PHI_CARD: worker running"; else echo "card $PHI_CARD: no worker"; fi
+diff --git a/scripts/phi512.md b/scripts/phi512.md
+index 7339f28..de26698 100644
+--- a/scripts/phi512.md
++++ b/scripts/phi512.md
+@@ -96,5 +96,7 @@ core, a 256 MiB residency pool, the pool awake a second after a job).
+ `PHI_VPU_ARGS` set explicitly still wins.
+ 
+-The worker's arguments under `PHI512_V3=1` are `-S 1 -C 55 -T 2 -R 128 -s
+-1000` since 2026-10-13 (the control thread needs a core of its own:
++The worker's arguments under `PHI512_V3=1` are `-S 1 -C (cores - 2) -T 2 -R 128 -s
++1000` with the start's thread count the card's cores (`phi-vpu.sh cores`:
++`-C 55` and 57 on a 3120A since 2026-10-13, `-C 59` and 61 on a 7120A
++since 2026-10-22; the control thread needs a core of its own:
+ [`../card/vpu/sched.md`](../card/vpu/sched.md)).
+diff --git a/scripts/phi512.sh b/scripts/phi512.sh
+index 88cdd3f..4f35afe 100755
+--- a/scripts/phi512.sh
++++ b/scripts/phi512.sh
+@@ -103,10 +103,13 @@ else
+         }
+         # Stdin is the program's: the start's ssh would read it. One thread per
+-        # core: the seamless path splits a loop over 57 (offload.rs,
+-        # SPLIT_THREADS) and copies through the window one core at a time,
+-        # so a second thread per core only polls beside them (the default,
+-        # 114, is the matrix multiplies'; card/vpu/vpu_worker.md).
++        # core: the seamless path splits a loop over the card's cores
++        # (offload.rs, SPLIT_THREADS) and copies through the window one core
++        # at a time, so a second thread per core only polls beside them (the
++        # default, two a core, is the matrix multiplies'; card/vpu/vpu_worker.md).
++        # Under PHI512_V3 one slot takes two threads on every core but the
++        # last two (the control plane): -C 55 on a 3120A, 59 on a 7120A.
+         # (the restart's preload needs slots and a pool: -S 12 -C 4 -R 64.)
+-        PHI_VPU_ARGS="${PHI_VPU_ARGS:-${PHI512_V3:+-S 1 -C 55 -T 2 -R 128 -s 1000}}" "$root/scripts/phi-vpu.sh" -c "$card" start 57 >&2 </dev/null || {
++        cores=$("$root/scripts/phi-vpu.sh" -c "$card" cores </dev/null)
++        PHI_VPU_ARGS="${PHI_VPU_ARGS:-${PHI512_V3:+-S 1 -C $((cores - 2)) -T 2 -R 128 -s 1000}}" "$root/scripts/phi-vpu.sh" -c "$card" start "$cores" >&2 </dev/null || {
+             echo "phi512: could not start the worker on card $card (is the card up? phi -c $card status)" >&2
+             exit 1

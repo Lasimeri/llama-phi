@@ -1,0 +1,181 @@
+diff --git a/host/asm/phitop/defs.inc b/host/asm/phitop/defs.inc
+index d2aa2b9..8e662b0 100644
+--- a/host/asm/phitop/defs.inc
++++ b/host/asm/phitop/defs.inc
+@@ -69,6 +69,7 @@
+ # host-memory window): its counters since it started, copied whole into
+ # the snapshot when the window is mapped (SN_VPU_HAVE 1).
+ 	.set VPU_OFF_STATS, 320
++	.set VPU_OFF_CDMA_STATS, 192	# the worker's DMA channel line (vpu_proto.h): bytes in, bytes out, copies in, copies out
+ 	.set VS_REQUESTS, 0
+ 	.set VS_ERRORS, 8
+ 	.set VS_BUSY_NS, 16
+@@ -95,7 +96,8 @@
+ 	.set PW_VPU, 72
+ 	.set PW_WHOLE, 80
+ 	.set PW_SHAPE, 88
+-	.set SN_PWG, SN_VPU_HAVE + 8
++	.set SN_CDMA, SN_VPU_HAVE + 8		# 32 bytes: the worker's DMA channel counters (VPU_OFF_CDMA_STATS)
++	.set SN_PWG, SN_CDMA + 32
+ 	.set SN_PWG_HAVE, SN_PWG + PWG_SIZE
+ # An MD program's stats block (Intel-Phi-AmberMD: src/card/mdstat.h,
+ # docs/md-stats.md): the first 128 bytes of the window's page at MD_PART
+@@ -170,7 +172,9 @@
+ # pwgd's rates (derive_pwg): chunks a second and the mean worker's busy
+ # percent in tenths, compute and DMA time per chunk, VPU instructions a
+ # second and per chunk, then the block's own counts.
+-	.set DV_PWG_HAVE, DV_VPU_HAVE + 88
++	.set DV_CDMA_IN, DV_VPU_HAVE + 88	# the worker's DMA channel, bytes a second into the card
++	.set DV_CDMA_OUT, DV_VPU_HAVE + 96	# and out of it
++	.set DV_PWG_HAVE, DV_VPU_HAVE + 104
+ 	.set DV_PWG_CHUNK_TENTHS, DV_PWG_HAVE + 8
+ 	.set DV_PWG_BUSY_TENTHS, DV_PWG_HAVE + 16
+ 	.set DV_PWG_COMPUTE_NS, DV_PWG_HAVE + 24
+diff --git a/host/asm/phitop/defs.md b/host/asm/phitop/defs.md
+index ce47ff1..619fc1a 100644
+--- a/host/asm/phitop/defs.md
++++ b/host/asm/phitop/defs.md
+@@ -36,3 +36,10 @@ magic `AMDS`, a sequence word at 8 (odd while the card writes), then steps done
+ the time step in 1/1000 fs, atoms, threads, total energy in 1/1000 kcal/mol (signed),
+ temperature in 1/1000 K, the team's ns in parallel work, ns inside steps, state, pid, and a
+ 32-byte name. `DV_MD_*` holds the derived rates and a copy of the block for the view.
++
++`VPU_OFF_CDMA_STATS` (192): the worker's DMA channel line in the window's
++control area (`vpu_proto.h`): bytes into the card, bytes out, copies in,
++copies out, u64 each, rewritten after every reply. Copied into the
++snapshot at `SN_CDMA` (32 bytes, before `SN_PWG`); `derive_vpu` turns the
++two byte counters into `DV_CDMA_IN` and `DV_CDMA_OUT` (bytes a second,
++`per_second`; 0 when a counter went backwards).
+diff --git a/host/asm/phitop/main.S b/host/asm/phitop/main.S
+index adad7a0..7ef37a9 100644
+--- a/host/asm/phitop/main.S
++++ b/host/asm/phitop/main.S
+@@ -432,6 +432,18 @@ slot_vpu_sample:
+ 	jnz 1b
+ 	movq SL_CUR(%rbx), %rdi
+ 	movq $1, SN_VPU_HAVE(%rdi)
++	# the worker's DMA channel line beside it (VPU_OFF_CDMA_STATS):
++	# four counters that only grow, zero from a worker without them
++	leaq vpu_maps(%rip), %rcx
++	movq (%rcx,%r12,8), %rsi
++	addq $VPU_OFF_CDMA_STATS, %rsi
++	movl $4, %ecx
++2:	movq (%rsi), %rax
++	movq %rax, SN_CDMA(%rdi)
++	addq $8, %rsi
++	addq $8, %rdi
++	decl %ecx
++	jnz 2b
+ 5:	leaq pwg_maps(%rip), %rcx
+ 	movq (%rcx,%r12,8), %rsi
+ 	movq SL_CUR(%rbx), %rdi
+diff --git a/host/asm/phitop/main.md b/host/asm/phitop/main.md
+index 8534080..d37c282 100644
+--- a/host/asm/phitop/main.md
++++ b/host/asm/phitop/main.md
+@@ -60,3 +60,7 @@ window's page at `MD_PART` (1320 MiB, Intel-Phi-AmberMD's part, its `docs/md-sta
+ there and the block's sequence word was even and the same before and after the copy (up to
+ three tries; the card writes the page uncached, so its stores arrive in order). Without the
+ block nothing changes.
++
++`slot_vpu_sample` also copies the worker's DMA channel line
++(`VPU_OFF_CDMA_STATS`, four u64 counters) into `SN_CDMA` when the window
++is mapped (2026-11-06).
+diff --git a/host/asm/phitop/model.S b/host/asm/phitop/model.S
+index aa84dc1..9b25ee9 100644
+--- a/host/asm/phitop/model.S
++++ b/host/asm/phitop/model.S
+@@ -664,7 +664,21 @@ derive_vpu:
+ 	xorl %edx, %edx
+ 	divq %rbx
+ 	movq %rax, DV_VPU_PUSH_NS(%r14)
+-8:	movq $1, DV_VPU_HAVE(%r14)
++8:	# the worker's DMA channel: bytes a second each way (0 when a counter
++	# went backwards: a worker restarted between the samples)
++	movq SN_CDMA+0(%r13), %rax
++	subq SN_CDMA+0(%r12), %rax
++	jnc 81f
++	xorl %eax, %eax
++81:	call per_second
++	movq %rax, DV_CDMA_IN(%r14)
++	movq SN_CDMA+8(%r13), %rax
++	subq SN_CDMA+8(%r12), %rax
++	jnc 82f
++	xorl %eax, %eax
++82:	call per_second
++	movq %rax, DV_CDMA_OUT(%r14)
++	movq $1, DV_VPU_HAVE(%r14)
+ 9:	popq %rbx
+ 	ret
+ 
+diff --git a/host/asm/phitop/model.md b/host/asm/phitop/model.md
+index 582aad9..170c427 100644
+--- a/host/asm/phitop/model.md
++++ b/host/asm/phitop/model.md
+@@ -53,3 +53,6 @@ blocks of the same pid with no fewer steps it derives steps a second and simulat
+ against the program's own clock of time inside steps, the wall time per step, the team's busy
+ percent (its threads' time in parallel work over step time x threads) and the seconds the
+ remaining steps take. The program's clock is used where a step can be longer than the interval.
++
++`derive_vpu` also gives `DV_CDMA_IN` and `DV_CDMA_OUT`, the worker's DMA
++channel bytes a second each way from `SN_CDMA` (2026-11-06).
+diff --git a/host/asm/phitop/view.S b/host/asm/phitop/view.S
+index 9dddd62..1c182de 100644
+--- a/host/asm/phitop/view.S
++++ b/host/asm/phitop/view.S
+@@ -1185,10 +1185,25 @@ render:
+ 	movq SN_MEM+32(%r12), %rdi
+ 	call w_mib
+ 	call line_end
+-	# line 4: pcie
++	# line 4: pcie; the worker's own DMA channel first (the daemon's
++	# counters after it do not see it), so a narrow terminal keeps it
+ 	call line_begin
+-	leaq s_pcie1(%rip), %rsi
++	cmpq $0, DV_VPU_HAVE(%r13)
++	je 40f
++	leaq s_pcie5(%rip), %rsi
++	call w_cstr
++	movq DV_CDMA_IN(%r13), %rdi
++	call w_rate
++	leaq s_pcie6(%rip), %rsi
++	call w_cstr
++	movq DV_CDMA_OUT(%r13), %rdi
++	call w_rate
++	leaq s_pcie7(%rip), %rsi
++	call w_cstr
++	jmp 401f
++40:	leaq s_pcie1(%rip), %rsi
+ 	call w_cstr
++401:
+ 	movq DV_DMA_TO(%r13), %rdi
+ 	addq DV_APER_TO(%r13), %rdi
+ 	call w_rate
+@@ -1499,6 +1514,9 @@ STR s_swap, ")   swap on host RAM "
+ STR s_pcie1, "pcie  to card "
+ STR s_pcie2, " (dma "
+ STR s_pcie3, ", aperture "
++STR s_pcie5, "pcie  card dma in "
++STR s_pcie6, ", out "
++STR s_pcie7, "   host dma to card "
+ STR s_pcie4, ")   from card "
+ STR s_card, "card"
+ STR s_empty, ""
+diff --git a/host/asm/phitop/view.md b/host/asm/phitop/view.md
+index 88d0b01..1afdd3b 100644
+--- a/host/asm/phitop/view.md
++++ b/host/asm/phitop/view.md
+@@ -56,3 +56,13 @@ temperature, atoms, threads and the team's busy percent. Two lines so each fits
+ frame's 132 columns. Measured with Intel-Phi-AmberMD's test simulation (48,668 argon atoms,
+ 120 threads on card 0): 2.9 to 3.4 steps/s and 311 to 321 ms a step against the program's own
+ 3.05 to 3.22 steps/s, team busy 83.3 to 85.0 % against its 80.5 to 84.8 %.
++
++## The worker's DMA channel on the pcie line (2026-11-06)
++
++When the co-processor worker's line is present (`DV_VPU_HAVE`), the pcie
++line starts with `card dma in X, out Y`: the bytes a second the worker
++moved with its own DMA channel (Intel-Phi-AVX-512-C `card/vpu/cdma.S`,
++channel 7: request pulls and result pushes), then `host dma to card` and
++the daemon's own counters as before. The daemon's `Traffic` counters
++never see that channel, which is card-owned; it goes first so a narrow
++terminal (`v_cols`, 132 in batch frames) keeps it.
