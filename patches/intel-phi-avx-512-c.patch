@@ -176,7 +176,7 @@ index 4d66789..e511976 100644
    worker's (`vpu_worker.md`, "What a dispatch costs").
  - **The per-thread block**: the thread pointer convention wants the
 diff --git a/card/vpu/matmul.S b/card/vpu/matmul.S
-index 6451e1b..05651e7 100644
+index 6451e1b..4df658b 100644
 --- a/card/vpu/matmul.S
 +++ b/card/vpu/matmul.S
 @@ -167,5 +167,6 @@ copy_pool:
@@ -203,7 +203,7 @@ index 6451e1b..05651e7 100644
 +	cmpl %eax, %edi
  	jg 2f
  	movl %edi, %eax
-@@ -259,5 +264,41 @@ push_data:
+@@ -259,5 +264,50 @@ push_data:
  	movq %rdx, %r13
  	movl %ecx, %r14d
 -	leaq 63(%r12), %r15
@@ -220,12 +220,21 @@ index 6451e1b..05651e7 100644
 +	cmpq $983040, %r15			# 15360 lines: under the length field and the landing area
 +	jbe 72f
 +	movq $983040, %r15
-+72:	movq cdma_land(%rip), %rdi
++72:	# the piece into the landing area by the pool (2026-11-06): one core copying
++	# held a download to 0.81 GB/s with the 120 pool threads idle
++	movl %r14d, %edi
++	call map_threads
++	movl %eax, %ecx
++	movq cdma_land(%rip), %rdi
 +	movq %rbx, %rsi
 +	leaq 63(%r15), %rdx
 +	shrq $6, %rdx
-+	call phi_copy64
-+	xorl %edi, %edi
++	cmpl $1, %ecx
++	jbe 73f
++	call copy_pool
++	jmp 74f
++73:	call phi_copy64
++74:	xorl %edi, %edi
 +	movq %r13, %rsi
 +	leaq 63(%r15), %rdx
 +	andq $-64, %rdx
@@ -246,7 +255,7 @@ index 6451e1b..05651e7 100644
 +79:	leaq 63(%r12), %r15
  	shrq $6, %r15
  	xorl %eax, %eax
-@@ -1686,5 +1727,47 @@ vpu_matmul_run:
+@@ -1686,5 +1736,47 @@ vpu_matmul_run:
  	jmp .Lok
  
 -5:	# MATMUL, MATMUL_ID, MATMUL_MORE
@@ -295,7 +304,7 @@ index 6451e1b..05651e7 100644
 +59:	# MATMUL, MATMUL_ID, MATMUL_MORE
  	cmpq $0, MM_M(%rbx)
  	je .Lbad_said
-@@ -3244,4 +3327,6 @@ r_big:	.skip 8
+@@ -3244,4 +3336,6 @@ r_big:	.skip 8
  r_rounds:	.skip 8
  r_i:	.skip 8
 +	.globl stat_dma_push
@@ -664,10 +673,10 @@ index 0df9c2a..e77e14b 100644
  
  #define VPU_OFF_MATMUL 13312   /* struct vpu_matmul, in the control area */
 diff --git a/card/vpu/vpu_matmul.md b/card/vpu/vpu_matmul.md
-index 40c6cb3..677d761 100644
+index 40c6cb3..0798694 100644
 --- a/card/vpu/vpu_matmul.md
 +++ b/card/vpu/vpu_matmul.md
-@@ -31,4 +31,13 @@ activations at `VPU_OFF_MORE`: "A layer's gate and up in one request").
+@@ -31,4 +31,16 @@ activations at `VPU_OFF_MORE`: "A layer's gate and up in one request").
    across the pool's threads (`vpu_pool_map`).
  - `VPU_K_FREE`: drop a tensor, or all of them.
 +- `VPU_K_DOWNLOAD` (32, 2026-11-06): bytes `[a_off, a_off + bytes)` of the
@@ -678,10 +687,13 @@ index 40c6cb3..677d761 100644
 +  `K_LAST`, `vpu_fexec.h`). Measured 2026-11-06 on the 7120A: 10 downloads
 +  of a 32 MiB matrix byte-identical to the upload, 0.81 GB/s card to window
 +  (each 983,040-byte piece copied into the landing area, then one engine
-+  copy, serially), the window to the GPU 13.40 GB/s.
++  copy, serially), the window to the GPU 13.40 GB/s. Since the same day the DMA
++  path fills the landing area with `copy_pool` across the request's threads
++  (`map_threads`), not one core: measured on the card, one core at 100 % and
++  the pool idle was the bound.
  
  Weight types (`VPU_MM_*`, `a_type`): float32 and float16 rows use the
-@@ -384,5 +393,7 @@ The section above, "Two threads per core, measured again", found the
+@@ -384,5 +396,7 @@ The section above, "Two threads per core, measured again", found the
  second thread no help on a prompt-sized batch (q6_K at n 64, 188 against
  209 GFLOP/s), and the service stayed capped at 58 slices (`POOL_SLOTS`,
 -`map_threads`). It is built for 114 now (`POOL_SLOTS`), because a
