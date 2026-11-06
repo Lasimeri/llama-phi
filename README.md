@@ -89,6 +89,14 @@ numbers were taken: [docs/results.md](docs/results.md).
 The design, every change in the patches, and what was tried and dropped:
 [docs/design.md](docs/design.md).
 
+## With a GPU
+
+An NVIDIA GPU can take prompt prefill and the KV cache while the weights stay in
+host RAM and on the card: `scripts/serve.sh` (one llama-server, OpenAI API on
+127.0.0.1:8095). It also has CUDA kernels that drive the card worker by DMA
+and a two-server prefill/generation overlap. Layout, the scheduler setting it
+needs, and measurements: [docs/cuda.md](docs/cuda.md).
+
 ## Use
 
 Requirements: a Xeon Phi x100 card booted with the
