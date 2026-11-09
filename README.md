@@ -99,6 +99,13 @@ needs, and measurements: [docs/cuda.md](docs/cuda.md). The DMA router that serve
 a model with its weights in host RAM and on the card while the GPU does every
 prompt (no disk reads during inference): [docs/router.md](docs/router.md).
 
+The card takes Q4_0 weights as well (six kernels in the patch, their
+weights equal to ggml's bit for bit). In a split layout, one GPU server
+for prompts and one host-and-card server for generation with a slot file
+between them (`scripts/split.sh`), a 27 B Q4_0 model generates 2.605
+tok/s with 13.09 GB of its rows on the card, against 0.2076 tok/s when
+the card could take only its one Q6_K matrix: [docs/q4_0.md](docs/q4_0.md).
+
 ## Use
 
 Requirements: a Xeon Phi x100 card booted with the
