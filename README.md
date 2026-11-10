@@ -1,12 +1,30 @@
 # llama-phi
 
-An Intel Xeon Phi 7120A (Knights Corner) as a matrix co-processor for
-[llama.cpp](https://github.com/ggml-org/llama.cpp): the host
-runs llama.cpp natively on its own threads, the card's 512-bit vector
-units take a share of every weight matrix multiply through a ggml
-backend, and the two exchange activations and results by the card's own
-DMA engine. One 7120A doubles decode on Qwen3.8-35B-A3B Q8_0 on a
-Ryzen 7 5800X.
+An Intel Xeon Phi 7120A (Knights Corner), an NVIDIA GPU and the host CPU
+running one model together through
+[llama.cpp](https://github.com/ggml-org/llama.cpp). The card's 512-bit
+vector units multiply the weights it holds and exchange activations and
+results with the host by the card's own DMA engine; the GPU takes the
+prompts, the context and the layers that fit in VRAM; the host holds and
+computes the rest.
+
+llama.cpp is built from unpatched source, and it is not stock llama.cpp
+when it runs: a ggml backend for the card and preload libraries replace
+its memory mapping and part of its scheduling
+([What is changed in llama.cpp](#what-is-changed-in-llamacpp)).
+
+On a Ryzen 7 5800X with 32 GB, an RTX 3090 Ti and one 7120A:
+
+| Layout | Script | Model | Generation, tok/s | Prompts, tok/s |
+|---|---|---|---|---|
+| VRAM + card + locked host RAM | `scripts/vram35.sh` | Qwen3.8-35B-A3B Q8_0, 35.21 GiB | 14.6 to 17.8 | 472 |
+| GPU context, card holds the most used experts, host the rest | `scripts/moe.sh` | Qwen3.8-35B-A3B Q6_K, 29.2 GB | 10.8 to 11.0 | 345 |
+| GPU context, card holds every dense row | `scripts/one.sh` | a 27 B Q4_0 model | 3.22 to 3.28 | 315 to 319 |
+| host and card, no GPU | `scripts/bench.sh` | Qwen3.8-35B-A3B Q8_0 | 8.62 (host alone 4.32) | 15.86 (host alone 4.74) |
+
+The rows are different models, lengths and tools (the last is
+llama-bench at 16 tokens, the others llama-server), so they are not a
+ladder; each is documented with its conditions below.
 
 This repository holds the integration: patches to two existing public
 repositories, the scripts that fetch, patch and build everything, and
@@ -42,8 +60,9 @@ upstream llama.cpp: its loader, its page handling and the placement its
 scheduler computes all differ from a stock build's. `scripts/serve.sh`
 alone (the backend, no preload) is the closest to stock.
 
-## Measured
+## Host and card, no GPU
 
+The first layout, and the only one without a preload library.
 llama-bench, Qwen3.8-35B-A3B Q8_0 (35.20 GiB, 35.51 B parameters), host
 Ryzen 7 5800X with 31.3 GiB RAM, card Xeon Phi 7120A on PCIe Gen2 x8,
 `-t 14 -ngl 0`, the GPU hidden. The card holds 10.49 GB of the model
@@ -65,7 +84,7 @@ tg128 11.95 ± 1.39; `-n 256 -r 1` gave tg256 9.15 (no host-only control
 was run at these lengths). Details, the per-request costs and how the
 numbers were taken: [docs/results.md](docs/results.md).
 
-## How it works
+### How that layout works
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
@@ -183,7 +202,18 @@ scripts/setup.sh work            # fetch the pinned upstreams, patch, build
 scripts/worker.sh work           # deploy and start the card worker
 scripts/bench.sh work MODEL.gguf a      # host + card
 scripts/bench.sh work MODEL.gguf host   # host only, the control
+
+scripts/serve.sh work MODEL.gguf start  # one server: prompts and context on the GPU
+scripts/moe.sh work MODEL.gguf route    # a mixture model: log its routing, generate, then
+scripts/moe.sh work MODEL.gguf rank     #   rank each layer's experts by use
+scripts/moe.sh work MODEL.gguf start    #   the most used experts on the card
+scripts/vram35.sh work MODEL.gguf start # the same with layers in VRAM and the host's
+                                        #   share as locked memory
 ```
+
+The server layouts answer the OpenAI API on 127.0.0.1:8095. `moe.sh` and
+`vram35.sh` load preload libraries from `work/runs/serve`; each one's
+document under `tools/` gives its build line.
 
 `setup.sh` prints the size and md5 of each built binary. Built from these
 patches, the card worker is deterministic (same bytes on every build).
