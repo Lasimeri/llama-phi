@@ -3797,7 +3797,7 @@ index a06d5a5..91a70c9 100644
 +card-backed pages. `phi_ggml_open` clears the word when it maps the window, since
 +a client killed between a request and its reply leaves it taken.
 diff --git a/host/asm/ggml-phi/backend.S b/host/asm/ggml-phi/backend.S
-index 9f25cff..0956e43 100644
+index 9f25cff..303af68 100644
 --- a/host/asm/ggml-phi/backend.S
 +++ b/host/asm/ggml-phi/backend.S
 @@ -65,4 +65,6 @@ tg_only:	.skip 8			# PHI_GGML_TG_ONLY=K: a multiply of more than K tokens stays
@@ -3829,9 +3829,11 @@ index 9f25cff..0956e43 100644
 +t_q40:	.asciz "q4_0"
  t_unknown:	.asciz "?"
  st_ok:	.asciz "ok"
-@@ -286,4 +293,6 @@ s_nocards:	.asciz "no card is up with a worker polling; nothing to share the wor
+@@ -285,5 +292,7 @@ s_start2:	.asciz " start)"
+ s_nocards:	.asciz "no card is up with a worker polling; nothing to share the work with"
  s_clear:	.asciz "could not clear card "
- s_allrows_needs:	.asciz "PHI_GGML_ALL_ROWS needs PHI_GGML_OFFLOAD=1 (the judgement needs host rows): ignored"
+-s_allrows_needs:	.asciz "PHI_GGML_ALL_ROWS needs PHI_GGML_OFFLOAD=1 (the judgement needs host rows): ignored"
++s_allrows_needs:	.asciz "PHI_GGML_ALL_ROWS needs PHI_GGML_OFFLOAD=1 or PHI_GGML_JUDGE=0 (the judgement needs host rows): ignored"
 +s_stream_on:	.asciz "stream: every weight stays in host RAM, in the window above the transfer areas; each multiply has the card pull its rows (no upload into the card's memory, no fused feed-forward, no pairs)"
 +s_stream_full:	.asciz "stream: the window is full; this tensor stays with the host"
  s_experts_host:	.asciz "whole experts without the offload: the host keeps its copy of every expert (a batch handed to a GPU reads it) and skips the cards' at a generation step; the judge is off"
@@ -3851,7 +3853,17 @@ index 9f25cff..0956e43 100644
 +	movl $0, OFF_LOCK(%r13)
  	movq %rbx, CD_INDEX(%rax)
  	movl threads(%rip), %ecx
-@@ -1201,5 +1215,17 @@ phi_ggml_open:
+@@ -1198,8 +1212,27 @@ phi_ggml_open:
+ 	cmpl $0, offload(%rip)
+ 	jne 81f
++	# without the offload every row may still be the cards' when nothing is
++	# judged (PHI_GGML_JUDGE=0): the host keeps its copy and computes none of it
++	leaq e_judge(%rip), %rdi
++	movl $1, %esi
++	call env_u64
++	testq %rax, %rax
++	jz 81f
+ 	leaq s_allrows_needs(%rip), %rsi
  	call say
  	movl $0, all_rows(%rip)
 -81:	# whole experts
@@ -3870,7 +3882,7 @@ index 9f25cff..0956e43 100644
 +85:	# whole experts
  	movl $0, place_any(%rip)
  	leaq e_experts(%rip), %rdi
-@@ -1968,4 +1994,101 @@ drop_pages:
+@@ -1968,4 +2001,101 @@ drop_pages:
  	ret
  
 +
@@ -3972,7 +3984,7 @@ index 9f25cff..0956e43 100644
 +
  # ---- the host taking everything ----
  
-@@ -3125,5 +3248,42 @@ upload_area:
+@@ -3125,5 +3255,42 @@ upload_area:
  	movq %rdi, %rbx
  	movq %rsi, %r12
 -	call mm_clear
@@ -4016,7 +4028,7 @@ index 9f25cff..0956e43 100644
 +5:	call mm_clear
  	movq CD_NEXT_ID(%rbx), %r13
  	leaq mm_buf(%rip), %rax
-@@ -3386,5 +3546,6 @@ plan:
+@@ -3386,5 +3553,6 @@ plan:
  	subq SP_R0(%rbx), %rsi
  	imulq pa_nb_a(%rip), %rsi
 -	call drop_pages
@@ -4024,7 +4036,7 @@ index 9f25cff..0956e43 100644
 +	call back_or_drop
  	addq %rax, %r14
  	incq -88(%rbp)
-@@ -3681,5 +3842,10 @@ plan_whole:
+@@ -3681,5 +3849,10 @@ plan_whole:
  	addq pa_a(%rip), %rdi
  	movq -48(%rbp), %rsi
 -	call drop_pages
@@ -4036,7 +4048,7 @@ index 9f25cff..0956e43 100644
 +	call back_whole
  	addq %rax, %r14
  811:	incq %r15
-@@ -4632,5 +4798,9 @@ issue:
+@@ -4632,5 +4805,9 @@ issue:
  	movq RDW_CI(%r15), %rcx
  	movq SP_ID(%rax,%rcx,8), %rax
 -	movq %rax, MM_A_ID(%rdi)
@@ -4047,7 +4059,7 @@ index 9f25cff..0956e43 100644
 +1:	movq %rax, MM_A_ID(%rdi)
  	movl RD_A_TYPE(%rbx), %eax
  	movl %eax, MM_A_TYPE(%rdi)
-@@ -4901,5 +5071,9 @@ work_max:
+@@ -4901,5 +5078,9 @@ work_max:
  	.globl phi_ggml_begin_id_pair
  phi_ggml_begin_id_pair:
 -	pushq %rbp
@@ -4058,22 +4070,29 @@ index 9f25cff..0956e43 100644
 +1:	pushq %rbp
  	movq %rsp, %rbp
  	pushq %rbx
-@@ -5657,4 +5831,5 @@ phi_ggml_free_all:
+@@ -5657,4 +5838,5 @@ phi_ggml_free_all:
  	movq $0, CD_UPLOADED(%rbx)
  	movl $0, CD_FULL(%rbx)
 +	movq $0, CD_STREAM_AT(%rbx)		# the streamed weights' places, forgotten with the splits
  	incl %r12d
  	jmp 1b
-@@ -5669,4 +5844,4 @@ phi_ggml_free_all:
+@@ -5669,4 +5851,4 @@ phi_ggml_free_all:
  	.section .data.rel.ro,"aw"
  	.balign 8
 -type_names:	.quad t_f32, t_f16, t_q4k, t_q5k, t_q6k, t_q80, t_iq4xs, t_bf16
 +type_names:	.quad t_f32, t_f16, t_q4k, t_q5k, t_q6k, t_q80, t_iq4xs, t_bf16, t_q40
  status_names:	.quad st_ok, st_alloc, st_pull, st_push, st_request, st_kernel
 diff --git a/host/asm/ggml-phi/backend.md b/host/asm/ggml-phi/backend.md
-index 41e6344..ae1cc5a 100644
+index 41e6344..f467cc5 100644
 --- a/host/asm/ggml-phi/backend.md
 +++ b/host/asm/ggml-phi/backend.md
+@@ -23,5 +23,5 @@ variables (every one with its Rust default):
+ | `PHI_GGML_ACT` | 1 | activations as float16 |
+ | `PHI_GGML_OFFLOAD` | 0 | the cards' rows are theirs alone and their pages are dropped |
+-| `PHI_GGML_ALL_ROWS` | 0 | with the offload, the cards may keep every row |
++| `PHI_GGML_ALL_ROWS` | 0 | with the offload, or with `PHI_GGML_JUDGE=0` (since 2026-11-10: nothing is judged, so the host needs no rows of its own), the cards may keep every row |
+ | `PHI_GGML_EXPERTS` | unset | a placement file: whole experts on the cards. Under the offload the cards' experts are theirs alone (their pages dropped); without it (since 2026-10-06) the host keeps its copy of every expert, so a batch handed to a GPU by llama.cpp's op offload reads it while a generation step skips the cards' experts through the substituted ids, and the judge is forced off (a tensor judged back to the host would be computed in full there) |
+ | `PHI_GGML_JUDGE` | 1 | tensors judged by their timings |
 @@ -126,4 +126,20 @@ ends) take them from named static blocks (`pr_*`, `pa_*`, `q_*`,
  `ga_*`, `en_*`), which the one lock makes as private as a frame.
  
@@ -4095,7 +4114,7 @@ index 41e6344..ae1cc5a 100644
 +
  ## Limits, said when reached
  
-@@ -156,2 +172,56 @@ backend. The backend loaded with no tensor allowed on a card
+@@ -156,2 +172,85 @@ backend. The backend loaded with no tensor allowed on a card
  the CPU alone's 7.76 and 7.92, interleaved: the hand-offs, not the
  cards, cost about 30 ms a token (`docs/results/2026-10-07-rack-generation.md`).
 +
@@ -4127,6 +4146,35 @@ index 41e6344..ae1cc5a 100644
 +the file, 0 differing); the first generated token's log-probabilities are the
 +same to the last digit either way; the disk read during a 220-token generation fell
 +from 1,836 to 437 MiB.
++
++## Every row on the cards with the weights still in host RAM (2026-11-10)
++
++`PHI_GGML_ALL_ROWS=1` asked for the offload because the judgement of a
++tensor needs rows the host computes. With `PHI_GGML_JUDGE=0` nothing is
++judged, and the cards may keep every row while the host keeps its copy
++(`PHI_GGML_OFFLOAD=0`): a prompt computed on a GPU then reads host
++memory only. `PHI_GGML_AHEAD` is allowed in the same case (`glue.md`).
++
++Measured on a 9 B Q8_0 model whose file was wholly in host memory, card
++0 (a 7120A), an RTX 3090 Ti holding the context and taking the prompts,
++14 host threads, the host's small operations on (`PHI_GGML_HOSTOPS=1`),
++220 generated tokens:
++
++| the card holds | generation |
++| --- | --- |
++| nothing (the host alone, without this backend) | 4.09, 4.02 tok/s |
++| 50.0 % of every dense matrix's rows (4.35 GB), judged | 6.55, 6.45, 6.37 tok/s |
++| every row (8.14 GB), judge off, run-ahead on | 5.73 tok/s (one run) |
++| nothing resident: 15.6 % of every matrix streamed (`PHI_GGML_STREAM`) | 4.14, 4.20, 4.19 tok/s |
++
++With half the rows the timeline (`PHI_GGML_TIME`) has the host's rows at
++55.4 % of the time, the host's small operations at 30.8 % and the wait
++for the card at 1.1 %: the host is the slower side. With every row the
++card is, and the result is lower than the shared one; the 24 tokens at
++temperature 0 are the same in both. No share between the two was
++measured. Streamed, no multiply went to the card after the first
++tokens (the time spent issuing stays at 0.49 s over the next 57,344
++sub-graphs), and the result is the host's.
 +
 +## Streamed weights (`PHI_GGML_STREAM`, 2026-11-06)
 +
@@ -4239,7 +4287,7 @@ index 51402de..e429a8c 100644
  | buffers | `BUF_BUFT` |
  | `struct ggml_backend_reg` and its interface | `REG_BYTES`, `REG_API_VERSION`, `REG_IFACE`, `REG_CONTEXT`; `REG_I_BYTES` and the slots `REG_I_GET_NAME`, `REG_I_GET_DEVICE_COUNT`, `REG_I_GET_DEVICE`, `REG_I_GET_PROC_ADDRESS` |
 diff --git a/host/asm/ggml-phi/glue.S b/host/asm/ggml-phi/glue.S
-index 96cc2b9..0d64521 100644
+index 96cc2b9..ae7e68e 100644
 --- a/host/asm/ggml-phi/glue.S
 +++ b/host/asm/ggml-phi/glue.S
 @@ -20,4 +20,63 @@
@@ -4341,12 +4389,13 @@ index 96cc2b9..0d64521 100644
 +ah_drain:	.skip AH_DRAIN_MAX		# where the results of one nothing asked for go
  
  	.section .rodata
-@@ -68,4 +152,22 @@ e_offload:	.asciz "PHI_GGML_OFFLOAD"
+@@ -68,4 +152,23 @@ e_offload:	.asciz "PHI_GGML_OFFLOAD"
  e_graph:	.asciz "PHI_GGML_GRAPH"
  e_verbose:	.asciz "PHI_GGML_VERBOSE"
 +e_ahead:	.asciz "PHI_GGML_AHEAD"
 +s_ahead_on:	.asciz "a multiply whose activations are ready is issued ahead of its node (PHI_GGML_AHEAD)"
-+s_ahead_off:	.asciz "PHI_GGML_AHEAD needs PHI_GGML_OFFLOAD (without it a multiply is timed from its start and judged)"
++s_ahead_off:	.asciz "PHI_GGML_AHEAD needs PHI_GGML_OFFLOAD or PHI_GGML_JUDGE=0 (otherwise a multiply is timed from its start and judged)"
++e_judge_g:	.asciz "PHI_GGML_JUDGE"
 +s_ah1:	.asciz "ahead: "
 +s_ah2:	.asciz " multiplies were with the cards before their node arrived, "
 +s_ah3:	.asciz " begun ahead were not what came"
@@ -4364,7 +4413,7 @@ index 96cc2b9..0d64521 100644
 +s_hostops_on:	.asciz "the small operations of a generation step run on the host's cores, in the sub-graph of the multiply before them (PHI_GGML_HOSTOPS)"
  s_no_cpu:	.asciz "no CPU device registered"
  s_no_cpu_init:	.asciz "the CPU backend would not initialise"
-@@ -116,6 +218,10 @@ card_type:
+@@ -116,6 +219,10 @@ card_type:
  	cmpl $GGML_TYPE_BF16, %edi
  	je 17f
 +	cmpl $GGML_TYPE_Q4_0, %edi
@@ -4375,7 +4424,7 @@ index 96cc2b9..0d64521 100644
 +	ret
  10:	movl $MM_F32, %eax
  	ret
-@@ -199,5 +305,9 @@ weight_readable:
+@@ -199,5 +306,9 @@ weight_readable:
  # ffn_enabled: PHI_GGML_FFN=1, off under PHI_GGML_OFFLOAD (said once).
  ffn_enabled:
 -	cmpl $-1, ffn_on(%rip)
@@ -4386,10 +4435,10 @@ index 96cc2b9..0d64521 100644
 +8:	cmpl $-1, ffn_on(%rip)
  	jne 9f
  	pushq %rbx
-@@ -1691,6 +1801,329 @@ find_quad:
+@@ -1691,6 +1802,335 @@ find_quad:
  	ret
  
-+# ahead_enabled: PHI_GGML_AHEAD=1 under PHI_GGML_OFFLOAD (asked once,
++# ahead_enabled: PHI_GGML_AHEAD=1 under PHI_GGML_OFFLOAD or with the judge off (asked once,
 +# and said once either way); eax.
 +ahead_enabled:
 +	cmpl $-1, ahead_on(%rip)
@@ -4407,6 +4456,12 @@ index 96cc2b9..0d64521 100644
 +	call env_u64
 +	testl %eax, %eax
 +	jnz 2f
++	# or with nothing judged (PHI_GGML_JUDGE=0): no timing to spoil
++	leaq e_judge_g(%rip), %rdi
++	movl $1, %esi
++	call env_u64
++	testl %eax, %eax
++	jz 2f
 +	leaq s_ahead_off(%rip), %rsi
 +	call say
 +	xorl %ebx, %ebx
@@ -4716,7 +4771,7 @@ index 96cc2b9..0d64521 100644
 +# are dropped (ahead_drain) and the node runs as it always did.
  run_mul_mat:
  	pushq %rbp
-@@ -1710,5 +2143,70 @@ run_mul_mat:
+@@ -1710,5 +2150,70 @@ run_mul_mat:
  	movl T_TYPE(%r12), %edi
  	call card_type
 -	movl %eax, %esi
@@ -4788,7 +4843,7 @@ index 96cc2b9..0d64521 100644
 +20:	movl -64(%rbp), %esi
  	movq T_DATA(%r12), %rdi
  	movq T_NE+8(%r12), %rdx
-@@ -1723,10 +2221,12 @@ run_mul_mat:
+@@ -1723,10 +2228,12 @@ run_mul_mat:
  	movq T_NB+8(%r13), %rax
  	movq %rax, 16(%rsp)
 +	TM 4
@@ -4802,7 +4857,7 @@ index 96cc2b9..0d64521 100644
 +21:	xorl %r14d, %r14d			# r
  1:	cmpq %r15, %r14
  	jge 3f
-@@ -1749,8 +2249,75 @@ run_mul_mat:
+@@ -1749,8 +2256,75 @@ run_mul_mat:
  3:	movq T_DATA(%rbx), %rdi
  	movq T_NB+8(%rbx), %rsi
 +	TM 2
@@ -4879,19 +4934,19 @@ index 96cc2b9..0d64521 100644
 +30:	xorl %eax, %eax
  	jmp 99f
  9:	movl $-1, %eax
-@@ -1778,4 +2345,5 @@ run_ffn:
+@@ -1778,4 +2352,5 @@ run_ffn:
  	movq %rdi, %rbx
  	movq %rsi, %r12
 +	call ahead_drain			# nothing issued ahead stays with the cards
  	movslq Q_GATE(%r12), %rax
  	movq (%rbx,%rax,8), %r13		# gate
-@@ -2039,4 +2607,5 @@ run_id_pair:
+@@ -2039,4 +2614,5 @@ run_id_pair:
  	movq %rdi, %rbx				# x
  	movq %rsi, %r12				# y
 +	call ahead_drain			# nothing issued ahead stays with the cards
  	movq T_SRC(%rbx), %r13			# w1
  	movq T_SRC(%r12), %r14			# w2
-@@ -2092,5 +2661,7 @@ run_id_pair:
+@@ -2092,5 +2668,7 @@ run_id_pair:
  	movq T_NE+8(%r13), %r8
  	movq T_NE(%r13), %r9
 +	TM 4
@@ -4899,25 +4954,25 @@ index 96cc2b9..0d64521 100644
 +	TM 1
  	addq $112, %rsp
  	cmpq $-2, %rax
-@@ -2137,4 +2708,5 @@ run_id_pair:
+@@ -2137,4 +2715,5 @@ run_id_pair:
  	movl -76(%rbp), %ecx
  	call host_rows_id_pair
 +	TM 2
  	testl %eax, %eax
  	jnz 9f
-@@ -2146,4 +2718,5 @@ run_id_pair:
+@@ -2146,4 +2725,5 @@ run_id_pair:
  	movq T_NB+16(%r12), %r9
  	call phi_ggml_end_id_pair
 +	TM 3
  	testl %eax, %eax
  	jnz 9f
-@@ -2173,4 +2746,5 @@ run_mul_mat_id:
+@@ -2173,4 +2753,5 @@ run_mul_mat_id:
  	subq $56, %rsp
  	movq %rdi, %rbx
 +	call ahead_drain			# nothing issued ahead stays with the cards
  	movq T_SRC(%rbx), %r12			# src0
  	movq T_SRC+8(%rbx), %r13		# src1
-@@ -2216,5 +2790,7 @@ run_mul_mat_id:
+@@ -2216,5 +2797,7 @@ run_mul_mat_id:
  	movq T_NB+8(%r12), %r8
  	movl -48(%rbp), %r9d
 +	TM 4
@@ -4925,7 +4980,7 @@ index 96cc2b9..0d64521 100644
 +	TM 1
  	addq $96, %rsp
  	testq %rax, %rax
-@@ -2243,5 +2819,7 @@ run_mul_mat_id:
+@@ -2243,5 +2826,7 @@ run_mul_mat_id:
  	movq T_NB+8(%rbx), %rsi
  	movq T_NB+16(%rbx), %rdx
 +	TM 2
@@ -4933,13 +4988,13 @@ index 96cc2b9..0d64521 100644
 +	TM 3
  	testl %eax, %eax
  	jnz 9f
-@@ -2349,4 +2927,5 @@ phi_graph_compute:
+@@ -2349,4 +2934,5 @@ phi_graph_compute:
  	subq $40, %rsp
  	movq %rsi, %rbx				# graph
 +	call tm_enter
  	movq %rbx, %rdi
  	call dump_graph
-@@ -2414,9 +2993,25 @@ phi_graph_compute:
+@@ -2414,9 +3000,25 @@ phi_graph_compute:
  	je 52f
  	cmpl $GGML_OP_GLU, %eax
 -	je 55f
@@ -4966,7 +5021,7 @@ index 96cc2b9..0d64521 100644
 +56:
  	call say_begin
  	leaq s_unsupported(%rip), %rsi
-@@ -2428,5 +3023,11 @@ phi_graph_compute:
+@@ -2428,5 +3030,11 @@ phi_graph_compute:
  	call l_end
  	jmp 92f
 -51:	movq %r14, %rdi
@@ -4979,7 +5034,7 @@ index 96cc2b9..0d64521 100644
 +511:	movq %r14, %rdi
  	call run_mul_mat
  	testl %eax, %eax
-@@ -2467,5 +3068,6 @@ phi_graph_compute:
+@@ -2467,5 +3075,6 @@ phi_graph_compute:
  	jmp 99f
  92:	movl $GGML_STATUS_FAILED, %eax
 -99:	leaq -40(%rbp), %rsp
@@ -4987,7 +5042,7 @@ index 96cc2b9..0d64521 100644
 +	leaq -40(%rbp), %rsp
  	popq %r15
  	popq %r14
-@@ -2584,4 +3186,7 @@ phi_dev_supports_op:
+@@ -2584,4 +3193,7 @@ phi_dev_supports_op:
  	pushq %rbp
  	movq %rsp, %rbp
 +	pushq %rbx
@@ -4995,7 +5050,7 @@ index 96cc2b9..0d64521 100644
 +	movq %rsi, %rbx
  	movq %rsi, %rdi
  	movl T_OP(%rdi), %eax
-@@ -2594,11 +3199,28 @@ phi_dev_supports_op:
+@@ -2594,11 +3206,28 @@ phi_dev_supports_op:
  	movl %eax, %edi
  	call is_view
 +	testl %eax, %eax
@@ -5025,7 +5080,7 @@ index 96cc2b9..0d64521 100644
 +	popq %rbp
  	ret
  
-@@ -2719,4 +3341,7 @@ ggml_backend_phi_reg:
+@@ -2719,4 +3348,7 @@ ggml_backend_phi_reg:
  	movl $-1, graph_left(%rip)
  	movl $-1, verbose_on(%rip)
 +	movl $-1, ahead_on(%rip)
@@ -5034,7 +5089,7 @@ index 96cc2b9..0d64521 100644
  1:	call tables_init
  	leaq phi_reg(%rip), %rbx
 diff --git a/host/asm/ggml-phi/glue.md b/host/asm/ggml-phi/glue.md
-index d839796..cbc4cec 100644
+index d839796..ae68b49 100644
 --- a/host/asm/ggml-phi/glue.md
 +++ b/host/asm/ggml-phi/glue.md
 @@ -30,5 +30,5 @@ hands out a backend from a pool of eight (`BE_SLOT`, `BE_USED`).
@@ -5052,7 +5107,7 @@ index d839796..cbc4cec 100644
 +  `K_FFN` names resident slices).
  - views, reshapes, permutes and transposes are ggml's own and pass.
  
-@@ -89,4 +90,212 @@ the feed-forward's host part), with `w_elapsed_ms` giving C's `%.3f`
+@@ -89,4 +90,216 @@ the feed-forward's host part), with `w_elapsed_ms` giving C's `%.3f`
  of the elapsed milliseconds.
  
 +## A multiply issued ahead of its node (`PHI_GGML_AHEAD`, 2026-11-09)
@@ -5091,10 +5146,14 @@ index d839796..cbc4cec 100644
 +- A multiply is begun ahead only when its activations are at the
 +  address the finished one read, so none is left outstanding at the end
 +  of a pass: the next pass's first multiply reads another tensor.
-+- It needs `PHI_GGML_OFFLOAD` (`ahead_enabled` says so and stays off
-+  without it): outside the offload `phi_ggml_end` times a multiply from
-+  its `phi_ggml_begin` and judges the tensor by it, and a request left
-+  running across ggml's other work would be counted against its tensor.
++- It needs `PHI_GGML_OFFLOAD` or `PHI_GGML_JUDGE=0` (`ahead_enabled`
++  says so and stays off without either): where tensors are judged,
++  `phi_ggml_end` times a multiply from its `phi_ggml_begin` and judges
++  the tensor by it, and a request left running across ggml's other work
++  would be counted against its tensor. With the judge off nothing is
++  timed for a verdict, and the run-ahead works with the weights kept in
++  host RAM as well (since 2026-11-10; `backend.md`, "Every row on the
++  cards with the weights still in host RAM").
 +
 +The copy is 1 MiB and the drop buffer 8 MiB (`AH_COPY_MAX`,
 +`AH_DRAIN_MAX`); a multiply whose activations or results would not fit
@@ -5589,9 +5648,16 @@ index 93f858b..2fa1d4c 100755
  }
  # NAME EXPECTED_OK EXTRA_ENV BIN [ARGS]: a fresh worker, the program under
 diff --git a/scripts/phi-ggml.md b/scripts/phi-ggml.md
-index 2afd9dc..055cb2b 100644
+index 2afd9dc..fc2db97 100644
 --- a/scripts/phi-ggml.md
 +++ b/scripts/phi-ggml.md
+@@ -47,5 +47,5 @@ repository's, so two builds can be compared interleaved),
+ `PHI_GGML_OFFLOAD` (1: the cards' rows leave the host, for a model
+ larger than its memory; needs `--load-mode mmap`, below),
+-`PHI_GGML_ALL_ROWS` (1, with the offload: the cards may keep every row,
++`PHI_GGML_ALL_ROWS` (1, with the offload or with `PHI_GGML_JUDGE=0`: the cards may keep every row,
+ the host none, for a model that fits them),
+ `PHI_GGML_EXPERTS` (a placement file, with the offload: the cards keep
 @@ -55,4 +55,17 @@ every one; `tools/expert-placement.md` makes the file from a run with
  `PHI_GGML_SPIN_US` (the wait for a card spins this many microseconds,
  then sleeps between looks; unset, it spins throughout),

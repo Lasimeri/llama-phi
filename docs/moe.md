@@ -186,6 +186,43 @@ computes every dense row give the same first-token log-probabilities to
 the last digit; layouts that share a matrix with the host differ from
 them by up to 0.3 in the tail (the chosen token's by 0.002).
 
+## Three memories: VRAM, the card, locked host RAM
+
+The Q8_0 file is 35.21 GiB. With a quarter of it on the card the host's
+share is 26.4 GiB, and this host had 16.1 to 16.5 GiB of memory
+available (a compressed swap held 16.6 GiB of other data in 8.9 GiB of
+RAM). Three layouts of the Q8_0 file, the card holding a quarter in
+each, in the order they were tried:
+
+| Layout | Generation, tok/s | Prefill, tok/s | Read from the disk |
+|---|---|---|---|
+| the file mapped, no weights in VRAM (`scripts/moe.sh`, 9.44 GB on the card: half of each dense matrix, 62 experts a layer) | 7.88, 7.45 (220 tokens); 5.89, 6.50, 6.57 (64 after a prompt) | 59.1, 77.8, 74.1 | at every prompt: 13.8 of the file's 35.2 GiB were in the page cache |
+| the same with the host's share as locked memory (`libhostram.so`, its first build) | none: ended by `systemd-oomd` 33 s into the load | | |
+| 18 blocks and the output matrix in VRAM (16.35 GiB), 9.33 GB on the card (half of each dense matrix and 120 experts a layer of the 22 other blocks), 10.32 GiB locked on the host (`scripts/vram35.sh`) | 17.71, 17.82 (64 after a prompt); 14.61 (220 tokens) | 204.1, then 471.7 | 0 bytes of the file after the load |
+
+```
+scripts/vram35.sh work MODEL.gguf start
+```
+
+- The context is 204,800 tokens with Q8_0 keys and values; VRAM in use
+  was 22,100 to 22,189 MiB of 24,564, the desktop's 2,290 included.
+- The host's share is anonymous memory, not a mapping of the file
+  ([hostram.md](../tools/hostram.md)): `VmLck` 10,819,504 kB, nothing of
+  the server in the swap. The tensors that go to VRAM are read from the
+  file once for their upload and never held by the host.
+- Across two prompt requests and a 220-token generation the library
+  read 0 bytes from the file, and every process on the machine together
+  read 31 MiB from both drives. A prompt's burst from the card is
+  8.585 GB at 3.07 GB/s.
+- The second layout's end is the library's first build as much as the
+  host's size: it left pages unlocked, the kernel moved weights into the
+  swap, and the swap passed 90 %. The build that locks on demand has not
+  been run on that layout, so whether 26.4 GiB can be held there is not
+  measured.
+- 18 blocks was a first estimate. 2.4 GB of VRAM stayed free; more
+  blocks in VRAM were not tried.
+- One run each.
+
 ## The documented benchmark, run again
 
 `scripts/bench.sh work MODEL a` on the Q8_0 file, as in

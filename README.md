@@ -135,6 +135,18 @@ its own DMA engine, straight into the buffer it is multiplied from.
 Every step, the timeline that chose them, and what did not work:
 [docs/moe.md](docs/moe.md).
 
+The Q8_0 file of that model (35.21 GiB) in three memories
+(`scripts/vram35.sh`): 18 blocks and the output matrix in VRAM beside a
+204,800-token context, a quarter of the file on the card, and the
+remaining 10.32 GiB on the host as locked anonymous memory, not as a
+mapping of the file. 17.7 to 17.8 tok/s after a prompt and 14.6 over
+220 tokens, prompts at 472 tok/s, and no byte of the file read after
+the load. `tools/hostram.c` is what makes the host's share real memory
+without the model ever being in host RAM whole: llama.cpp gets an
+anonymous region in place of the file mapping, the card's and the GPU's
+parts pass through it once, and the rest is read and locked
+([tools/hostram.md](tools/hostram.md)).
+
 ## Use
 
 Requirements: a Xeon Phi x100 card booted with the

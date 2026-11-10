@@ -370,6 +370,23 @@ window is 2 GiB, which leaves 1.25 GiB for rows: 8.1 % of every matrix
 - The GPU fed from host RAM prefills faster than fed from the card
   (569 against 315 to 319 tok/s): the card link is the slower source.
 
+A second model the same way, 2026-11-10: Qwen3.8-9B at Q8_0 (9.79 GB),
+read into locked memory (`--load-mode mlock`: no mapping of the file,
+`VmLck` 9,293,496 kB) or wholly in the page cache, 220 generated
+tokens, prompts on the GPU at 1,061 to 1,294 tok/s in every row:
+
+| The card holds | Generation |
+|---|---|
+| nothing: the host alone | 4.09, 4.02 tok/s |
+| nothing resident, 15.6 % of every matrix pulled by its DMA engine | 4.14, 4.20, 4.19 tok/s |
+| a copy of half of every dense matrix's rows (4.35 GB) | 6.55, 6.45, 6.37 tok/s |
+| a copy of every row (8.14 GB), the host on the small operations only | 5.73 tok/s (one run) |
+
+Streamed, no multiply reached the card after the first tokens: the
+result is the host's. A copy on the card pays (`OFFLOAD=0` in
+`scripts/serve.sh` keeps the weights in host RAM as well); with every
+row there the card is the slower side, with half the host is.
+
 ## The card worker since [q4_0.md](q4_0.md)
 
 Both are in `patches/intel-phi-avx-512-c.patch`, with their documents
