@@ -1,0 +1,69 @@
+# proto.rs: the contract, from the host's side
+
+The Rust mirror of `card/vpu/vpu_proto.h`: window offsets, the readiness
+magic, the kernel numbers, the block and chunk sizes, and the request and
+reply structures as `#[repr(C)]`.
+
+Nothing checks the layout at run time, so three things check it before:
+
+- both files assert the two structure sizes at compile time (56 and 48)
+- the unit tests here pin every field offset with `offset_of!`
+- `tools/vpu-layout-check.c` prints the C compiler's offsets against the
+  same numbers
+
+`status_name` turns a reply status into words, so a failure says what
+went wrong rather than printing a small negative number.
+
+## The seamless path (2026-09-22 evening)
+
+`Exec`, `Regs`, `Range`, `Mail` and `WbPage` mirror `card/vpu/vpu_exec.h`
+(v2: modes, phases, ranges, the split, two fetch and two write-back
+slots, the bundle at `OFF_EXEC_CODE`); `tools/vpu-layout-check.c` checks
+the offsets. `K_EXEC` is the request kind.
+
+## The matrix-multiply service (2026-09-23)
+
+`Matmul` mirrors `struct vpu_matmul` in `card/vpu/vpu_matmul.h`, 128
+bytes at `OFF_MATMUL` in the control area, and five request kinds use
+it (`K_FFN`, 7, has its own descriptor, `Ffn`, below):
+
+| kind | number | what it does |
+| --- | --- | --- |
+| `K_UPLOAD` | 3 | keep `bytes` from the window under `a_id` (replacing an earlier one) |
+| `K_MATMUL` | 4 | `d = a . b^T`, `a` cached by id or streamed from the window |
+| `K_FREE` | 5 | drop `a_id`, or everything when it is 0 |
+| `K_MATMUL_ID` | 6 | the same with one expert per column, ggml's MUL_MAT_ID |
+| `K_MATMUL_MORE` | 8 | this descriptor's multiply and up to three more by the same activations (and ids), `More` at `OFF_MORE` (below) |
+
+The descriptor's last five words are `chunk` (rows per chunk the card
+works in, 0 for its own default) and the four a mixture needs (`n_used`,
+`n_tokens`, `b_rows`, `ids_bytes`), all zero for an ordinary multiply.
+`tools/vpu-layout-check.c` and the unit tests here pin every one of
+their offsets, as for the request and reply.
+
+`matmul.rs` has the window layout the service uses, the conformance
+check behind `phi-vpu matmul-check`, and what each field means in
+practice.
+
+`b_type` (the word after `a_type`) says how the activation rows are
+stored: 0 float32, 1 float16. The card's quantized kernels up-convert a
+float16 memory operand for nothing, so this halves what crosses the link
+and what sits in the card's L2; the float weight types have no such
+kernel and the card rejects the request rather than misreading the rows.
+
+`K_FFN` (7) is a feed-forward block's share in one request, its
+descriptor `Ffn` (`struct vpu_ffn`, 192 bytes) at `OFF_FFN` (13440, just
+after the matmul one): three resident slices (gate and up rows, down's
+columns for the same run of the intermediate), the run, the shapes, the
+activations and the result, and `h_type`, the intermediate's format on
+the card (0 float32, 1 float16, which overflows past 65504). The unit
+test and `tools/vpu-layout-check.c` pin the offsets as for the others.
+`K_MATMUL_MORE` (8, since 2026-09-27) carries further matrices by the same
+activations in the same request as the matmul descriptor's own, listed
+in `More` (`struct vpu_more`, 128 bytes) at `OFF_MORE` (13632, just after
+the feed-forward one): up to `MORE_MAX` (3) `MoreMat` entries of 40 bytes,
+each a resident slice, its quantized type, its rows, its row stride and
+where its results go. The unit test and the layout check pin them too.
+`MM_SWIGLU` (98) is the diagnostic type that runs the card's SwiGLU
+alone (`card/vpu/vpu_matmul.md`). `MM_Q4_0` (8, 2026-11-09) is Q4_0,
+after `MM_BF16` so that no earlier type's number moved.

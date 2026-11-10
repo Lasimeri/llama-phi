@@ -40,9 +40,28 @@ libraries replace parts of what it does at run time
 | [Lasimeri/Intel-Phi-AVX-512-C](https://github.com/Lasimeri/Intel-Phi-AVX-512-C) | `db092f6` | `patches/intel-phi-avx-512-c.patch`: card worker, ggml backend, preload |
 | [Lasimeri/Intel-Phi-7120A](https://github.com/Lasimeri/Intel-Phi-7120A) | `22712a2` | `patches/intel-phi-7120a-phitop.patch`: phitop shows the worker's DMA; the card no longer swaps into host memory (`PHI_SWAP_HOSTMEM=1` opts in) |
 
+## Source in this repository
+
+The source the measured servers were built from is here, beside the
+integration:
+
+| Directory | What it is | How to check |
+|---|---|---|
+| `llama.cpp/` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) at commit `4b77dee0524c64b8471869232e2958bd9589607d`, every file, none changed | `git rev-parse HEAD:llama.cpp` gives `b02cf014b4690a51d8530f06edecb69cb91dfce9`, the tree of that commit |
+| `Intel-Phi-AVX-512-C/` | [Lasimeri/Intel-Phi-AVX-512-C](https://github.com/Lasimeri/Intel-Phi-AVX-512-C) at `87b3920`: `db092f6` with `patches/intel-phi-avx-512-c.patch` applied (card worker, ggml backend) | `git rev-parse HEAD:Intel-Phi-AVX-512-C` gives `6e11e7d6c410a04161290b39ff55760422b888e9`, the tree of that commit |
+| `tools/`, `cuda/`, `scripts/` | this repository's own: the preload libraries, the CUDA programs, the launchers | |
+
+Both directories were placed as git trees, not re-added file by file, so
+the identifiers above are equal to the origins' by construction. They
+are snapshots: `scripts/setup.sh` still fetches the pinned upstreams and
+applies the patches, and does not build from these copies. The workflow
+files under `llama.cpp/.github/` are upstream's and do not run here
+(GitHub runs only a repository's own top-level workflows).
+
 ## What is changed in llama.cpp
 
-No file of llama.cpp is edited, and its checkout stays clean at
+No file of llama.cpp is edited: the copy in `llama.cpp/` is upstream's
+tree, and the checkout the servers were built from is clean at
 `4b77dee`. What it does when it runs is changed from outside, by a
 backend it loads and by libraries placed in front of it with
 `LD_PRELOAD`:
@@ -225,4 +244,6 @@ starts with `card dma in, out`, and the vpu line shows the requests.
 ## License
 
 MIT, as the upstream repositories: [LICENSE](LICENSE). llama.cpp is
-MIT-licensed by its authors and is fetched, not copied.
+MIT-licensed by its authors; the copy in `llama.cpp/` is theirs,
+unchanged, under its own [LICENSE](llama.cpp/LICENSE), and the code it
+bundles from others keeps the notices it carries there.

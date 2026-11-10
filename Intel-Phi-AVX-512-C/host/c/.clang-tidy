@@ -1,0 +1,13 @@
+# The C preload's lint (host/c/README.md, "Conventions"); make check runs it with warnings as errors.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -bugprone-narrowing-conversions,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  misc-redundant-expression,
+  performance-*,
+  portability-*
+WarningsAsErrors: '*'

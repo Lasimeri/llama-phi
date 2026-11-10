@@ -1,0 +1,343 @@
+# phi-vpu-worker: the card side of the co-processor
+
+**The C this documents was replaced by the assembly worker on 2026-09-30**
+(`worker.S`, `exec.S`, `matmul.S` and `rows.S`, their `.md` siblings);
+the design, the measurements and the defects recorded here stand, and
+the assembly keeps every mechanism named. The C files are in the history
+before commit `6484cf0`.
+
+Resident on the card. Polls a doorbell in host memory, and when a request
+arrives runs an AVX-512 kernel, translated to the card's own instruction
+set ahead of time by `host/crates/avx512-xlate`, across the vector units,
+and writes the result back where the host can read it.
+
+```
+phi-vpu-worker [-v [-v]] [-t N] [-s MS] [-i US] [-e N] [-m 0|1] [threads]
+```
+
+`threads` is the most the worker will spread one request across (1 to
+228, default 57). `-v` logs start-up, rejected requests and the seamless
+path's requests; `-v -v` also logs a line per matrix-multiply request
+(below, "Logging costs the reply"). `-t N` traces the pool (below, "What
+a dispatch costs"). `-s` is the spin window
+and `-i` the idle poll interval, both described below.
+`-e` is the seamless path's page pool, below.
+`scripts/phi-vpu.sh` deploys, builds, starts and stops it from the host
+(`PHI_VPU_ARGS` passes these options through `start`).
+
+## The pool, and why it exists
+
+Creating a thread on this card costs about 0.58 ms (a 1.1 GHz in-order
+core, measured 2026-09-21 and again here). The first version of this
+worker created and joined its threads inside the request handler, and
+the result was a compute time that **grew** with the thread count:
+
+| threads | compute per request, 65536 elements | measured |
+| --- | --- | --- |
+| 1 | 1.854 ms | 2026-09-22, per-request threads |
+| 8 | 5.327 ms | |
+| 57 | 34.865 ms | |
+| 57 | **0.088 ms** | 2026-09-22, persistent pool, warm |
+
+The pool is created once at start-up. Pool thread `t` goes to core
+`t % 57`, on the hardware thread `pool_slot(core, t / 57)` names (a
+core's threads in the order 0, 3, 1, 2, because the block devices'
+pollers were seen on core 55's threads 1 and 2; core 56's in the order
+0, 1, 2, 3): core-major, so one thread lands on every core before any
+core gets a second, which is what the two-cycle decoder wants (SSDG
+328207-002 section 2.1.2). The dispatcher, the thread that polls the
+doorbell, is pinned to CPU 0, which is core 56's thread 3. With 57
+threads or fewer in all (a pool of 56) core 56 has the dispatcher to
+itself; above that, pool thread 56 (CPU 225, core 56's thread 0) shares
+it, as at the default of 114.
+
+Each request is one generation. The dispatcher writes every thread's job
+(a slice of whole 128-element chunks), bumps the generation word, runs
+the last slice itself rather than spinning on a core that has work, and
+waits for `pool.done` to reach the number of cores with pool threads
+(`busy_cores`): a core's threads count themselves on a line of the
+core's own (`cores[core]`), and the one that completes the core's count
+reports the core, one locked add on the shared counter a core rather
+than a thread. Every pool thread acknowledges every generation, even one
+that gave it nothing, so there is no per-request bookkeeping of who is
+expected.
+
+## Waiting without a syscall, and parking without a busy card
+
+A pool thread spins on the generation word for `-s` milliseconds after
+its last job (default 200), then parks in a futex. The spin is what makes
+a request that follows another cost nothing but a cache-line transfer;
+the park is what keeps 56 cores from burning power while the host is
+doing something else. Measured 2026-09-22, 1048576 elements, 57 threads:
+
+| pool state when the doorbell rang | compute |
+| --- | --- |
+| spinning (within the window) | 0.302 ms |
+| parked (idle 3 s) | 0.788 ms |
+
+Waking 56 parked threads costs about 0.5 ms. The dispatcher issues the
+wake only when the parked counter says someone is asleep, so the warm
+path makes no system call at all.
+
+## The dispatcher's own idle
+
+The doorbell poll is one PCIe read per iteration, and the first version
+did it flat out for ever: one hardware thread (CPU 0) at 100 percent,
+reading host memory a million times a second to learn nothing, visible
+in phitop as a pegged core. Now it spins only for the same `-s` window
+after the last request and then sleeps `-i` microseconds between polls
+(default 500). `nanosleep` on this kernel costs about 60 us over what is
+asked (10 us asks for 72, 100 us for 162, 500 us for 563, measured
+2026-09-22), which sets the idle doorbell latency. Measured on CPU 0
+while idle, over 3 s, with the first doorbell after 1 s of quiet:
+
+| `-i` | CPU 0 busy | idle doorbell (host wall minus card total) |
+| --- | --- | --- |
+| 100 us | 23.5% | 79 to 157 us |
+| **500 us** | **0.8%** | 70 to 681 us |
+| 1000 us | 3.3% | 259 to 775 us |
+| 2000 us | 2.7% | 983 to 1857 us |
+
+A warm doorbell is 21 us by the same measure. The cost of the default is
+therefore up to 0.7 ms on the first request after 200 ms of silence,
+against a transport that costs 3 ms for the smallest request, for a card
+that is 99.9 percent idle when nothing is happening.
+
+The card's musl ships no `linux/futex.h`; the syscall number (202) and
+the two operation codes are defined in the source.
+
+## Fences on a core that has none
+
+Knights Corner has no `MFENCE`, `LFENCE` or `SFENCE` (ISA reference
+327364-001, appendix B). x86 ordering makes a store visible before a
+later store and a load before a later load without help, and every place
+the worker relies on that has a compiler barrier and a comment. The one
+place a **store must be visible before a following load** is the
+generation bump followed by the read of the parked counter, and that is a
+`lock addq $0, (%rsp)`, the same idiom libknc's vector store kernels use.
+The done counter is a locked add, which is also a full fence, so a
+thread's results are visible before its acknowledgement.
+
+## Moving the data
+
+Bulk data goes through `/dev/phiblk1`, the DMA path. A multiply's
+activations and results up to 2 MiB (`MAP_POOL_MAX`) do not: they cross
+the mapping (below, "Corrected the same night"); uploads, a weight
+streamed from the window (`a_id` 0) and the SwiGLU and probe
+diagnostics always use the block device. The worker maps
+the whole window as well (`WIN_BYTES`, `vpu_window(off, len)`, which
+returns NULL when the mapping failed and the block device then serves
+everything), and the two were measured against each other at the size a
+token's activations and results are, 16 KiB, 100 rounds each, on card 0
+on 2026-09-23 (`phi-vpu matmul-check --probe`):
+
+| 16 KiB across the link | card reads the window | card writes it |
+| --- | --- | --- |
+| block device | 109 us | 95 us |
+| the mapping, `memcpy` | 1488 us (11 MB/s) | 225 us (73 MB/s) |
+
+The mapping has no per-request cost but every access is a link round
+trip, and even at 16 KiB that loses by an order of magnitude reading and
+by half writing. It is kept for the measurement and for anything that
+wants a word or two of the window without a request.
+
+**Corrected the same night.** Those figures measured `memcpy`, which on
+this core moves 8 bytes at a time, and one thread, which has one load in
+flight. The mapping is uncached, so the width of an access is the width
+of its transaction: 64-byte vector stores write 16 KiB in 29 us (557
+MB/s), and the same copy split across the pool, one load in flight per
+core, reads and writes at 2.6 GB/s by 1 MiB, ahead of the block device
+(`kernels.md`, `vpu_matmul.md`). A multiply's activations and
+results up to 2 MiB now go that way (`pull_data`, `push_data`, and the
+pull inside a small request's dispatch); uploads and window-resident
+weights stay on the block device; `-m 0` puts everything back on it.
+
+Two rules follow from opening the block device with `O_DIRECT`, which is
+required because the host changes this memory behind the card's back and
+the page cache would serve whatever the last reader saw:
+
+- every offset and every length is a whole number of 4096-byte blocks,
+  so the worker rounds lengths up and the host must lay regions out on
+  block boundaries with nothing in the slack (`vpu_proto.h`)
+- buffers persist across requests and only grow; the first version
+  allocated and freed them per request, paying a page fault per 4 KiB
+  on first touch
+
+- buffers come from 2 MiB huge pages when the card has some reserved
+  (`/proc/sys/vm/nr_hugepages`, which `scripts/phi-vpu.sh start` sets;
+  `-v` reports a fall-back to 4 KiB pages). The block driver posts one
+  record to the host per physically contiguous run of a buffer, so a
+  4 KiB-paged buffer fresh from `malloc` cost 15 records per 64 KiB and
+  88 per 512 KiB request, each a round trip of host work; a huge-paged
+  buffer is one record per 512 KiB request. Measured 2026-09-22 with the
+  stack's `card/examples/blkbench.c` on card 0: a 512 KiB `pread` went from 1.8 ms to 0.24 ms,
+  16 MiB from 7.4 ms to 5.2 ms, the Gen2 x8 link.
+
+With the host daemon pipelining records, the card driver's poller
+staying awake around requests (kernel patch 0029) and huge pages, the
+transport for 65536 elements is 0.25 ms in and 0.17 ms out on card 0,
+against 0.05 ms of compute: 0.49 ms wall for a request that cost 2.9 ms
+the day it first worked ([`docs/results/2026-09-22-block-pipeline.md`](https://github.com/Lasimeri/Intel-Phi-3120A/blob/main/docs/results/2026-09-22-block-pipeline.md)).
+64 MiB each way moves at the link, 21 ms in and 20 ms out.
+
+## Status codes
+
+| value | meaning |
+| --- | --- |
+| 0 | done |
+| -1 | could not reserve buffers |
+| -2 | reading the input failed |
+| -3 | writing the output failed (an unaligned offset is the usual cause) |
+| -4 | `n` is zero or an offset is not block aligned |
+| -5 | unknown kernel number |
+
+## Things that cost time here
+
+- **The worker owns the sequence reset.** Taking the baseline from
+  whatever the window held made a request left by a previous run
+  invisible for ever. Both counters are zeroed at start-up; the host
+  starts from one.
+- **The readiness word is re-asserted while idle**, or the host's clear
+  of the window before its first request wipes the flag it is about to
+  wait for.
+- `pkill -f phi-vpu-worker` typed over ssh matches the ssh command line
+  and kills the session. `scripts/phi-vpu.sh` uses a bracket class.
+
+## The exec request (2026-09-22)
+
+`VPU_K_EXEC` hands the request to `vpu_exec_run` (`vpu_exec.c`,
+`vpu_exec.md`): a region of the host program's own code, run on this
+card as it is. The control mapping grew to 16 KiB for the mailbox and
+the exec descriptor. The element count and offsets are not checked for
+that kind; they belong to the polynomial request.
+
+## `-e N`: the seamless path's page pool
+
+The exec engine pre-faults 256 huge pages (512 MiB) when the worker
+starts, which a worker serving only the ggml backend's matrix multiplies
+never uses. `-e N` sets that pool (`vpu_exec_pool`), and `-e 0` leaves
+every huge page to the multiplies: on a card with 5.5 GiB it is half a
+gigabyte more of the model resident. `scripts/phi-ggml.sh` starts
+workers with `-e 0`; `scripts/phi-vpu.sh start` passes anything in
+`PHI_VPU_ARGS`.
+
+## The matrix-multiply requests
+
+`VPU_K_UPLOAD`, `VPU_K_MATMUL`, `VPU_K_FREE`, `VPU_K_MATMUL_ID`,
+`VPU_K_FFN` (7, a feed-forward block's share in one request, since
+2026-09-23) and `VPU_K_MATMUL_MORE` (8, further matrices by the same
+activations in one request, since 2026-09-27) all go to `vpu_matmul_run`
+(`vpu_matmul.md`), which reads its descriptors from the control area:
+the matmul one at `VPU_OFF_MATMUL`, the feed-forward one at
+`VPU_OFF_FFN`, the further matrices at `VPU_OFF_MORE`. The worker adds
+nothing of its own to them but the timing in the reply.
+
+## What a dispatch costs (`-t N`, 2026-09-27)
+
+`-t N` stamps every dispatch through `vpu_pool_map` (the matrix multiplies'
+and their copies; the polynomial's own dispatch is not summed; sums are
+kept for the first 8 distinct slice functions seen, `TRACE_FNS`, and
+later ones are not traced) with the
+time stamp counter (`rdtsc`;
+its rate is measured against the kernel's clock at start-up and printed):
+when each thread saw the generation, when its slice began and ended, and
+when the dispatcher saw the last one done. The stamps sit on a line per
+thread, the sums are kept per slice function, and every N dispatches one
+line is printed per function: the average dispatch, how long the last
+thread took to see it, the longest pool slice, the dispatcher's own
+slice, the time from the last slice's end to the dispatcher seeing it,
+and which thread was most often the last to wake. The functions print as
+addresses; `nm phi-vpu-worker` names them. Off by default, and without
+it the pool does nothing it did not do before.
+
+Measured on card 0 (averages of 1000 dispatches):
+
+| dispatch | total | last thread sees it | longest pool slice | last end to seen |
+| --- | --- | --- | --- | --- |
+| empty (`--probe`'s loop) | 28.6 us | 6.8 | 5.2 | 20.4 |
+| a pull split across the pool, at generation | 28 us | 7.2 | 7.8 | 15.3 |
+| a 35B-A3B's one-token multiply, before the fix below | 610 to 680 us | 6.2 | 596 to 666 | 13 |
+
+So the pool's own cost, its wake and its done counter, is about 20 to
+30 us, and at generation the slices themselves were the whole of the
+problem: `vpu_matmul.md`, "One token's multiply, and whose lines the
+pool reads".
+
+## Logging costs the reply (2026-09-27)
+
+`scripts/phi-vpu.sh start` always passes `-v`, and the worker used to log
+two lines for every request, one of them before the reply: a `printf`
+and an `fflush` into `worker.log`, which lives on the card's `/data`, the
+host-backed disk. On the one-token mixture multiply
+(`phi-vpu matmul-check --moe`, card 0) the host's round trip was 0.37 and
+0.30 ms with them and 0.30 and 0.27 ms without; a 35B-A3B makes about 120
+such requests a token. The matrix-multiply service's lines (and the
+upload lines) now need `-v -v`; everything else `-v` printed, the seamless
+path's per-request lines included, is unchanged, and so is the command
+line `phi-vpu.sh` passes (Intel-Phi-Jev reads it back to know its own
+worker).
+
+## Two threads per core (2026-09-27)
+
+The pool is now built for two threads on each of the 57 cores (114,
+`scripts/phi-vpu.sh`'s default; the backend asks for 114,
+`PHI_GGML_THREADS`). A core's four hardware threads share its in-order
+issue slots round-robin, so the second thread only pays when the first
+leaves slots unused and nothing else takes them. Four changes make the
+pool cheap enough for that:
+
+- **Placement.** A core's second pool thread goes to its hardware thread
+  3, not 1 (`pool_slot`), keeping 1 and 2 free of the pool: the card's
+  block-device pollers run on core 55's threads 1 and 2 (CPUs 222 and
+  223), and with the second thread on 1, pool thread 112 shared CPU 222
+  with `phiblk1-poll` and was the last to wake in 6 to 10 percent of
+  dispatches. Core 56's thread 3 is CPU 0, the dispatcher's, so there
+  the second pool thread takes 1.
+- **One broadcast job.** `vpu_pool_map` writes its work (function,
+  argument, slice count) on the generation's own line (`bc`), where it
+  wrote 114 per-thread job records a dispatch, each a line some other
+  core had read the dispatch before. The threads of a core share its L1,
+  so one fetch per core wakes both. The polynomial's `dispatch` keeps its
+  per-thread records (`bc.nslices` 0).
+- **Counting done per core.** The threads of a core add to a count on a
+  line of that core's (`cores[]`, a locked add that stays in its L1); the
+  one completing its core's count adds once to `pool.done`, so the
+  dispatcher waits for 57 increments rather than 113 on one contended
+  line (`wait_done`).
+- **Waiting without issuing.** Every spin (a pool thread waiting for work,
+  the dispatcher waiting for done, a thread waiting for a pull,
+  `vpu_matmul.md`) runs `delay` between looks (ISA reference 327364-001,
+  appendix A: `VEX.128.F3.0F.W0 AE /6`, written as bytes; measured 1000
+  cycles in 925 ns). A thread that spins on its core otherwise takes issue
+  slots from the thread of that core still computing.
+
+An empty dispatch (`matmul-check --probe`) went from 42.5 us at 57
+threads and 62.8 us at 114 to 14.5 and 15.1. The request itself is read
+in one 64-byte vector load of its line (the control area is mapped
+uncached, and reading its fields one by one was a link round trip
+each), and `-t N` now also sums each multiply request's stages (read
+the request, descriptors and checks, pull, groups, compute, push,
+reply) from time stamps `vpu_matmul.c` leaves in `vpu_marks`. What the
+matrix service does with two threads per core is in `vpu_matmul.md`.
+
+The seamless path (`vpu_exec.c`) splits a loop over 57 threads and was
+measured slower on a 114-thread pool: the 1M-element seamless test's
+polynomial, dot product and integer kernels took 25.7, 29.3 and 22.2 ms
+against 21.9, 23.4 and 18.3 at 57. Its copies and write-back diffs used
+the whole pool, and a core's copies over the link go one at a time
+however many of its threads issue them, so they now take one slice per
+core (`vpu_pool_cores`): 28.4, 25.4 and 20.3 against 25.8, 24.4 and 18.4
+in the next pair of runs. `scripts/phi512.sh` starts its worker at 57.
+
+## What the other card files call
+
+`vpu_exec.c` and `vpu_matmul.c` reach the worker through these
+(declared in `vpu_exec.h` and `vpu_matmul.h`):
+
+| function | what |
+| --- | --- |
+| `vpu_pool_map(fn, arg, nslices)` | run `fn` in `nslices` slices across the pool, the caller's thread the last one, and wait for all |
+| `vpu_pool_threads()` | the pool's threads, the dispatcher not counted |
+| `vpu_pool_cores()` | the most slices with at most one a core: for copies through the uncached window, which go one at a time per core |
+| `vpu_window(off, len)` | a pointer into the mapped window, or NULL when the mapping failed or the range is past it |
+| `vpu_pull(dst, len, off)`, `vpu_push(src, len, off)` | the block device's transfers, window offset to card memory and back |

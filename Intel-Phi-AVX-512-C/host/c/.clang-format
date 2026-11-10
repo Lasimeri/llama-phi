@@ -1,0 +1,10 @@
+# The C preload's layout (host/c/README.md, "Conventions"); make format applies it, make check enforces it.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 110
+BreakBeforeBraces: Linux
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AlignTrailingComments: true
+SortIncludes: Never

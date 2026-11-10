@@ -1,0 +1,97 @@
+# Contributing
+
+These rules exist so that someone with the same cards and a fresh Arch
+Linux install can reproduce every result here without asking anyone. The
+sections are the same in every repository of the family (see
+[The family](#the-family)); what differs is said where it applies.
+
+## Languages
+
+- **C** (C17 with GNU extensions, gcc) for the intercept preload
+  (`host/c`, `libphi512-c.so`), its conventions in
+  [`host/c/README.md`](host/c/README.md): `-Werror`, clang-format and
+  clang-tidy clean, no AVX-512 in its own code, libc allowed, nothing
+  exported. Also the card's protocol headers (`card/vpu/*.h`, the
+  readable contract the layout checkers read), the card examples, and the
+  test programs and helpers under `tools/` (gcc, or `tcc` for the small
+  ones that must see the C headers as C sees them).
+- **Assembly** for the card worker (`card/vpu`), the ggml backend
+  (`host/asm/ggml-phi` with `host/asm/common`) and the assembly preload
+  (`host/asm/phi512`) the C one replaces module by module: x86-64 GNU
+  `as`, no libc, the card's vector instructions through `mvex.inc`, the
+  card binary audited for what Knights Corner runs
+  (`card/vpu/build.md`), layouts from checkers never by hand
+  (`host/asm/README.md`). The C worker the assembly one replaced is in
+  the history before commit `6484cf0`
+  (`docs/results/2026-09-30-worker-assembly.md`).
+- **Rust** only for what is not ported yet (the crates under
+  `host/crates`); nothing new is written in it.
+- **Shell** (`sh`, POSIX where practical, `bash` when arrays are needed) for
+  scripts that orchestrate the stack's tools and the card worker.
+- **Never Python, JavaScript or Perl** for anything here.
+
+## Documentation
+
+- Every code file (`.rs`, `.c`, `.h`, `.S`, `.sh`, `.json`, `.config`) has
+  a sibling `.md` with the same stem in the same directory: purpose, the
+  hardware or document facts the code depends on (with the source named),
+  invariants, how to test it. Obvious code is not re-narrated. A change to
+  behaviour changes its `.md` in the same commit.
+- Every public Rust item has a doc comment; every C function a comment
+  block. Comments explain intent and hardware contract, not syntax.
+- No em or en dash characters anywhere, commit messages included. Use
+  commas, colons, parentheses, or `--`.
+- Relative links between Markdown files must resolve. A file that lives in
+  a sibling repository is linked on GitHub, never named as if it were here.
+- `scripts/check-docs.sh` enforces the sibling, dash and link rules
+  (`make docs-check`, the first step of `make check`).
+
+## Measurements
+
+- Every hardware claim names its source: an Intel document number and
+  section, a file and function in a named source tree, or a measurement
+  made on this machine with the command shown.
+- Results are recorded under `docs/results/` with the date, the host
+  kernel, and the exact command. Timings closer than this host's drift (a
+  quarter over tens of minutes) need interleaved runs.
+- `make check` needs no card. What needs one is run by hand against a
+  card that is up: `scripts/gates.sh` (the preload's regression gates,
+  [`scripts/gates.md`](scripts/gates.md)), the llama.cpp runs under
+  `scripts/bench/`, `scripts/phi512-check.sh` and `scripts/phi512-ground.sh`
+  (conformance against hardware and against the card), and the programs
+  under `tools/`.
+
+## The family
+
+| repository | what | finds its dependency by |
+| --- | --- | --- |
+| [Intel-Phi-3120A](https://github.com/Lasimeri/Intel-Phi-3120A) | the cards' software stack: daemon, kernel, boot, storage, the `phi` CLI, the cross toolchain | (none) |
+| [Intel-Phi-AVX-512-C](https://github.com/Lasimeri/Intel-Phi-AVX-512-C) (this one) | the cards as an AVX-512 co-processor: the C intercept preload, the card worker, the `libggml_phi.so` backend; [Intel-Phi-AVX-512-ASM](https://github.com/Lasimeri/Intel-Phi-AVX-512-ASM) is its frozen assembly twin | `PHI_STACK_ROOT`, `phi` on PATH, a checkout next to this one, `$HOME` |
+| [Intel-Phi-Stream](https://github.com/Lasimeri/Intel-Phi-Stream) | a thought stream over the GPU, the cards and host memory, through `libggml_phi.so` | `PHI_AVX512_ROOT`, a checkout next to it, `$HOME` |
+| [Intel-Phi-Jev](https://github.com/Lasimeri/Intel-Phi-Jev) | `xks`, a local Jev (System One) whose subject runs on the host and the cards | `PHI_AVX512_ROOT`, a checkout next to it, `$HOME` |
+| [Mechanical-Jev](https://github.com/Lasimeri/Mechanical-Jev) | `mjev`, the asking side of Jev, and Jev reverse engineered from its docs | `MJEV_XKS`, `xks` on PATH, a checkout next to it, `$HOME` |
+
+- A dependency is found in that order, as a checkout under its GitHub
+  clone's name (`Intel-Phi-3120A`) or the spaced one (`Intel Phi 3120A`).
+  Nothing of a sibling is copied into another, with one exception: the
+  stack's `knc-mvex` library (`lib.rs`, `conv.rs`, `transc.rs`), carried
+  here byte for byte and compared with the stack's by `make check`
+  ([`scripts/mvex-sync.md`](scripts/mvex-sync.md)); a change to the
+  encoder is made in both in the same session.
+- The interfaces the others consume from this repository keep working
+  across changes: `scripts/phi512.sh`, `scripts/phi-vpu.sh` and its verbs,
+  `scripts/phi-ggml.sh` (Intel-Phi-Stream runs through it),
+  `host/target/release/libggml_phi.so`, and the `PHI_GGML_*` and
+  `PHI_VPU_*` environment variables. Add, do not rename; when one must
+  change, change its consumers in the same session.
+- Everything downloaded or built for the card itself (musl, busybox,
+  dropbear, CPython, LLVM, the vendor archives) is the stack's, pinned and
+  checked there (its `toolchain/` and `scripts/fetch-vendor.sh`).
+
+## Git
+
+- One subject line that says what changed (a leading `Area:` is fine), then
+  the why. `make check` before every commit, push after.
+- Never commit Intel binaries, flash images, MPSS packages, or anything
+  from a `vendor/` directory.
+- MIT license ([`LICENSE-MIT`](LICENSE-MIT)).

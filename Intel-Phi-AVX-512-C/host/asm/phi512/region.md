@@ -1,0 +1,284 @@
+# region.S: a region of a function run to its next exit
+
+The path for the functions `seeds.S` has no plan for, which is every
+function found at a fault (`xlfn.S`'s dynamic seeds): the blob runs on
+card 0 from the fault's instruction to its next exit, and the host
+continues the program natively from there.
+
+```
+region_run(uc rdi, seed rsi, entry rdx) -> eax 0 (the frame is set),
+    else a failure code for the handler's line (1000 + the exit kind,
+    2000 + a card status, 2001 a step)
+```
+
+## What a region does
+
+1. The register file from the signal frame (`file_from_frame`), then
+   what the host cannot hold from the last region's file out
+   (`shadow_merge`): zmm16 to zmm31 and the masks whole; of zmm0 to
+   zmm15 the upper 256 bits when the lower 256 are what the last region
+   left (a VEX write on the host zeroes them otherwise).
+2. The stack: the floor is rsp minus 128 (the red zone), and 16 KiB
+   lower (`STACK_SLACK`) when the handler runs on its alternate stack,
+   clamped to the stack mapping's start: a region may move rsp down and
+   write there (a call's stack arguments: `llama-server`'s context
+   parameters reached `llama_init_from_model` with `n_batch` 0 because
+   the line below rsp minus 128 never came back, 2026-10-14; a region
+   that ends below the floor is reported). The units of the floor, of
+   rsp minus 128, of rsp and of rsp plus 8 KiB made resident
+   (`wu_ensure`), then every resident unit of the mapping holding rsp
+   floored (`wu_stack_floors`) at the floor, or at its end when it lies
+   wholly below: below the frame's rsp
+   minus the red zone the stack is the SIGILL handler's own (it has no
+   alternate stack) and is never written back (`WU_LO`). A floor that
+   drops marks the range between for a whole refresh (`wu_set_floor`).
+   The fault path floors again (a stack unit a fault brought in). Before
+   2026-10-14 only the unit of rsp minus 128 took the floor: when that
+   address fell into the unit below, the unit holding rsp kept a higher
+   floor from an earlier region and the lines the region wrote between
+   never came back (a `std::regex` bracket matcher built on the card,
+   "0 line(s) back", a null store in the host; ASLR decided the run).
+3. Every resident unit compared with the program's memory
+   (`wu_refresh`: the reads and compares of the units by card 0's 16
+   workers and this thread at once, [`pool.md`](pool.md), each changed
+   line marked in the unit's bitmap; then the marked lines into the list
+   unit by unit here): one the host wrote since gets its shadow updated, its
+   filled bit on the card cleared and a fill queued; the residency
+   rounds run.
+4. `K_FEXEC` with `FXF_IDSTACK` (the file's rsp is the program's stack
+   at identity; the blob's `ret` is an exit, not the card's return
+   stub) at the blob offset of the instruction.
+5. The exit (the reply's fields are kept before any other request
+   reuses the slot's reply):
+   - `X_FAULT` with an address: the unit made resident with a shadow
+     filled from the program's memory, the file as the card left it,
+     posted again at the fault's instruction (the card's blob address
+     from `cblob_tab`, filled by `card_load_seed`). A fault with no
+     address is a general-protection fault, not a missing page: a
+     failure.
+   - `X_RET`, `X_CALL`, `X_JUMP`, `X_SYSCALL`: every unit pulled back
+     (`K_PUSH` into a staging slot) and diffed against its shadow line
+     by line over its mapped pages above the floor (`wu_writeback`); a
+     changed line goes into the program's memory and the shadow. Then
+     the frame from the card's file (`frame_from_file_full`: every
+     general register, rsp as the blob left it, rip where the blob
+     said the host resumes, the flags from the raw `lahf`/`seto` word,
+     xmm0 to xmm15 and their ymm halves), the file kept as the shadow.
+
+The unit table holds up to 1024 units with 64 KiB shadows in a 64 MiB
+arena; the readable and the writable pages of a unit come from
+`copy_mapped` (`copy_mapped_pages`, `copy_mapped_wpages`: a bit per
+4 KiB page) at residency and again at every refresh, so a page the
+program unmaps or protects after a region is never compared, and a
+line is written back only into a page the program can write (the host
+died storing into a library's read-only page before) (the narrow suite's page-end check
+protects its second page after the load; before this the host wrote the
+line into it and died, 2026-10-13).
+
+Verbose: a line per region (the exit kind, where the host resumes, the
+faults, the units, the lines written back, the time) and, on a fault,
+the card's exit rip, the address, the signal and code, the blob's card
+address.
+
+## State (2026-10-13 night)
+
+`tools/avx512-region-test.c` passes whole on card 0 (both kernels, 4
+regions), as do the form suites `tools/avx512-f-forms-test.c` (42
+checks) and `tools/avx512-narrow-test.c` (66 checks, 97 regions): the
+stage-3 recipe gate. The silently wrong regions of the day were the
+scratch-register moves of `blob.S` and `mvex.S` with the register's
+extension in REX.B instead of REX.R (r8 to r15 moved rax), found by
+decoding a blob against the register probes.
+
+## The write-back by bytes, one snapshot (2026-10-14)
+
+A line the card changed goes back byte by byte: only the bytes where
+the card's copy differs from the shadow are written into the program
+and the shadow, run by run, through `/proc/self/mem` (`wb_line_apply`:
+the line is read with `pread`, each run written with `pwrite`), never by
+the host's own loads and stores: a page another thread unmapped during
+the region fails the call instead of faulting the host (an HTTP
+thread's region read a line above its stack that was gone, 2026-10-14). `llama-server` has more threads than the one in a
+region (`common_log`'s worker, 130 in all at model loading); a whole
+line copied back undid what another thread wrote to the same line
+during the region, and glibc stopped on "corrupted double-linked list"
+where vocabulary strings shared lines with malloc's free-list links.
+The shadows of the units a `K_RESIDENT` fills come from the bytes
+staged for the card (`wu_shadows_from_stage`, called by
+`card_resident_post`), not from an earlier read: two reads differ when
+another thread writes between them. A probe counts the lines where
+memory no longer matches the shadow at the write-back
+(`stat_wb_conflicts`; under verbose a line per conflict with the
+memory, shadow and card words).
+
+A unit whose changed lines overflow the refresh list is refilled whole
+(a `K_RESIDENT` from a new read of the program's memory), and the lines
+it had already put into the list are taken back (`wu_refresh` keeps the
+list's count, bytes and last range's length at each unit's start):
+the card applies the list after the refill, so a line kept from the
+first read landed over the second while the shadow held the second,
+and the write-back put the first read's bytes back. That reverted the
+main thread's malloc metadata from a region of `common_log`'s worker
+thread (a write-back conflict of three different values, the card's
+the oldest) and glibc stopped at 11,955 regions.
+
+## The exit kind and X_HOST (2026-10-14)
+
+`.Lrg_exit` reloads the exit kind from its slot: the register held the
+reply's signal word, so every exit without a signal had been taken as a
+resume, `X_REFUSED` included. `X_HOST` (an instruction the host runs,
+[`blob.md`](blob.md)'s lazy sites) resumes like `X_JUMP`; a region whose
+exit is `X_HOST` at the very address it was posted at means the host
+faulted on that instruction too, and the program dies instead of
+looping.
+
+## The heap walk (a probe, `PHI512_HEAPCHECK=1`)
+
+`heap_walk` walks glibc's main arena from the `[heap]` mapping's start
+by the chunks' size fields (a size of at least 32, a multiple of 16,
+the next chunk within the mapping, the last ending at its end; for a
+chunk the next one marks free, that its size is the next one's
+`prev_size` and that an `fd` or `bk` inside the heap links back to it,
+glibc's "corrupted double-linked list" condition) at every region's
+start and after every write-back, and reports the first break once,
+with the check that failed and the chunk's first 64 bytes: the region's number (the n-th `region exit` line of the verbose
+log), whether native code before it or its own write-back broke the
+heap, the chunk, its size field and the chunk before. glibc finds such
+damage only when it next frees or merges the chunk. Only the main
+thread's regions walk: from another thread's handler the main thread may
+be inside malloc, and a list caught mid-update reads as broken (the
+first report, after a region of `common_log`'s worker thread, was
+that). Checked against a
+program that breaks a chunk's size natively between two regions
+("before region 2", the chunk and its field exactly).
+
+## The progress line (2026-10-14)
+
+`heartbeat`, called from region_run after each region, writes one line to standard error at most every 5 s, always on (not gated by `PHI512_VERBOSE`):
+
+```
+phi512: progress at 65 s: 6905 regions (79/s), 99.9% of the time in regions, 41 fault(s), 33483 write-back line(s); last region in ggml_backend_buffer_init
+```
+
+Seconds count from the constructor (close to llama's own log clock). The rate and the share are over the interval since the previous line; the share is host wall time inside region_run. Reason: under the preload llama-server's loader prints nothing for minutes at its default verbosity, and two runs were killed as hung on 2026-10-14 while card 0 was 87.7% busy.
+
+## Immutable chunks (2026-10-14)
+
+A card fault in a 2 MiB chunk wholly inside one readable, not writable
+mapping (`elf.S chunk_immutable`) is queued as the whole chunk, class 0
+(`ro_need`): no unit, no shadow, no refresh, no write-back, the 1024-unit
+table untouched; any other chunk takes the 64 KiB unit path as before. A
+chunk card 0 already holds by units stays on that path. The progress line
+counts chunk fills, the read-only ones, and evictions. Measured
+(kernel5): 192 faults in one region in 2.07 s, about 10.8 ms a fault
+(the fill about 0.65 ms of it, the rest the region's exit and re-post).
+
+## In-card calls and the stack floor (2026-10-14)
+
+With in-card calls a region's callees put their frames below the rsp the
+region started with: `STACK_SLACK` went from 16 KiB to 256 KiB, so those
+frames lie above the floor (refreshed, shadowed, written back) when a
+region leaves the card inside a callee. A fault inside a callee is
+re-posted in the blob that holds the card's rip (`blob_at`, over every
+seed's blob on card 0), and the region's seed becomes that blob's.
+
+## Read-ahead of immutable chunks (2026-10-14)
+
+`ro_need`: a fault on the chunk right after the previous immutable fault
+(a matrix read in order) queues the next `RO_AHEAD` (8) immutable chunks
+card 0 does not hold with it, so their fills go in the same round and the
+region does not leave the card for each (an exit and a re-post saved per
+chunk). `stat_ro_ahead` counts them.
+
+## Caller promotion (2026-10-14)
+
+A card function F called from plain host code runs as one region per call
+(llama.cpp's expert path: `ggml_vec_dot_bf16` once a row from a plain
+loop, ~840 regions every 5 s). `promote_check`, after a region of F that
+ended with a return: once F has `PROMOTE_AT` (64) regions, the function G
+holding the return address, in the same object (`obj_at`) and not F, is
+translated and loaded on every card (`seed_prepare`, a dynamic seed when
+new) and its entry patched with `ud2` (`patch_entry`: mprotect RWX, `0F 0B`,
+back to RX). G's next call faults; `seed_of` finds G's seed by the
+address and G runs on the card from its entry, F in-card. Each F promotes
+its caller once; G's returns climb on the same rule up to the first
+caller in another object. `PHI512_PROMOTE=0` turns it off. Gate:
+`avx512-region-test` kernel8 (a plain integer caller of an AVX-512
+function, three calls): 100 callee regions and 5 caller regions against
+300 and 0 without, same result.
+
+## Staying on the card across plain code (2026-10-14)
+
+- Continuation: a region that ends returning (`X_RET`) into a function
+  with an automatic blob (`blob_seed_at`) goes on there at once:
+  `region_run` returns 2 with `next_seed`/`next_entry`, and sigill.S
+  calls it again in the same handler.
+- Trampoline: a region that ends calling plain code (`X_CALL`, a callee
+  the card's table does not have), from a caller with a blob in an
+  object whose path holds "libggml", has the call made by the host
+  with `phi512_tramp` (a `ud2` in the preload) as the return address
+  (`tramp_setup`, a 1024-entry ring keyed by the rsp after the return).
+  The callee's return faults on the trap; `tramp_resume` puts the
+  return site back in the frame and the caller's blob goes on from
+  there. Restricted to ggml's libraries because a C++ exception could
+  not unwind through the trap; `PHI512_TRAMP_ANY=1` lifts it for tests.
+- `PHI512_CONT=0` turns both off. Gate kernel8 with `PHI512_TRAMP_ANY=1`:
+  right results, 387 regions against 120 with both off (the caller now
+  goes back to the card after each plain call instead of finishing on
+  the host).
+- Both only in objects whose path holds "libggml-cpu" (`cont_obj_ok`, the
+  trampoline's path test): with every "libggml" object, llama-server's
+  load went 20x slower (rs7: `gguf_init_from_reader` 4,835 regions every
+  5 s, each `fread` a round trip; still parsing the GGUF at 90 s against
+  3.9 s). Card round trips pay off in the compute loops; glue with many
+  plain calls stays on the host.
+
+## Dirty tracking of the writable units (2026-10-14)
+
+The refresh read every unit back through `/proc/self/mem` and compared it
+before every region; with llama-server's 164 MiB compute buffer in the
+table (`WU_MAX` now 4096) that was ~62% of the main thread. Each new unit
+is registered with userfaultfd for write-protection in asynchronous mode
+(`UFFD_FEATURE_WP_ASYNC | WP_UNPOPULATED`, user mode only) and protected
+at once; `dt_scan_all` before the refresh asks `PAGEMAP_SCAN`
+(`PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC`, `PAGE_IS_WRITTEN`) for each
+unit's pages written since and protects them again; `wu_refresh_unit`
+skips a unit with none (and no forced range) without reading it. A unit
+the kernel will not register, or whose scan fails, keeps the full
+compare. `PHI512_DIRTY=0` turns it off.
+
+## Callee translation and the exits in the progress line (2026-10-14)
+
+`callee_promote`, at every `X_CALL` exit: a callee in the compute library
+(through its PLT stub or not) that has no blob is translated and loaded
+on every card at once, so its next call stays on the card (llama-server:
+the graph thread's regions fell from ~1,410 to 7 every 5 s). The
+progress line now counts the region exits by kind (returns, calls, host
+instructions, syscalls, faults, jumps), the callees translated and the
+trampolines.
+
+## One step back to the card after a host-run instruction (2026-10-14)
+
+An instruction the card cannot run (a lazy site: a locked atomic, a form
+without a recipe) is run by the host, and the function then went on
+natively: tinyBLAS's `gemm` takes its work chunks through
+`ggml_threadpool_chunk_add` (a `lock xadd`), and after each the host ran
+`gemm` and called `gemm_bloc` from there, one region per block (rs16's
+exit histogram: "host in ggml_threadpool_chunk_add +2" ~700 every 5 s,
+"ret in gemm +1e2" ~700). Now, in the compute library, the host takes
+the instruction with the trap flag set; the SIGTRAP after it (the same
+handler, installed for SIGTRAP too) clears the flag and posts the
+function's blob at the next instruction (`blob_seed_at`), or lets the
+host go on when there is none. `PHI512_TRAMP_ANY=1` applies it to the
+test programs as well. The progress line's exit histogram (`ex_note`,
+`ex_print`: the three most frequent "kind in function +offset" of the
+interval) is how these were found.
+- libm counts with the compute library (`cont_obj_ok`: "/libm.so" in the
+  path): `expf` called from `gated_delta_net` (95 every 5 s) is translated
+  and called in-card, and continuation, the trampoline and the single step
+  apply there too. glibc's own code translated: the results stay bit-exact.
+- Every caller of a busy F is promoted, not only the first (each caller
+  tried once): `vec_dot_bf16` had promoted `mul_mat_id`'s loop, and then
+  ran once a row from `ggml_compute_forward_mul_mat` (the output layer:
+  ~113 regions/s for minutes, rs19). With continuation, the call already
+  in flight moves to the card at its next row.

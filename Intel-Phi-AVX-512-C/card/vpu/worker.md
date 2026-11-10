@@ -1,0 +1,214 @@
+# worker.S: phi-vpu-worker in assembly
+
+The card side of the AVX-512 co-processor: a resident process that
+polls a doorbell in host memory and, when work arrives, runs it across
+the card's vector units. It replaces `vpu_worker.c` (the plan of
+2026-09-30: the card first, since the fixed cost of a request is the
+pole after the whole-expert placement). No libc: system calls direct
+(`defs.inc`), threads by `clone`, text by `text.S`. Built on the host by
+`build.sh` and audited for what the card does not run.
+
+```
+phi-vpu-worker [-v] [-O] [-t N] [-s MS] [-i US] [-e N] [-m 0|1] [-d 0|1] [-S slots] [-C cores] [-T threads] [-R pages] [-N cores] [threads]
+```
+
+`threads` 1 to every hardware thread of the card (default and 0: one a
+core, 57 on a 3120A, 61 on a 7120A): the dispatcher plus the pool.
+`-N cores` sets the card's core count instead of counting its CPUs
+(`count_cores`: the CPUs this process may run on at start over four; a
+failed count leaves 57). `-v` logs each
+request (the matrix service's at `-v -v`, since a line costs its reply
+35 to 60 us on the host-backed disk); `-s MS` spins that long after a
+job before parking (200); `-i US` polls the doorbell every that many
+microseconds once parked (500; `nanosleep` on this kernel costs about
+60 us over the ask); `-e N` huge pages the seamless path pools (256; 0
+leaves them all to the matrix multiplies); `-m 0` sends the matrix
+service's small transfers through the block device (1: through the
+mapping); `-d 0` leaves the card's own DMA channel closed, so the pull
+stays on the cores (1: the channel carries it, `cdma.md`). `-t N` prints
+the pool's dispatch trace and the matrix service's stage trace every N
+dispatches or requests (below).
+
+## What the process does
+
+- **Start.** Maps the 16 KiB control area of `/dev/phihost` (uncached:
+  every access a link transaction) and the whole 768 MiB window (its
+  failure tolerated: the block device then serves every transfer),
+  opens `/dev/phiblk1` with `O_DIRECT` (the page cache would serve the
+  host's stale bytes otherwise), sets its own per-thread block as `fs`
+  (`arch_prctl`), pins itself to CPU 0 (one of the last core's threads,
+  so the pool's core-major fill never lands a worker on its core until
+  every other is taken), calibrates its clock, opens the card's DMA
+  channel for the pull (`cdma_open`, `cdma.md`; one log line says
+  whether it is up, with the DCR and tail it found, or why not; `-d 0`
+  skips it), starts the pool, initialises the exec
+  engine, prints one line, then owns the reset: both sequence numbers to
+  zero (a request left in the window by an earlier run would otherwise
+  be invisible for ever), the scratch displacement at `OFF_SCRATCH`
+  (`SCRATCH_DISP`, the same in every thread's block), then `VPU_MAGIC`
+  at `OFF_READY`.
+- **The pool.** Thread `t` lives on core `core_base + t mod core_count`, its hardware
+  thread from `pool_slot` (a core's first two threads on hardware
+  threads 0 and 3, keeping 1 and 2, where the block devices' pollers
+  run, free; the last core in order 0..3), pinned by `sched_setaffinity` from
+  inside the thread, with a 64 KiB alternate signal stack for the exec
+  engine's handlers and a 256 KiB stack. A thread is `clone` with
+  `CLONE_THREAD_FLAGS | CLONE_SETTLS`: its block (`tls_blocks`, a page
+  each) is its `fs` base, holding its index, core and slot, its stacks,
+  and the 512-byte exec scratch at `SCRATCH_DISP`. Waiting: 2000 looks
+  at the generation word with `delay 64` between them, then the clock;
+  after `spin_ns` with nothing to do the thread counts itself parked and
+  waits in a futex on the word (the kernel compares it atomically, so a
+  bump between the look and the call returns at once). Dispatch:
+  `vpu_pool_map(fn, arg, nslices)` writes the job on the generation's
+  line, bumps the generation, fences (`lock addq $0, (%rsp)`: the card
+  has no `mfence`), wakes the futex only if someone is parked, runs the
+  last slice itself and waits for every busy core's count. Completion is
+  counted per core (a locked add on a line of that core's own, no ring
+  traffic) and the thread completing its core's multiple adds once to
+  `pool_done`, so the dispatcher waits for 57 cores, not 227 threads.
+  `pool_done` is eight counters on eight lines (core modulo
+  `DONE_GROUPS`), summed by `wait_done`: with one counter the
+  assembly's faster wake had the 57 adds arrive together and queue on
+  the line, 11 microseconds from the last thread's end to the
+  dispatcher seeing it (the C worker's slower wake spread them, 5); on
+  eight lines it is 4, a dispatch of nothing 18 to 11 microseconds by
+  the trace.
+- **The doorbell.** One uncached 8-byte load of the request's sequence
+  per poll; idle, it keeps rewriting the readiness word (the host clears
+  the window before its first request and would wipe the flag it is
+  about to wait for) and, every 64 polls past `spin_ns` of idleness,
+  sleeps `idle_us`. A new number: the time, a time-stamp mark, the
+  request line in one 64-byte vector load (`phi_copy64`; field by field
+  would be a link round trip each), then by kind: `K_EXEC` to
+  `vpu_exec_run`, the matrix kinds (`K_UPLOAD` to `K_MATMUL_MORE`, 3 to 8,
+  and `K_DOWNLOAD`, 32, matched exactly so the slot kinds 9 to 16 stay
+  unknown here) to `vpu_matmul_run` (the C
+  signature: control area, kind, threads, verbosity, and pointers for
+  the compute, pull and push times and the slices run), `K_POLY30` here
+  (buffers reserved, the input and coefficients pulled, `poly_dispatch`
+  over whole 128-element chunks with the last slice on this thread, the
+  output pushed), anything else `VPU_E_KERNEL`. The reply's fields are
+  written, then its sequence number last: that is what the host polls.
+  After it, the running counters (`stats`, `struct vpu_stats`): the
+  replies written, those with an error, the sums of their total,
+  compute, pull and push times, the last request's kind, threads and
+  sequence number, stored whole at `OFF_STATS` in one 64-byte vector
+  store (zeroed there at start, before readiness). The stack's phitop
+  reads the line from the window on the host and shows the rates
+  between two of its samples; nothing on the card reads it.
+- **The clock.** `now_ns` is the time-stamp counter scaled by a rate
+  measured at start against the kernel's clock over 20 ms (1099.8
+  ticks per microsecond on this card, the same on every core): a
+  `clock_gettime` is a system call in this binary, which has no libc to
+  find the vDSO through, and the request path takes the time six or
+  seven times. Only differences are used.
+- **The trace (`-t N`).** `stamps` holds each thread's start and end of
+  the current generation; `trace_note` sums, per slice function, how
+  long the slowest thread took to see the generation, the longest pool
+  slice, the dispatcher's slice and the tail from the last end to the
+  dispatcher seeing it, and prints them every N dispatches (`trace fn`,
+  with the thread most often last to see it and its CPU). `stage_note`
+  sums a matrix request's stages from the marks the service leaves in
+  `vpu_marks` (the request read, the descriptors, the pull, the groups,
+  the compute, the push, the reply) and prints them every N requests of
+  that kind (`stages`). The C worker's lines, word for word.
+- **Bulk data**: `vpu_pull` and `vpu_push` read and write whole 4 KiB
+  blocks through the block device (`O_DIRECT` wants the offsets and
+  lengths aligned, so every buffer is page aligned and oversized by a
+  block); `vpu_window` gives the mapping for the small transfers the
+  matrix service does in 64-byte vectors. Buffers (`reserve`) come from
+  2 MiB huge pages when the card has some (`PHI_VPU_HUGEPAGES` in the
+  start script; one block-device record per 512 KiB instead of one per
+  scattered 4 KiB page), else 4 KiB pages, and are touched once so no
+  request pays first-touch faults.
+
+The pool's design and its numbers are the C worker's (`vpu_worker.md`,
+"What a dispatch costs": an empty dispatch 14.5 us at 57 threads, 15.1
+at 114); what the assembly changes is what is under it: no musl, no
+pthread, no TLS variant, every thread's scratch at one displacement.
+
+## The gates
+
+1b (2026-09-30, card 1, the C worker on card 0): `phi-vpu --card 1
+status` prints `worker: polling`; `phi-vpu --card 1 poly` reports every
+lane bit-identical to the host's FMA3 at 65536 elements (57 threads,
+three runs), 1048576 (114 threads) and 16777216 (after a pause long
+enough for the pool to park: the futex path), compute 0.039, 0.117 and
+3.6 ms (the C worker: 0.081, 0.313, 3.185, `vpu_worker.md`). Two
+defects on the way: the block device opened by its error message's
+text instead of its path (errno 2), and `poly_dispatch` computing with
+`rcx` and `rdx` before saving the pointers it received in them (a
+general protection fault in every pool thread at the kernel's first
+coefficient load: the card's `dmesg` names the ip, and the binary keeps
+its symbols during the port).
+
+## Protocol v3: slot processes (2026-10-13)
+
+`-S slots` (0), `-C cores` (4) and `-T threads a core` (1) fork slot
+processes before this process's pool exists ([`sched.md`](sched.md)):
+each takes its cores (`core_base`, `core_count`, which `pool_start` and
+`create_thread` now honour in every process), the wide pool for the
+legacy kinds keeps the cores after theirs (at most four threads a core
+of them), and `main_loop` reads the SLOTSEQ line each poll
+(`slots_poll`), hands a posted slot its job, refreshes `idle_since` when
+it did, and sums the slots' counters into `OFF_STATS` every 64 polls
+(`slots_stats`). The readiness word is re-asserted every 64 polls, not
+every poll. With `-S 0` nothing of this runs. `-R pages` (0) is the pool
+of huge pages for the program's memory ([`resident.md`](resident.md)),
+mapped before the fork.
+
+## A whole card for one slot (2026-10-13, later)
+
+`-S 1 -C 57` is allowed: the slot takes every core and the wide pool
+keeps core 56 beside it, where its threads sleep on a futex until a
+legacy job comes (the clamp used to reduce such a request to 0 slots).
+The pool parks on a futex after `-s MS` of idleness and a wake costs
+about 5 ms, so a session of many short requests runs the worker with
+`-s 1000`: `scripts/phi512.sh` starts it as `-S 1 -C 57 -T 2 -R 128 -s
+1000` under `PHI512_V3=1`.
+
+## The layout for one program (2026-10-13, later)
+
+`-S 1 -C 55 -T 2 -R 128 -s 1000`: 110 pool threads on cores 0 to 54
+(hardware threads 0 and 3), the slot's control thread alone on core 55's
+thread 0, the dispatcher on core 56's thread 3 (CPU 0) with the wide pool
+asleep beside it. CPU numbering on the card: core c's hardware thread h is
+CPU 4c + h + 1 for c < 56; core 56's are CPUs 225, 226, 227 and 0. The
+worker reserves the program's address range first thing
+([`resident.md`](resident.md)).
+
+## The same layout on a 7120A (2026-10-22)
+
+The worker counts the card's cores at start (`ncores`, 61 on a 7120A), so
+the layout above is `-S 1 -C 59 -T 2 -R 128 -s 1000` there (the scripts
+pass `-C` as the card's cores less two): 118 pool threads, two on each of
+cores 0 to 58 (hardware threads 0 and 3), the slot's control thread on
+core 59's thread 0 (CPU 237), the dispatcher on CPU 0 (core 60) with the
+wide pool asleep on cores 59 and 60. Measured on the 7120A, every task's
+`Cpus_allowed_list` against `/proc/cpuinfo`'s APIC IDs: exactly that, no
+thread unpinned; and `/proc/stat` before and after the region gate: both
+pool threads of each of the 59 cores on the CPU for the whole run (341 to
+343 ticks), hardware threads 1 and 2 idle. With `-N 57 -C 55` the worker
+pins every thread where the 57-core worker of 2026-10-14 did (the same
+CPU for each of its 120 threads), the check that a 3120A's layout is
+unchanged.
+
+## Slots beside the pool (`-O`, 2026-11-06)
+
+`-O` lets the slots share the wide pool's cores instead of taking cores
+of their own. Each core has four hardware threads; the pool keeps
+threads 0 and 3 (`pool_slot`, `slot_order` 0, 3, 1, 2) of cores 0 to
+`ncores - 2`, and a slot's threads take threads 1 and 2 of its cores
+(`mate_base` 2 added to `TLS_MATE` before `pool_slot`, set in the slot
+process). The slot's control thread goes to the last core's hardware
+thread 1 (CPU 4 (ncores - 1) + 2, 242 on a 7120A), the dispatcher stays
+on CPU 0. On a 7120A, `-O -S 1 -C 59 -T 2` with 121 threads gives the
+translated regions 118 threads on cores 0 to 58 beside the matrix
+service's 120 on cores 0 to 59; core 59's threads 1 and 2 stay with the
+block-device pollers. `-T` above 2 would wrap onto the pool's threads
+and is not meant with `-O`.
+
+After every reply the worker also stores `cdma_stats` at `OFF_CDMA_STATS`
+(192, `vpu_proto.h`): the DMA channel's bytes and copies each way, which
+phitop shows on its pcie line (2026-11-06).

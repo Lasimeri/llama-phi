@@ -1,0 +1,12 @@
+_ITM_deregisterTMCloneTable
+_ITM_registerTMCloneTable
+__cxa_finalize
+__gmon_start__
+__stack_chk_fail
+sigaction
+sigemptyset
+snprintf
+strlen
+strncmp
+vsnprintf
+write

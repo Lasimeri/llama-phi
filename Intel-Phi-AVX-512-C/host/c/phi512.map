@@ -1,0 +1,7 @@
+/* phi512.map: the preload exports nothing. A preloaded library's global
+ * symbols interpose the program's own (verbose, say, now_ns are plausible
+ * names in a program), so every symbol is local; the constructor runs from
+ * .init_array without an export. See README.md, "The hybrid build". */
+{
+	local: *;
+};

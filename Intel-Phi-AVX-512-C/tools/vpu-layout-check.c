@@ -1,0 +1,216 @@
+/*
+ * vpu-layout-check.c: verify that the C offload protocol matches the Rust
+ * one. Run: tcc -run tools/vpu-layout-check.c   (or `make layout-check`)
+ * Exit status 0 when every offset matches the constants pinned by the
+ * unit tests in host/crates/phi-vpu/src/proto.rs; 1 otherwise.
+ */
+#include <stddef.h>
+#include <stdio.h>
+
+#include "../card/vpu/vpu_proto.h"
+#include "../card/vpu/vpu_exec.h"
+#include "../card/vpu/vpu_matmul.h"
+#include "../card/vpu/vpu_fexec.h"
+
+static int fails;
+
+static void check(const char *name, size_t have, size_t want)
+{
+	if (have != want) {
+		printf("MISMATCH %-24s C=%zu rust=%zu\n", name, have, want);
+		fails = 1;
+	} else {
+		printf("ok       %-24s %zu\n", name, have);
+	}
+}
+
+int main(void)
+{
+	/* Values on the right are what proto.rs asserts. */
+	check("sizeof(vpu_request)", sizeof(struct vpu_request), 56);
+	check("request.seq", offsetof(struct vpu_request, seq), 0);
+	check("request.kernel", offsetof(struct vpu_request, kernel), 8);
+	check("request.threads", offsetof(struct vpu_request, threads), 12);
+	check("request.n", offsetof(struct vpu_request, n), 16);
+	check("request.in_off", offsetof(struct vpu_request, in_off), 24);
+	check("request.out_off", offsetof(struct vpu_request, out_off), 32);
+	check("request.aux_off", offsetof(struct vpu_request, aux_off), 40);
+	check("request.aux_len", offsetof(struct vpu_request, aux_len), 48);
+
+	check("sizeof(vpu_reply)", sizeof(struct vpu_reply), 48);
+	check("sizeof(vpu_regs)", sizeof(struct vpu_regs), 2256);
+	check("regs.k", offsetof(struct vpu_regs, k), 2048);
+	check("regs.gpr", offsetof(struct vpu_regs, gpr), 2112);
+	check("regs.rflags", offsetof(struct vpu_regs, rflags), 2240);
+	check("regs.rip", offsetof(struct vpu_regs, rip), 2248);
+	check("sizeof(vpu_exec)", sizeof(struct vpu_exec), 4560);
+	check("exec.entry", offsetof(struct vpu_exec, entry), 56);
+	check("exec.threads", offsetof(struct vpu_exec, threads), 72);
+	check("exec.step", offsetof(struct vpu_exec, step), 88);
+	check("exec.loop_exit", offsetof(struct vpu_exec, loop_exit), 112);
+	check("exec.exit_rip", offsetof(struct vpu_exec, exit_rip), 152);
+	check("exec.exit_kind", offsetof(struct vpu_exec, exit_kind), 168);
+	check("exec.fetch_ns", offsetof(struct vpu_exec, fetch_ns), 192);
+	check("exec.regs", offsetof(struct vpu_exec, regs), 256);
+	check("exec.code_page", offsetof(struct vpu_exec, code_page), 2512);
+	check("exec.ranges", offsetof(struct vpu_exec, ranges), 3024);
+	check("sizeof(vpu_range)", sizeof(struct vpu_range), 24);
+	check("sizeof(vpu_mail)", sizeof(struct vpu_mail), 48);
+	check("mail.ack", offsetof(struct vpu_mail, ack), 32);
+	check("mail.status", offsetof(struct vpu_mail, status), 40);
+	check("reply.seq", offsetof(struct vpu_reply, seq), 0);
+	check("reply.compute_ns", offsetof(struct vpu_reply, compute_ns), 8);
+	check("reply.total_ns", offsetof(struct vpu_reply, total_ns), 16);
+	check("reply.pull_ns", offsetof(struct vpu_reply, pull_ns), 24);
+	check("reply.push_ns", offsetof(struct vpu_reply, push_ns), 32);
+	check("reply.status", offsetof(struct vpu_reply, status), 40);
+	check("reply.threads", offsetof(struct vpu_reply, threads), 44);
+
+	check("VPU_OFF_READY", VPU_OFF_READY, 0);
+	check("VPU_OFF_MATMUL", VPU_OFF_MATMUL, 13312);
+	check("VPU_K_UPLOAD", VPU_K_UPLOAD, 3);
+	check("VPU_K_MATMUL", VPU_K_MATMUL, 4);
+	check("VPU_K_FREE", VPU_K_FREE, 5);
+	check("VPU_K_MATMUL_ID", VPU_K_MATMUL_ID, 6);
+	check("matmul.a_id", offsetof(struct vpu_matmul, a_id), 0);
+	check("matmul.a_off", offsetof(struct vpu_matmul, a_off), 8);
+	check("matmul.bytes", offsetof(struct vpu_matmul, bytes), 16);
+	check("matmul.a_type", offsetof(struct vpu_matmul, a_type), 24);
+	check("matmul.b_type", offsetof(struct vpu_matmul, b_type), 28);
+	check("matmul.m", offsetof(struct vpu_matmul, m), 32);
+	check("matmul.n", offsetof(struct vpu_matmul, n), 40);
+	check("matmul.k", offsetof(struct vpu_matmul, k), 48);
+	check("matmul.nb_a", offsetof(struct vpu_matmul, nb_a), 56);
+	check("matmul.nb_b", offsetof(struct vpu_matmul, nb_b), 64);
+	check("matmul.b_off", offsetof(struct vpu_matmul, b_off), 72);
+	check("matmul.d_off", offsetof(struct vpu_matmul, d_off), 80);
+	check("matmul.chunk", offsetof(struct vpu_matmul, chunk), 88);
+	check("matmul.n_used", offsetof(struct vpu_matmul, n_used), 96);
+	check("matmul.n_tokens", offsetof(struct vpu_matmul, n_tokens), 104);
+	check("matmul.b_rows", offsetof(struct vpu_matmul, b_rows), 112);
+	check("matmul.ids_bytes", offsetof(struct vpu_matmul, ids_bytes), 120);
+	check("sizeof matmul", sizeof(struct vpu_matmul), 128);
+	check("VPU_K_FFN", VPU_K_FFN, 7);
+	check("VPU_OFF_FFN", VPU_OFF_FFN, 13440);
+	check("ffn.gate_type", offsetof(struct vpu_ffn, gate_type), 24);
+	check("ffn.b_type", offsetof(struct vpu_ffn, b_type), 36);
+	check("ffn.rows", offsetof(struct vpu_ffn, rows), 40);
+	check("ffn.m_out", offsetof(struct vpu_ffn, m_out), 56);
+	check("ffn.nb_gate", offsetof(struct vpu_ffn, nb_gate), 72);
+	check("ffn.nb_b", offsetof(struct vpu_ffn, nb_b), 96);
+	check("ffn.b_off", offsetof(struct vpu_ffn, b_off), 104);
+	check("ffn.d_off", offsetof(struct vpu_ffn, d_off), 112);
+	check("ffn.chunk", offsetof(struct vpu_ffn, chunk), 120);
+	check("ffn.h_type", offsetof(struct vpu_ffn, h_type), 128);
+	check("sizeof ffn", sizeof(struct vpu_ffn), 192);
+	check("VPU_K_MATMUL_MORE", VPU_K_MATMUL_MORE, 8);
+	check("VPU_OFF_MORE", VPU_OFF_MORE, 13632);
+	check("VPU_MORE_MAX", VPU_MORE_MAX, 3);
+	check("more_mat.a_type", offsetof(struct vpu_more_mat, a_type), 8);
+	check("more_mat.m", offsetof(struct vpu_more_mat, m), 16);
+	check("more_mat.nb_a", offsetof(struct vpu_more_mat, nb_a), 24);
+	check("more_mat.d_off", offsetof(struct vpu_more_mat, d_off), 32);
+	check("sizeof more_mat", sizeof(struct vpu_more_mat), 40);
+	check("more.mat", offsetof(struct vpu_more, mat), 8);
+	check("sizeof more", sizeof(struct vpu_more), 128);
+	check("VPU_OFF_SCRATCH", VPU_OFF_SCRATCH, 8);
+	check("VPU_FX_SCRATCH_TPOFF", VPU_FX_SCRATCH_TPOFF, 1536);
+	check("VPU_OFF_REQ", VPU_OFF_REQ, 64);
+	check("VPU_OFF_NONCE", VPU_OFF_NONCE, 128);
+	check("VPU_OFF_REPLY", VPU_OFF_REPLY, 256);
+	check("VPU_OFF_LOCK", VPU_OFF_LOCK, 15360);
+	check("VPU_OFF_STATS", VPU_OFF_STATS, 320);
+	check("sizeof(vpu_stats)", sizeof(struct vpu_stats), 64);
+	check("stats.requests", offsetof(struct vpu_stats, requests), 0);
+	check("stats.errors", offsetof(struct vpu_stats, errors), 8);
+	check("stats.busy_ns", offsetof(struct vpu_stats, busy_ns), 16);
+	check("stats.compute_ns", offsetof(struct vpu_stats, compute_ns), 24);
+	check("stats.pull_ns", offsetof(struct vpu_stats, pull_ns), 32);
+	check("stats.push_ns", offsetof(struct vpu_stats, push_ns), 40);
+	check("stats.last_kernel", offsetof(struct vpu_stats, last_kernel), 48);
+	check("stats.last_threads", offsetof(struct vpu_stats, last_threads), 52);
+	check("stats.last_seq", offsetof(struct vpu_stats, last_seq), 56);
+	check("VPU_OFF_DATA", VPU_OFF_DATA, 1u << 20);
+	check("VPU_BLOCK", VPU_BLOCK, 4096);
+	check("VPU_CHUNK", VPU_CHUNK, 128);
+
+	/* Protocol v3 (vpu_fexec.h): the values on the right are proto.inc's. */
+	check("VPU_OFF_SLOTSEQ", VPU_OFF_SLOTSEQ, 448);
+	check("VPU_NSLOTS", VPU_NSLOTS, 32);
+	check("VPU_OFF_SLOTS", VPU_OFF_SLOTS, 65536);
+	check("VPU_SLOT_BYTES", VPU_SLOT_BYTES, 4096);
+	check("VPU_OFF_SLOTDATA", VPU_OFF_SLOTDATA, 48u << 20);
+	check("VPU_SLOTDATA_BYTES", VPU_SLOTDATA_BYTES, 1u << 20);
+	check("VPU_OFF_LOADAREA", VPU_OFF_LOADAREA, 80u << 20);
+	check("VPU_LOADAREA_BYTES", VPU_LOADAREA_BYTES, 16u << 20);
+	check("VPU_OFF_RESIDENT", VPU_OFF_RESIDENT, 96u << 20);
+	check("VPU_RESIDENT_BYTES", VPU_RESIDENT_BYTES, 32u << 20);
+	check("VPU_SD_REGS_OUT", VPU_SD_REGS_OUT, 4096);
+	check("VPU_SD_REFRESH_TAB", VPU_SD_REFRESH_TAB, 8192);
+	check("VPU_SD_REFRESH", VPU_SD_REFRESH, 16384);
+	check("VPU_SD_WB_TAB", VPU_SD_WB_TAB, 272u * 1024);
+	check("VPU_SD_WB", VPU_SD_WB, 288u * 1024);
+	check("VPU_SD_DEFER", VPU_SD_DEFER, 528u * 1024);
+	check("VPU_SD_LAND", VPU_SD_LAND, 784u * 1024);
+	check("VPU_K_PING", VPU_K_PING, 9);
+	check("VPU_K_LOAD", VPU_K_LOAD, 10);
+	check("VPU_K_UNLOAD", VPU_K_UNLOAD, 11);
+	check("VPU_K_RESIDENT", VPU_K_RESIDENT, 12);
+	check("VPU_K_FEXEC", VPU_K_FEXEC, 13);
+	check("VPU_K_RESUME", VPU_K_RESUME, 14);
+	check("VPU_K_FLUSH", VPU_K_FLUSH, 15);
+	check("VPU_K_PUSH", VPU_K_PUSH, 16);
+	check("VPU_SD_WB_BYTES", VPU_SD_WB_BYTES, 240u * 1024);
+	check("VPU_X_LOOP", VPU_X_LOOP, 6);
+	check("VPU_X_LIMIT", VPU_X_LIMIT, 8);
+	check("VPU_X_HOST", VPU_X_HOST, 10);
+	check("sizeof(vpu_slot_req)", sizeof(struct vpu_slot_req), 368);
+	check("slot_req.canary", offsetof(struct vpu_slot_req, canary), 352);
+	check("slot_req.victim", offsetof(struct vpu_slot_req, victim), 360);
+	check("fill_off", offsetof(struct vpu_slot_req, fill_off), 336);
+	check("fill_len", offsetof(struct vpu_slot_req, fill_len), 344);
+	check("slot_req.seq", offsetof(struct vpu_slot_req, seq), 0);
+	check("slot_req.kind", offsetof(struct vpu_slot_req, kind), 8);
+	check("slot_req.flags", offsetof(struct vpu_slot_req, flags), 12);
+	check("slot_req.fn_id", offsetof(struct vpu_slot_req, fn_id), 16);
+	check("slot_req.entry", offsetof(struct vpu_slot_req, entry), 24);
+	check("slot_req.threads", offsetof(struct vpu_slot_req, threads), 32);
+	check("slot_req.nstripes", offsetof(struct vpu_slot_req, nstripes), 36);
+	check("slot_req.stripes", offsetof(struct vpu_slot_req, stripes), 40);
+	check("sizeof(vpu_stripe)", sizeof(struct vpu_stripe), 16);
+	check("slot_req.ind_reg", offsetof(struct vpu_slot_req, ind_reg), 296);
+	check("slot_req.bound_reg", offsetof(struct vpu_slot_req, bound_reg), 300);
+	check("slot_req.step", offsetof(struct vpu_slot_req, step), 304);
+	check("slot_req.loop_exit", offsetof(struct vpu_slot_req, loop_exit), 312);
+	check("slot_req.refresh_n", offsetof(struct vpu_slot_req, refresh_n), 320);
+	check("slot_req.defer_cap", offsetof(struct vpu_slot_req, defer_cap), 324);
+	check("slot_req.wb_n", offsetof(struct vpu_slot_req, wb_n), 328);
+	check("slot_req.wb_bytes", offsetof(struct vpu_slot_req, wb_bytes), 332);
+	check("VPU_SLOT_REPLY", VPU_SLOT_REPLY, 2048);
+	check("sizeof(vpu_slot_reply)", sizeof(struct vpu_slot_reply), 88);
+	check("slot_reply.status", offsetof(struct vpu_slot_reply, status), 8);
+	check("slot_reply.exit_kind", offsetof(struct vpu_slot_reply, exit_kind), 12);
+	check("slot_reply.exit_rip", offsetof(struct vpu_slot_reply, exit_rip), 16);
+	check("slot_reply.exit_aux", offsetof(struct vpu_slot_reply, exit_aux), 24);
+	check("slot_reply.run_ns", offsetof(struct vpu_slot_reply, run_ns), 32);
+	check("slot_reply.fetch_ns", offsetof(struct vpu_slot_reply, fetch_ns), 40);
+	check("slot_reply.wb_ns", offsetof(struct vpu_slot_reply, wb_ns), 48);
+	check("slot_reply.total_ns", offsetof(struct vpu_slot_reply, total_ns), 56);
+	check("slot_reply.wb_n", offsetof(struct vpu_slot_reply, wb_n), 64);
+	check("slot_reply.defer_n", offsetof(struct vpu_slot_reply, defer_n), 68);
+	check("slot_reply.threads_ran", offsetof(struct vpu_slot_reply, threads_ran), 72);
+	check("slot_reply.free_bytes", offsetof(struct vpu_slot_reply, free_bytes), 80);
+	check("VPU_SLOT_MAIL", VPU_SLOT_MAIL, 3072);
+	check("sizeof(vpu_slot_mail)", sizeof(struct vpu_slot_mail), 40);
+	check("slot_mail.seq", offsetof(struct vpu_slot_mail, seq), 16);
+	check("slot_mail.ack", offsetof(struct vpu_slot_mail, ack), 24);
+	check("slot_mail.status", offsetof(struct vpu_slot_mail, status), 32);
+	check("VPU_SLOT_PROGRESS", VPU_SLOT_PROGRESS, 3136);
+
+	if (fails) {
+		printf("vpu-layout-check: MISMATCH\n");
+		return 1;
+	}
+	printf("vpu-layout-check: ok\n");
+	return 0;
+}

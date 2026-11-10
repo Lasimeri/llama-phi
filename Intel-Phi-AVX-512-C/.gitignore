@@ -1,0 +1,16 @@
+# Build outputs
+/host/target/
+**/*.rs.bk
+/tools/*.out
+*.o
+*.bin
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+/host/asm/out/
+/host/c/out/
+/compile_commands.json
+/.cache/

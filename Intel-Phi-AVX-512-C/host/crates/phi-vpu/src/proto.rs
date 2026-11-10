@@ -1,0 +1,583 @@
+//! The host/card contract, mirrored from `card/vpu/vpu_proto.h`.
+//!
+//! The two files must agree byte for byte: the card reads what the host
+//! writes at these offsets and nothing checks it at run time. Both carry
+//! the same size assertions, the unit tests below pin every field offset,
+//! and `tools/vpu-layout-check.c` compares the C side against the same
+//! numbers.
+
+/// Window offset of the card's readiness word.
+pub const OFF_READY: usize = 0;
+/// Window offset of the `fs`-relative displacement (i64) of the card
+/// worker's per-thread scratch area for the seamless path's thunks
+/// (`vpu_exec.h`), written by the card before its readiness word.
+pub const OFF_SCRATCH: usize = 8;
+/// Window offset of the request descriptor.
+pub const OFF_REQ: usize = 64;
+/// Window offset of the line the card alone writes at start: the nonce of
+/// its DMA channel's open (`card/vpu/cdma.md`). The host never touches it.
+pub const OFF_NONCE: usize = 128;
+/// Window offset of the reply descriptor.
+pub const OFF_REPLY: usize = 256;
+/// Window offset of the worker's running counters (`Stats`), one line it
+/// rewrites after every reply; the stack's phitop reads it for its rates.
+pub const OFF_STATS: usize = 320;
+/// Window offset of the doorbell lock: host-side clients take it before a
+/// request and free it after the reply; the card never touches it.
+pub const OFF_LOCK: usize = 15360;
+/// Where bulk data starts. Everything below is control words.
+pub const OFF_DATA: u64 = 1 << 20;
+
+/// What the card writes at `OFF_READY` while it is polling ("VPU_READ").
+pub const MAGIC: u64 = 0x5650_555F_5245_4144;
+
+/// Degree-30 Horner in float32: `out[i] = poly(in[i])`.
+pub const K_POLY30: u32 = 1;
+
+/// The card moves data with `O_DIRECT`, so every offset and every
+/// transfer is a whole number of these.
+pub const BLOCK: u64 = 4096;
+/// The POLY30 kernel works in steps of this many elements.
+pub const CHUNK: u64 = 128;
+
+/// Round a byte count or offset up to a block boundary.
+pub const fn round_up(x: u64) -> u64 {
+    (x + BLOCK - 1) & !(BLOCK - 1)
+}
+
+/// `struct vpu_request`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Request {
+    /// The host bumps this last; the card polls it.
+    pub seq: u64,
+    pub kernel: u32,
+    /// How many card threads to spread the work across.
+    pub threads: u32,
+    /// Elements.
+    pub n: u64,
+    pub in_off: u64,
+    pub out_off: u64,
+    pub aux_off: u64,
+    pub aux_len: u64,
+}
+
+/// `struct vpu_reply`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reply {
+    /// Echoes the request's sequence number once the work is done.
+    pub seq: u64,
+    /// Time on the vector units alone.
+    pub compute_ns: u64,
+    /// From the doorbell being seen to the reply being written.
+    pub total_ns: u64,
+    /// Moving the input and coefficients onto the card.
+    pub pull_ns: u64,
+    /// Moving the output back.
+    pub push_ns: u64,
+    pub status: i32,
+    /// Slices that actually ran.
+    pub threads: i32,
+}
+
+/// `struct vpu_stats`: the worker's counters since it started, summed
+/// over every reply it wrote; two samples give the rates.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Replies written.
+    pub requests: u64,
+    /// Of them with a status other than `OK`.
+    pub errors: u64,
+    /// The sum of their `total_ns`.
+    pub busy_ns: u64,
+    pub compute_ns: u64,
+    pub pull_ns: u64,
+    pub push_ns: u64,
+    /// The last request's kind and the slices it ran on.
+    pub last_kernel: u32,
+    pub last_threads: u32,
+    /// The last reply's sequence number.
+    pub last_seq: u64,
+}
+
+pub const OK: i32 = 0;
+pub const E_ALLOC: i32 = -1;
+pub const E_PULL: i32 = -2;
+pub const E_PUSH: i32 = -3;
+pub const E_REQUEST: i32 = -4;
+pub const E_KERNEL: i32 = -5;
+
+/// A reply status as words.
+pub fn status_name(status: i32) -> &'static str {
+    match status {
+        OK => "ok",
+        E_ALLOC => "card could not reserve buffers",
+        E_PULL => "card could not read the input from the window",
+        E_PUSH => "card could not write the output (unaligned offset?)",
+        E_REQUEST => "request rejected: n is zero or an offset is not block aligned",
+        E_KERNEL => "unknown kernel number",
+        _ => "unknown status",
+    }
+}
+
+// The C header asserts the same three sizes.
+const _: [(); 56] = [(); std::mem::size_of::<Request>()];
+const _: [(); 48] = [(); std::mem::size_of::<Reply>()];
+const _: [(); 64] = [(); std::mem::size_of::<Stats>()];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::offset_of;
+
+    /// These are the numbers `tools/vpu-layout-check.c` prints for the C
+    /// side. If either file changes, one of the two checks fails.
+    #[test]
+    fn request_layout_matches_the_c_header() {
+        assert_eq!(offset_of!(Request, seq), 0);
+        assert_eq!(offset_of!(Request, kernel), 8);
+        assert_eq!(offset_of!(Request, threads), 12);
+        assert_eq!(offset_of!(Request, n), 16);
+        assert_eq!(offset_of!(Request, in_off), 24);
+        assert_eq!(offset_of!(Request, out_off), 32);
+        assert_eq!(offset_of!(Request, aux_off), 40);
+        assert_eq!(offset_of!(Request, aux_len), 48);
+    }
+
+    #[test]
+    fn reply_layout_matches_the_c_header() {
+        assert_eq!(offset_of!(Reply, seq), 0);
+        assert_eq!(offset_of!(Reply, compute_ns), 8);
+        assert_eq!(offset_of!(Reply, total_ns), 16);
+        assert_eq!(offset_of!(Reply, pull_ns), 24);
+        assert_eq!(offset_of!(Reply, push_ns), 32);
+        assert_eq!(offset_of!(Reply, status), 40);
+        assert_eq!(offset_of!(Reply, threads), 44);
+    }
+
+    #[test]
+    fn stats_layout_matches_the_c_header() {
+        assert_eq!(offset_of!(Stats, requests), 0);
+        assert_eq!(offset_of!(Stats, errors), 8);
+        assert_eq!(offset_of!(Stats, busy_ns), 16);
+        assert_eq!(offset_of!(Stats, compute_ns), 24);
+        assert_eq!(offset_of!(Stats, pull_ns), 32);
+        assert_eq!(offset_of!(Stats, push_ns), 40);
+        assert_eq!(offset_of!(Stats, last_kernel), 48);
+        assert_eq!(offset_of!(Stats, last_threads), 52);
+        assert_eq!(offset_of!(Stats, last_seq), 56);
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn control_words_do_not_share_a_cache_line() {
+        assert!(OFF_REQ - OFF_READY >= 64);
+        assert!(OFF_REPLY - OFF_REQ >= std::mem::size_of::<Request>());
+        assert!(OFF_REPLY - OFF_REQ >= 64);
+        assert!(OFF_NONCE - OFF_REQ >= 64);
+        assert!(OFF_REPLY - OFF_NONCE >= 64);
+        assert!(OFF_STATS - OFF_REPLY >= 64);
+        assert_eq!(OFF_STATS % 64, 0);
+        assert!(OFF_DATA as usize >= OFF_STATS + std::mem::size_of::<Stats>());
+        assert_eq!(OFF_DATA % BLOCK, 0);
+    }
+
+    #[test]
+    fn rounding_lands_on_blocks() {
+        assert_eq!(round_up(0), 0);
+        assert_eq!(round_up(1), 4096);
+        assert_eq!(round_up(4096), 4096);
+        assert_eq!(round_up(4097), 8192);
+    }
+}
+
+/// Run a region of the host program on the card (card/vpu/vpu_exec.h).
+pub const K_EXEC: u32 = 2;
+
+// The seamless path (card/vpu/vpu_exec.h).
+pub const EXEC_CHUNK: u64 = 2 << 20;
+pub const EXEC_THUNK_MAX: u64 = 256 << 10;
+pub const EXEC_MAX_RANGES: usize = 64;
+pub const EXEC_MAX_PAGES: usize = 64;
+pub const EXEC_MAX_THREADS: usize = 64;
+/// The descriptor leads the bundle at `OFF_EXEC_CODE`: this many pages, then the thunk area, then the code pages.
+pub const EXEC_DESC_PAGES: u64 = 2;
+pub const OFF_MAIL: usize = 4096;
+pub const OFF_EXEC: usize = 8192;
+pub const OFF_EXEC_FETCH: u64 = 32 << 20;
+pub const OFF_EXEC_CODE: u64 = OFF_EXEC_FETCH + 2 * EXEC_CHUNK;
+pub const OFF_EXEC_WB: u64 = OFF_EXEC_CODE + EXEC_CHUNK;
+
+/// The register file: zmm0..31, k0..7, then the integer registers in x86
+/// encoding order (rax rcx rdx rbx rsp rbp rsi rdi r8..r15), flags, rip.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Regs {
+    pub zmm: [[u8; 64]; 32],
+    pub k: [u16; 8],
+    pub pad: [u8; 48],
+    pub gpr: [u64; 16],
+    pub rflags: u64,
+    pub rip: u64,
+}
+
+impl Default for Regs {
+    fn default() -> Self {
+        Regs {
+            zmm: [[0; 64]; 32],
+            k: [0; 8],
+            pad: [0; 48],
+            gpr: [0; 16],
+            rflags: 0,
+            rip: 0,
+        }
+    }
+}
+
+/// A range of the program's memory a phase touches.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Range {
+    pub addr: u64,
+    pub len: u64,
+    pub flags: u32,
+    pub pad: u32,
+}
+pub const RANGE_WRITE: u32 = 1;
+/// Every byte written and none read: the card fetches only its edge pages.
+pub const RANGE_DENSE: u32 = 2;
+
+pub const MODE_DEMAND: u32 = 0;
+pub const MODE_RANGES: u32 = 1;
+pub const EXEC_FINAL: u32 = 1;
+pub const EXEC_FIRST: u32 = 2;
+
+pub const EXIT_LEFT: u32 = 0;
+pub const EXIT_FAULT: u32 = 1;
+pub const EXIT_ILLEGAL: u32 = 2;
+pub const EXIT_COLLISION: u32 = 3;
+pub const EXIT_LIMIT: u32 = 4;
+pub const EXIT_SPLIT: u32 = 5;
+
+/// The exec descriptor at `OFF_EXEC`: the phase in, the exit out.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Exec {
+    pub region_id: u64,
+    pub mode: u32,
+    pub flags: u32,
+    pub code_addr: u64,
+    pub thunk_addr: u64,
+    pub thunk_len: u64,
+    pub region_lo: u64,
+    pub region_hi: u64,
+    pub entry: u64,
+    pub code_pages: u32,
+    pub nranges: u32,
+    pub threads: u32,
+    pub ind_reg: u32,
+    pub bound_reg: u32,
+    pub pad: u32,
+    pub step: i64,
+    pub ind_start: u64,
+    pub ind_end: u64,
+    pub loop_exit: u64,
+    pub reserved: [u64; 4],
+    pub exit_rip: u64,
+    pub fault_addr: u64,
+    pub exit_kind: u32,
+    pub exit_thread: u32,
+    pub chunks: u32,
+    pub dirty: u32,
+    pub faults: u32,
+    pub threads_ran: u32,
+    pub fetch_ns: u64,
+    pub wb_ns: u64,
+    pub run_ns: u64,
+    pub reserved2: [u64; 5],
+    pub regs: Regs,
+    pub code_page: [u64; EXEC_MAX_PAGES],
+    pub ranges: [Range; EXEC_MAX_RANGES],
+}
+
+impl Default for Exec {
+    fn default() -> Self {
+        Exec {
+            region_id: 0,
+            mode: 0,
+            flags: 0,
+            code_addr: 0,
+            thunk_addr: 0,
+            thunk_len: 0,
+            region_lo: 0,
+            region_hi: 0,
+            entry: 0,
+            code_pages: 0,
+            nranges: 0,
+            threads: 1,
+            ind_reg: 0,
+            bound_reg: 0,
+            pad: 0,
+            step: 0,
+            ind_start: 0,
+            ind_end: 0,
+            loop_exit: 0,
+            reserved: [0; 4],
+            exit_rip: 0,
+            fault_addr: 0,
+            exit_kind: 0,
+            exit_thread: 0,
+            chunks: 0,
+            dirty: 0,
+            faults: 0,
+            threads_ran: 0,
+            fetch_ns: 0,
+            wb_ns: 0,
+            run_ns: 0,
+            reserved2: [0; 5],
+            regs: Regs::default(),
+            code_page: [0; EXEC_MAX_PAGES],
+            ranges: [Range::default(); EXEC_MAX_RANGES],
+        }
+    }
+}
+
+pub const MAIL_FETCH: u32 = 0;
+pub const MAIL_WRITEBACK: u32 = 1;
+
+/// The mailbox at `OFF_MAIL`: the card writes addr, len, kind, then seq;
+/// the host serves, writes status, then ack = seq.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Mail {
+    pub seq: u64,
+    pub addr: u64,
+    pub len: u64,
+    pub kind: u32,
+    pub slot: u32,
+    pub ack: u64,
+    pub status: i32,
+    pub pad2: u32,
+}
+
+/// A page written back by the card (`MAIL_WRITEBACK`): only the 64-byte
+/// lines whose bit is set in `lines` changed. The table of `WB_TABLE`
+/// bytes leads the slot, the pages follow in table order.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct WbPage {
+    pub addr: u64,
+    pub lines: u64,
+}
+pub const WB_TABLE: u64 = 64 << 10;
+pub const WB_MAX_PAGES: u64 = (EXEC_CHUNK - WB_TABLE) / 4096;
+
+const _: [(); 2256] = [(); std::mem::size_of::<Regs>()];
+const _: [(); 24] = [(); std::mem::size_of::<Range>()];
+const _: [(); 256 + 2256 + 512 + 1536] = [(); std::mem::size_of::<Exec>()];
+const _: [(); 48] = [(); std::mem::size_of::<Mail>()];
+const _: [(); 16] = [(); std::mem::size_of::<WbPage>()];
+
+// ---- the matrix-multiply service (card/vpu/vpu_matmul.h) ----
+
+/// Keep `bytes` from the window at `a_off` under `a_id`.
+pub const K_UPLOAD: u32 = 3;
+/// d = a . b^T with a cached (`a_id`) or in the window (`a_off`).
+pub const K_MATMUL: u32 = 4;
+/// Drop `a_id` (0: everything).
+pub const K_FREE: u32 = 5;
+/// One expert of a mixture per column (ggml's MUL_MAT_ID).
+pub const K_MATMUL_ID: u32 = 6;
+/// Window offset of the matmul descriptor, in the control area.
+pub const OFF_MATMUL: usize = 13312;
+pub const MM_F32: u32 = 0;
+pub const MM_F16: u32 = 1;
+/// llama.cpp quantized formats (`VPU_MM_*`, vpu_matmul.h): 256-weight superblocks.
+pub const MM_Q4_K: u32 = 2;
+pub const MM_Q5_K: u32 = 3;
+pub const MM_Q6_K: u32 = 4;
+pub const MM_Q8_0: u32 = 5;
+pub const MM_IQ4_XS: u32 = 6;
+pub const MM_BF16: u32 = 7;
+/// Q4_0 (`VPU_MM_Q4_0`): 18-byte blocks of 32 weights, eight a superblock.
+pub const MM_Q4_0: u32 = 8;
+/// Diagnostic (`VPU_MM_SWIGLU`): `d = silu(g) * u` over `m` floats, g at
+/// `b_off` and u at `b_off + nb_b`, through the card's `phi_swiglu`.
+pub const MM_SWIGLU: u32 = 98;
+
+/// `struct vpu_matmul`: one upload, multiply or free.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Matmul {
+    pub a_id: u64,
+    pub a_off: u64,
+    pub bytes: u64,
+    pub a_type: u32,
+    /// The activations: 0 float32, 1 float16, which the card's memory
+    /// operands up-convert at no cost and which halves what crosses the
+    /// link (`kernels.md`).
+    pub b_type: u32,
+    pub m: u64,
+    pub n: u64,
+    pub k: u64,
+    pub nb_a: u64,
+    pub nb_b: u64,
+    pub b_off: u64,
+    pub d_off: u64,
+    /// Rows per chunk the card works in (0: its own default).
+    pub chunk: u64,
+    /// MUL_MAT_ID only, zero otherwise: the experts used per token, the
+    /// tokens, b's rows per token (1 when every expert reads the same
+    /// row), and the bytes of ids that precede b in the window.
+    pub n_used: u64,
+    pub n_tokens: u64,
+    pub b_rows: u64,
+    pub ids_bytes: u64,
+}
+
+/// A feed-forward block's share in one request: the gate and up rows of
+/// this card's run of the intermediate, the SwiGLU of them, and the down
+/// projection over the same run of its columns, returned as a partial sum
+/// over every output row (`struct vpu_ffn`, vpu_matmul.h). The
+/// intermediate never crosses the link.
+pub const K_FFN: u32 = 7;
+/// Window offset of the feed-forward descriptor, after the matmul one.
+pub const OFF_FFN: usize = 13440;
+
+/// `struct vpu_ffn`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Ffn {
+    /// The resident slices: gate and up `rows` rows of `k` (strides
+    /// `nb_gate`, `nb_up`), down `m_out` rows of this card's columns
+    /// only (stride `nb_down`).
+    pub gate_id: u64,
+    pub up_id: u64,
+    pub down_id: u64,
+    pub gate_type: u32,
+    pub up_type: u32,
+    pub down_type: u32,
+    /// The activations: 0 float32, 1 float16.
+    pub b_type: u32,
+    /// The run this request computes: a multiple of 256, at most what
+    /// the slices hold (a batch may give the host the rest of it).
+    pub rows: u64,
+    pub k: u64,
+    pub m_out: u64,
+    pub n: u64,
+    pub nb_gate: u64,
+    pub nb_up: u64,
+    pub nb_down: u64,
+    pub nb_b: u64,
+    pub b_off: u64,
+    pub d_off: u64,
+    pub chunk: u64,
+    /// The intermediate as the down projection reads it: 0 float32, which
+    /// holds any magnitude, 1 float16, whose kernels are quicker and which
+    /// overflows past 65504 (so only for activations known to be bounded).
+    pub h_type: u32,
+    pub pad: u32,
+    pub reserved: [u64; 7],
+}
+
+/// Further matrices by the same activations (and a mixture's same ids) in
+/// the same request as the matmul descriptor's own: one pull, one
+/// dispatch, one push per result (`struct vpu_more`, vpu_matmul.h).
+pub const K_MATMUL_MORE: u32 = 8;
+/// Bytes [a_off, a_off + bytes) of the resident a_id pushed to the window at
+/// d_off (both block aligned): a card-held matrix back to the host.
+pub const K_DOWNLOAD: u32 = 32;
+/// Window offset of the further-matrices descriptor, after the
+/// feed-forward one.
+pub const OFF_MORE: usize = 13632;
+/// The most further matrices one request carries.
+pub const MORE_MAX: usize = 3;
+
+/// `struct vpu_more_mat`: one further matrix.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MoreMat {
+    pub a_id: u64,
+    /// `MM_*`, a quantized type.
+    pub a_type: u32,
+    pub pad: u32,
+    /// Its rows this request computes (a mixture: rows of each expert).
+    pub m: u64,
+    pub nb_a: u64,
+    /// Where its `n` rows of `m` floats go, whole blocks.
+    pub d_off: u64,
+}
+
+/// `struct vpu_more`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct More {
+    /// Further matrices, 1 to `MORE_MAX`.
+    pub count: u32,
+    pub pad: u32,
+    pub mat: [MoreMat; MORE_MAX],
+}
+
+#[cfg(test)]
+mod more_layout {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn more_descriptor_matches_the_c_struct() {
+        assert_eq!(size_of::<MoreMat>(), 40);
+        assert_eq!(offset_of!(MoreMat, a_type), 8);
+        assert_eq!(offset_of!(MoreMat, m), 16);
+        assert_eq!(offset_of!(MoreMat, nb_a), 24);
+        assert_eq!(offset_of!(MoreMat, d_off), 32);
+        assert_eq!(size_of::<More>(), 128);
+        assert_eq!(offset_of!(More, mat), 8);
+        assert!(OFF_MORE >= OFF_FFN + 192 && OFF_MORE + 128 <= 16384);
+    }
+}
+
+#[cfg(test)]
+mod ffn_layout {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn ffn_descriptor_matches_the_c_struct() {
+        assert_eq!(size_of::<Ffn>(), 192);
+        assert_eq!(offset_of!(Ffn, gate_type), 24);
+        assert_eq!(offset_of!(Ffn, b_type), 36);
+        assert_eq!(offset_of!(Ffn, rows), 40);
+        assert_eq!(offset_of!(Ffn, m_out), 56);
+        assert_eq!(offset_of!(Ffn, nb_gate), 72);
+        assert_eq!(offset_of!(Ffn, nb_b), 96);
+        assert_eq!(offset_of!(Ffn, b_off), 104);
+        assert_eq!(offset_of!(Ffn, d_off), 112);
+        assert_eq!(offset_of!(Ffn, chunk), 120);
+        assert_eq!(offset_of!(Ffn, h_type), 128);
+        assert!(OFF_FFN >= OFF_MATMUL + 128 && OFF_FFN + 192 <= 16384);
+    }
+}
+
+#[cfg(test)]
+mod matmul_layout {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn matmul_descriptor_matches_the_c_struct() {
+        assert_eq!(size_of::<Matmul>(), 128);
+        assert_eq!(offset_of!(Matmul, a_type), 24);
+        assert_eq!(offset_of!(Matmul, m), 32);
+        assert_eq!(offset_of!(Matmul, nb_a), 56);
+        assert_eq!(offset_of!(Matmul, b_off), 72);
+        assert_eq!(offset_of!(Matmul, d_off), 80);
+        assert_eq!(offset_of!(Matmul, chunk), 88);
+        assert_eq!(offset_of!(Matmul, n_used), 96);
+        assert_eq!(offset_of!(Matmul, n_tokens), 104);
+        assert_eq!(offset_of!(Matmul, b_rows), 112);
+        assert_eq!(offset_of!(Matmul, ids_bytes), 120);
+        assert!(OFF_MATMUL >= OFF_EXEC + 4560 && OFF_MATMUL + 128 <= 16384);
+    }
+}

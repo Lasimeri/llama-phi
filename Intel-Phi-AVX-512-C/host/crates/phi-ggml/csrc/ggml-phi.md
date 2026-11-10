@@ -1,0 +1,212 @@
+# ggml-phi.c: the ggml glue
+
+**The C this documents was replaced by the assembly glue on 2026-09-30**
+(`host/asm/ggml-phi/glue.S` and its `glue.md`, the ggml layout from
+`tools/ggml-layout-check.c`; `docs/results/2026-09-30-backend-assembly.md`);
+what it explains stands, slot for slot. The C source is in the history
+before the commit that removed it.
+
+The C ggml's backend interface requires, modelled on ggml's own BLAS
+backend: a device of type ACCEL named "Phi" that shares the CPU's host
+buffers (so the model's weights need no copy on the host and ggml's
+scheduler can hand ops back and forth), `supports_op` for `MUL_MAT`
+with a weight type the cards take (float32, float16, Q4_K, Q5_K, Q6_K,
+Q8_0, IQ4_XS), float32 activations, contiguous rows, no batch
+dimensions, a `*.weight` tensor, not marked a Hadamard transform
+(`GGML_HINT_SRC0_IS_HADAMARD`), within the window limits; and
+`graph_compute`, which runs each node in three steps: `phi_ggml_begin`
+in `src/lib.rs` (the cards start on their rows), the host's rows here,
+`phi_ggml_end` (the cards' rows gathered).
+
+The host's rows run on a private ggml CPU backend (`host_backend`: the
+CPU device initialised a second time, `PHI_GGML_HOST_THREADS` threads,
+12 by default) with ggml's own `MUL_MAT`, so every type ggml has works
+and the host's part matches what the CPU alone would compute, bit for
+bit. `host_rows` builds a two-node graph per range: two leaves that
+alias the weight's rows and the activations (`alias`: a fresh tensor
+with the data pointer and strides, never a view, because a view of the
+activation tensor drags the whole model graph into the hash set of the
+graph built here, which is how the first version aborted), one
+`ggml_mul_mat` whose result points straight at the node's data with the
+node's row stride.
+
+The ggml functions it needs are resolved with `dlsym` from the program
+that loaded the library (`GGML_FNS`), so the object links against
+nothing of ggml and the same library serves any ggml build whose backend
+API version matches (`GGML_BACKEND_API_VERSION` in the headers it was
+compiled against).
+
+C here is the exception the repository allows: ggml's interface is C
+structs of function pointers, and nothing else of the backend is in C.
+
+The private CPU backend takes 12 threads by default
+(`PHI_GGML_HOST_THREADS`), and the program should be given the same
+`-t`: 12 and 12 measured pp64 9.96 and tg16 1.52 on the 27B, 14 and 14
+gave 1.42, and 16 and 16 collapsed to 0.18, because ggml's barrier spins
+and one thread per CPU leaves nothing for llama.cpp's own pool or the
+two card daemons. (The code said 15 while this note said 12 until
+2026-09-23; 15 is what the 0.47 tg16 of that morning's first run was.)
+
+`GGML_OP_MUL_MAT_ID` is accepted on the same terms as `MUL_MAT` (weight
+type the cards take, float32 activations, a name with "weight" in it),
+and runs in the same three steps, with `host_rows_id` building the
+host's share as a leaf alias of the expert tensor (`alias3`, which keeps
+`ne[2]` and `nb[2]` so every expert's rows are where ggml expects them)
+and the ids passed through untouched.
+
+The open prints up to three lines: that the host's rows have a
+threadpool of their own (and its poll level) when one is made (below),
+the thread count this private CPU backend
+runs the host's rows on (`PHI_GGML_HOST_THREADS`, 12), and a reminder to
+give the calling program the same, because everything that is not a
+matrix multiply runs on the program's own threads and those contend with
+the card daemons just as badly. At 16 of this machine's 16 hardware
+threads the 27B generates 0.29 tokens per second against 1.53 at 12
+(`../src/lib.md`).
+
+With `PHI_GGML_VERBOSE` set, every host range computed here prints its
+time ("host rows A..B of TYPE MxK, n N: compute T ms"), and so does each
+fused block's host part; the per-multiply lines (host part, wait, each
+card's pull, compute and push) come from the Rust side.
+
+`PHI_GGML_GRAPH=N` prints the first N sub-graphs the scheduler hands
+this backend, one line per node with the activation tensor's address.
+It is how the fusion question is answered without guessing: on
+Qwen3.8-27B it shows `ffn_gate` and `ffn_up` arriving in one sub-graph
+against one `attn_post_norm` tensor, and `ffn_down` arriving alone
+behind a `ffn_swiglu` the CPU computed, because this backend does not
+claim the gated-linear op.
+
+## Feed-forward blocks
+
+With `PHI_GGML_FFN=1` (off by default, below) the glue takes
+`GGML_OP_GLU` when it is SwiGLU in the split form, float32 with evenly
+spaced rows (`phi_supports_glu`).
+That is what brings a block's four nodes into one sub-graph; the dumps
+from before and after (`PHI_GGML_GRAPH`) are in the results note.
+
+`phi_graph_compute` scans each sub-graph first (`find_quad`): a SwiGLU
+whose two inputs are multiplies of the same activations in this
+sub-graph, read by a later multiply, with shapes that chain, none of the
+three intermediates marked as a graph output or read by any other node
+here, since the fused path never writes them. A block's gate, up and
+SwiGLU are then skipped where they stand and the block runs at its down
+multiply (`run_ffn`): Rust's `phi_ggml_ffn_begin` starts the cards, the
+host's runs of the intermediate are computed here as one ggml graph
+(`host_ffn`: row leaves of gate and up, the SwiGLU, a leaf of down's
+columns cut at the run's superblocks, summed into the result, the
+intermediates in a scratch buffer kept between calls), and
+`phi_ggml_ffn_end` adds the cards' partials. A block the fused path
+rejects when it first plans it (a type or shape it cannot take) runs as
+it would have without it: the multiplies the plain way (`run_mul_mat`)
+and the SwiGLU on the host. A block it has planned and then declines (it
+was judged not worth the cards, or its input would not fit the window)
+has its multiplies done on the host whole: its tensors are the fused
+path's (`ffn_members`), which the plain path leaves to the host.
+
+A SwiGLU that is not part of a block this backend fuses (a mixture of
+experts' own, whose inputs are `MUL_MAT_ID`) runs on the private CPU
+backend here (`host_glu`), which is what llama.cpp's CPU backend would
+have done with it.
+
+The k-sliced multiply `host_ffn` relies on, a quantized weight's leaf
+whose rows are shorter than their stride and start whole blocks in, was
+checked against the whole multiply for Q4_K, Q5_K, Q6_K, Q8_0 and IQ4_XS
+before any of this was written: equal within 1.1e-8 to 5.1e-8 of the
+magnitude, the summation order and nothing else (the results note).
+
+**Why it is off by default.** A fused block never writes its gate, up
+and SwiGLU tensors. `find_quad` checks that nothing else in the
+sub-graph reads them and that none is a graph output, but it sees only
+the sub-graph it is handed, and a program's eval callback can read a
+tensor from outside: llama-imatrix asks for every multiply and reads its
+activations, which for `ffn_down` is the SwiGLU, while the scheduler
+hands this backend a sub-graph ending at that multiply. Nothing visible
+here tells that call apart from inference. In ordinary inference the
+intermediates have no other reader, and the fused path is correct there
+(token for token on both models); it also measured neutral on both, so
+the default gives nothing up. Set `PHI_GGML_FFN=1` to use it, and not
+with such a program.
+
+## The host's rows have a threadpool of their own
+
+Without one, ggml's CPU backend builds a disposable pool inside every
+`graph_compute` and joins it at the end (`ggml/src/ggml-cpu/ggml-cpu.c`,
+`ggml_graph_compute`), and this backend computes about 419 small graphs
+a token. `host_backend` now attaches a persistent one
+(`ggml_threadpool_new` and `ggml_backend_cpu_set_threadpool`, through the
+CPU backend's proc addresses) whose workers do not spin between graphs
+(`PHI_GGML_HOST_POLL`, 0), since the program's own threads run between
+them. `PHI_GGML_HOST_POOL=0` leaves the CPU backend without it (a
+threadpool made per graph, as before). Measured neutral at every poll
+level on the 27B (1.66 to 1.67 at generation, `PHI_GGML_HOST_POOL=0`
+included): thread creation on this
+host is cheap, so this is waste removed rather than time gained.
+
+## What the cards are offered, and what they cannot read
+
+`phi_supports_mul_mat` and `phi_supports_mul_mat_id` decline a weight in
+a buffer that is not a host buffer (`weight_readable`): llama.cpp's CPU
+backend repacks some quantized types into its own interleaved layout
+(on this AVX2 host every Q4_K matrix whose rows are a multiple of 8), and
+this backend reads ggml's standard layout only. The scheduler checks
+buffers before placing a node too; declining here is what keeps such a
+weight out of the count the share is sized by. Every weight a multiply
+is accepted for is noted (`phi_ggml_note_weight`) with its shape (rows,
+bytes per row, matrices) and whether it is a mixture's, and the Rust side
+sizes the cards' shares from them at the first multiply, the dense
+matrices first (`../src/lib.md`, "A share per class").
+
+## A layer's gate and up together (2026-09-27)
+
+`id_pair` finds, for a `MUL_MAT_ID` node, a partner the cards can take
+in the same request: the next node that computes anything (views and
+reshapes are free), itself a `MUL_MAT_ID` of the same activations and the
+same ids, its weight a quantized card type (not f32 or f16) of the same
+shape, both tensors named `*weight*`. Only the next one,
+because the partner is computed at the first's place, earlier than the
+graph put it: ggml's allocator gives a node's output memory freed by
+nodes before it, so between the two there must be nothing whose tensors
+could be that memory. llama.cpp builds a layer's up and gate exactly so
+(`build_moe_ffn`, `src/llama-graph.cpp`). `run_id_pair` calls
+`phi_ggml_begin_id_pair`, reads each matrix's host ranges through
+`phi_ggml_host_range_of` (matrix 0 or 1), computes them in one graph
+(`host_rows_id_pair`, so ggml's pool wakes once), and gathers both with
+`phi_ggml_end_id_pair`; the partner is then skipped where it stands. When
+the Rust side declines the pair (-2, nothing started) the first node runs
+alone and the partner in its turn, as before (`../src/lib.md`, "A layer's
+gate and up in one request").
+
+## A device only when the cards open (2026-09-24)
+
+`phi_reg_get_device_count` opens the cards (`phi_ggml_open`) the first time
+it is asked and reports one device when they open, none when they do not.
+It does not ask for the host's CPU backend: the count is taken when the
+backend registers, which a program may do before it registers its CPU
+backend (xks does; the first version of this asked, found no CPU device,
+and left xks's cards site running on the host alone), and `init_backend`
+gets it later.
+llama.cpp stops with "failed to initialize" when an accelerator's
+`init_backend` returns NULL, which is what a card that is down used to
+cause through `GGML_BACKEND_PATH`; with no device the backend is simply
+not used and the program runs on the CPU.
+
+`PHI_GGML_FFN` is turned off, with a line saying so, when
+`PHI_GGML_OFFLOAD` is set: the fused path keeps its rows on the host and
+hands a declined block back to the host whole, the opposite of the
+offload's contract.
+
+## The host's ids substituted (2026-09-29)
+
+With whole experts on the cards (`PHI_GGML_EXPERTS`, `src/lib.md` "Whole
+experts"), the host's rows of a `MUL_MAT_ID` are all rows of the experts
+it holds, and the ids it multiplies by must name none of the cards'.
+`alias_ids` builds the ids leaf: the node's own, or, when
+`phi_ggml_host_ids` returns them, the backend's substitution (each slot
+naming a card's expert names a host-held expert of the same token
+instead, `n_used` per token, contiguous), which `host_rows_id` and
+`host_rows_id_pair` multiply by exactly as ggml would have; the gather
+overwrites the substituted slots with the cards' results afterwards.
+`phi_ggml_note_weight` carries each weight's layer, from its name
+(`layer_of`: llama.cpp names them `blk.N.<what>.weight`), which the
+placement file is keyed by.

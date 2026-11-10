@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# phi512.sh: run a program that needs AVX-512 on a host that has none.
+#
+#   scripts/phi512.sh ./my-avx512-program [args...]
+#
+# The program is not modified, recompiled, or asked to cooperate. It
+# executes an AVX-512 instruction, this host refuses it, and libphi512
+# performs the instruction and lets the program continue.
+#
+#   --card N    the card to use (default: PHI512_CARD, else 0)
+#   --emulate   run the AVX-512 in software on this host instead of on a card
+#   --verbose   report every region the card ran, with its phases and times
+#   --check     say whether this host needs the library at all, and exit
+#
+# The card's worker is started if it is not running (deployed once first
+# with `scripts/phi-vpu.sh -c N deploy`; this wrapper does not deploy).
+#
+# See phi512.md.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+# The checkout this runs from, or, for the copy phi512-install.sh puts in
+# /usr/local/bin, the checkout it was installed from (written into that
+# copy at install; PHI512_ROOT overrides): the worker script and driver
+# live there, not next to the installed command.
+installed_root=""
+if [ -f "$here/phi-vpu.sh" ]; then
+    root=$(cd "$here/.." && pwd)
+    installed=
+else
+    root=${PHI512_ROOT:-$installed_root}
+    installed=1
+fi
+
+verbose=0
+card=${PHI512_CARD:-0}
+emulate=${PHI512_EMULATE:-}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --verbose|-v) verbose=1; shift ;;
+        --card|-c) card=$2; shift 2 ;;
+        --card=*) card=${1#--card=}; shift ;;
+        --emulate) emulate=1; shift ;;
+        --check)
+            if grep -qw avx512f /proc/cpuinfo; then
+                echo "this host has AVX-512; the library is unnecessary here"
+                exit 0
+            fi
+            echo "this host has no AVX-512 (no avx512f flag): programs that use it need this wrapper"
+            exit 0
+            ;;
+        --) shift; break ;;
+        -*) echo "$0: unknown option $1" >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
+[ $# -ge 1 ] || { echo "usage: $0 [--verbose] [--card N] [--emulate] PROGRAM [args...] | --check" >&2; exit 2; }
+# Where the library is. Three places, in order: an explicit override, the
+# build tree when this script is being run from a clone, and the installed
+# copy. The build tree wins during development so a fresh build is picked
+# up without reinstalling; the installed command uses the installed one.
+lib="${PHI512_LIB:-}"
+
+if [ -z "$lib" ] && [ -z "$installed" ] && [ -d "$root/host/target" ]; then
+    # LD_PRELOAD splits its value on spaces and colons, and this repository
+    # may be checked out at a path with a space in it ("Intel Phi AVX-512").
+    # A space-free symlink to this checkout is the way in, because no
+    # quoting would help here; made when missing, and pointed at this
+    # checkout when it names another.
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/intel-phi-avx512"
+    if [ "$(readlink "$cache" 2>/dev/null)" != "$root" ]; then ln -sfn "$root" "$cache"; fi
+    # PHI512_V3=1: the assembly preload of the restart (host/asm/phi512),
+    # beside the Rust one until stage 3 replaces it.
+    if [ -n "${PHI512_V3:-}" ]; then
+        [ -f "$cache/host/target/release/libphi512-asm.so" ] && lib="$cache/host/target/release/libphi512-asm.so"
+    else
+        for cand in "$cache/host/target/release/libphi512.so" "$cache/host/target/debug/libphi512.so"; do
+            [ -f "$cand" ] && { lib="$cand"; break; }
+        done
+    fi
+fi
+[ -n "$lib" ] || { [ -f /usr/lib/libphi512.so ] && lib=/usr/lib/libphi512.so; }
+[ -n "$lib" ] || { echo "$0: libphi512.so not found; run 'make build' or scripts/phi512-install.sh" >&2; exit 1; }
+[ -f "$lib" ] || { echo "$0: $lib is missing" >&2; exit 1; }
+case "$lib" in *" "*) echo "$0: the library path contains a space, which LD_PRELOAD cannot express: $lib" >&2; exit 1 ;; esac
+
+[ "$verbose" = 1 ] && export PHI512_VERBOSE=1
+export PHI512_CARD="$card"
+if [ -n "$emulate" ]; then
+    export PHI512_EMULATE=1
+else
+    # The card executes the program's AVX-512: its worker must be polling.
+    # A missing worker is started here; one never deployed to this card
+    # needs `scripts/phi-vpu.sh -c N deploy` first, and the start fails.
+    driver=""
+    for cand in "$root/host/target/release/phi-vpu" "$root/host/target/debug/phi-vpu"; do
+        [ -x "$cand" ] && { driver=$cand; break; }
+    done
+    if [ -z "$driver" ] || ! "$driver" --card "$card" status 2>/dev/null | grep -q "worker: polling"; then
+        echo "phi512: card $card has no worker polling; starting it" >&2
+        [ -f "$root/scripts/phi-vpu.sh" ] || {
+            echo "phi512: no Intel-Phi-AVX512 checkout at '$root' to start the worker from; set PHI512_ROOT" >&2
+            exit 1
+        }
+        # Stdin is the program's: the start's ssh would read it. One thread per
+        # core: the seamless path splits a loop over the card's cores
+        # (offload.rs, SPLIT_THREADS) and copies through the window one core
+        # at a time, so a second thread per core only polls beside them (the
+        # default, two a core, is the matrix multiplies'; card/vpu/vpu_worker.md).
+        # Under PHI512_V3 one slot takes two threads on every core but the
+        # last two (the control plane): -C 55 on a 3120A, 59 on a 7120A.
+        # (the restart's preload needs slots and a pool: -S 12 -C 4 -R 64.)
+        cores=$("$root/scripts/phi-vpu.sh" -c "$card" cores </dev/null)
+        PHI_VPU_ARGS="${PHI_VPU_ARGS:-${PHI512_V3:+-S 1 -C $((cores - 2)) -T 2 -R 128 -s 1000}}" "$root/scripts/phi-vpu.sh" -c "$card" start "$cores" >&2 </dev/null || {
+            echo "phi512: could not start the worker on card $card (is the card up? phi -c $card status)" >&2
+            exit 1
+        }
+    fi
+fi
+exec env LD_PRELOAD="$lib${LD_PRELOAD:+:$LD_PRELOAD}" "$@"

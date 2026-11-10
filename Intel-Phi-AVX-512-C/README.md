@@ -1,0 +1,534 @@
+# Intel Xeon Phi as an AVX-512 co-processor
+
+A Xeon Phi 3120 (Knights Corner) card executes AVX-512 on behalf of a
+host CPU that has none. An ordinary program, compiled with `-mavx512f`
+and neither modified nor asked to cooperate, runs on the host; every
+AVX-512 instruction it reaches is carried, with the code around it, to
+the card's vector units and executed there as MVEX, the card's own
+encoding of the same operations. Nothing is interpreted. Results are
+bit-identical to what real AVX-512 hardware produces, on everything the
+tests here cover. This repository is the C version: the preload is being
+rewritten in C since 2026-10-14 (the next section), module by module,
+after the assembly restart of 2026-10-13 ("The assembly restart" below;
+the plan's stages and gates are in the dated records under `docs/results`).
+
+```
+make -C host/c                                   # host/c/out/libphi512-c.so (on the rack)
+cp host/c/out/libphi512-c.so ~/.cache/libphi512-c.so    # LD_PRELOAD cannot take a path with spaces
+PHI512_CARDS=0,1,2,3 PHI512_VERBOSE=1 LD_PRELOAD=$HOME/.cache/libphi512-c.so ./my-avx512-program
+PHI512_CARDS=0,1,2,3 PHI512_CARD_ATOMICS=1 LD_PRELOAD=$HOME/.cache/libphi512-c.so \
+    llama-bench -m Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf -p 4 -n 2 -t 1 -ngl 0   # the target: the full AVX-512 build
+```
+
+The host is the GPU rack's EPYC 7742 (no AVX-512) with four cards.
+Measured 2026-10-13 with `tools/avx512-seamless-test.c` (a polynomial,
+a dot product and an integer kernel, each checked lane for lane against
+a scalar reference), the kernels translated from the binary by the
+assembly translator and run on four cards, bit-identical at every size:
+
+| elements | polynomial | dot product | integers |
+| --- | --- | --- | --- |
+| 65536 | 3.2 ms | 1.2 ms | 1.8 ms (the first call: its translation and loads) |
+| 1048576 | 8.3 ms | 14.1 ms | 7.4 ms |
+| 16777216 | 71.6 ms | 182 ms | 57.7 ms |
+
+([`docs/results/2026-10-13-translator-seamless.md`](docs/results/2026-10-13-translator-seamless.md);
+the hand-written blobs of stage 2 give the same times within the noise.)
+The time is the requests' latency, not the cards' work: the 65536
+polynomial call spends 0.9 ms making memory resident, 1.3 ms in the run
+of which the cards compute for 33 us, 0.2 ms fetching the result
+([`docs/results/2026-10-13-preload-seamless-fast.md`](docs/results/2026-10-13-preload-seamless-fast.md)).
+
+## This repository: the C version (2026-10-14)
+
+This is Intel-Phi-AVX-512-C, the C twin of
+[Intel-Phi-AVX-512-ASM](https://github.com/Lasimeri/Intel-Phi-AVX-512-ASM)
+(frozen at 3ee445c, the history shared up to there). The preload is
+being written in C under [`host/c`](host/c/README.md); until a module is
+ported, the C library links the assembly module of
+[`host/asm/phi512`](host/asm/phi512/phi512.md) in its place, so the
+library runs end to end at every commit.
+
+Where things stand, measured on the rack on 2026-10-14: the section
+[Benchmarks with the Phis](#benchmarks-with-the-phis-2026-10-14) below
+(the backend about 13.2 tok/s with all four cards and without them; the
+assembly preload 0.0037 tok/s).
+
+The person's direction for the C version (2026-10-14): `mul_mat` and
+`mul_mat_id` on the four cards against weights kept resident there,
+everything else native on the host through the AVX2 twin build; target
+at least 12 tok/s generation. The reason: about 6,900 card round trips a
+token for graph building alone, at 38 to 48 us each at least, keep a
+preload that sends every region to a card under 3 tok/s (arithmetic).
+Nothing measured yet shows 12 tok/s on this machine without the GPUs
+(the benchmarks below); how the split reaches it is open.
+
+```
+make -C host/c && make -C host/c check      # libphi512-c.so and its checks (on the rack)
+scripts/gates.sh                            # the regression gates on card 0 (scripts/gates.md)
+scripts/bench/lb-run.sh lb1 4 2             # llama-bench under it (scripts/bench/README.md)
+```
+
+Status of the C version (2026-10-14):
+
+| piece | state |
+| --- | --- |
+| `main.c` (constructor, destructor) | ported; reads the environment from the loader's `envp` because `-z initfirst` runs it before libc's own init (glibc `elf/dl-init.c`); smoke test on the rack: the init lines, "no card" on an absent card, silent under `PHI512_DISABLE=1` |
+| the hybrid build, `make check` | in place: 13 assembly modules and 7 common ones linked with the C objects; exports nothing, 12 libc imports, clang-format and clang-tidy clean; the full `make check` passes on the rack |
+| `scripts/gates.sh`, `scripts/bench` | in place; the guard refuses while production holds a card (checked); the gates have not yet run on the C library: production holds all four cards |
+| the translator (`decode`, `fnscan`, `mvex`, `xlate`, `blob`) | still assembly; planned: each port with an offline check comparing the assembly and C blobs of every function of `libggml-cpu`, `libggml-base` and `libm` (not written yet) |
+| the split (heavy ops on the cards, the rest native) | not started |
+
+After the benchmarks, the sections describe the assembly modules the C library still
+links (the restart of 2026-10-13 and 14), the backend, and the layout.
+
+## Benchmarks with the Phis (2026-10-14)
+
+Measured on the rack (EPYC 7742, four 20 GB GPUs, four Xeon Phi 3120A)
+with llama.phi and the BF16 Qwen3.8 Flash-Next (329.71 GiB, larger than
+RAM). The full record, setup and raw data:
+[`docs/results/2026-10-14-phis-with-and-without.md`](docs/results/2026-10-14-phis-with-and-without.md).
+
+**The `libggml_phi.so` backend, one engine (GPUs, host, cards),**
+interleaved with all four cards (`PHI_GGML_CARDS=0,1,2,3`) and without them; 3 decodes of 128 tokens a
+round, greedy:
+
+| round (in order) | decode runs, tok/s | decode | prefill (8008 tokens) | card requests, 384 tokens |
+| --- | --- | --- | --- | --- |
+| with the four cards, `-t 12` | 13.45, 12.69, 13.27 | **13.14** | 119.7 tok/s | 8680 to 9386 a card, 0 errors, 0.165 to 0.176 ms each |
+| without the cards, `-t 32` | 13.52, 12.70, 13.48 | **13.23** | 98.9 tok/s | none |
+| with the four cards, `-t 12` | 13.24, 12.73, 14.10 | **13.36** | 117.4 tok/s | the same |
+
+Decode is the same with and without the cards, within the noise: the
+~13 tok/s is the GPUs' and the host's. The cards hold 4 whole experts a
+layer each and answer about 23 requests a token, about 4 ms of a 76 ms
+token (arithmetic). Confounds: the thread counts differ (phi-serve's
+defaults), and the no-card round's page cache never settled (40,000 to
+100,000 major faults a decode, against about 1,000 with the cards).
+Without the GPUs the record has 5.38 tok/s on the host alone and 5.69
+with the cards (2026-10-09).
+
+**The intercept preload** on the same model (llama-bench; its regions on card 0 only, one
+host thread, `-ngl 0`), the assembly library at 2c8ceb3: prompt 0.0078
+tok/s (4 tokens in 511 s), generation 0.0037 tok/s (273 s a token).
+The C library (`host/c`) has not been benchmarked on the cards yet: it
+is `main.c` plus the same assembly modules, and production held all four
+cards. Its runs use `scripts/bench/lb-run.sh` and
+[`scripts/gates.sh`](scripts/gates.md) once a card is free.
+
+Reproduce the backend series (it stops and starts the engine on port
+8001 three times):
+
+```
+cd /mnt/raid5/phi/bench && ./bench-setups-2026-10-14.sh one-cards-1 one-nocards-1 one-cards-2
+cat setups-2026-10-14/summary.txt
+```
+
+## The assembly restart (2026-10-13 and 14)
+
+The wrapper is being rewritten in place, in assembly, component by
+component (the plan's stages; the Rust crates stay until the last ones
+are replaced). What runs today:
+
+| stage | what | measured |
+| --- | --- | --- |
+| 1 | protocol v3: slot processes on the card, one 64-byte line of doorbells, `K_PING`, `K_LOAD`, `K_FEXEC`, `K_RESIDENT`, `K_PUSH`, `K_FLUSH` | round trips 45 to 48 us; a 114-slice dispatch 40 us |
+| 2 | the assembly preload (`host/asm/phi512`: the SIGILL handler, the register file from the signal frame, residency by 64 KiB units with a coverage bitmap, loops split into a stripe per card, outputs fetched by the card's DMA engine) | the seamless test bit-identical on four cards; 64 MiB of outputs in 18 to 20 ms (3.2 GB/s) |
+| 3 | the translator: `decode.S` (every field equal to iced-x86 over 2.34 million instructions of ten binaries), `fnscan.S` (a function indexed: kinds, branch targets, calls), `mvex.S` and `xlate.S` (the recipes: one-to-one forms, 128- and 256-bit forms under lane masks, the unaligned pairs, extracts, shuffles, scalar forms), `blob.S` (a function's blob: copies, re-based rip-relative operands, branches re-laid out, exits, constants, the rip map), `xlfn.S` (a function translated at its first fault, loaded on every card) | the seamless test from automatic translation, the table above |
+| 3, regions | regions and exits (`region.S`): a function runs on card 0 from the fault to its next call, return, jump out or syscall, and the host continues natively from there; the function is found in whichever object is mapped at the fault (`elf.S`: the maps line's path and file offset, that file's symbol table); memory the region touches is made resident in 64 KiB units as it faults, shadowed on the host, and written back by line diff; the lines the host changed since travel with the request and the card copies them in with its own stores (a DMA fill is not coherent against a line a core holds dirty) | llama-server of the full AVX-512 build on the BF16 Qwen3.8 Flash-Next shard: 976 regions on card 0 through libmtmd's constructor, the C++ regex compiler and the option parser, about 2 ms a region, no crash; then `-m` rejected by a silently wrong region, the open item |
+| 3, recipes | the recipes measured against the objects llama-server loads (`tools/recipe-census.c`, by the decoder's own mnemonic ids): 322,212 vector instructions of 289 mnemonics in libllama-server-impl, libllama-common, libllama, libggml-base, libggml-cpu and libmtmd, of which 25,321 (123 mnemonics) have no recipe after the batch of 2026-10-13 evening (`xlate2.S`: the qword adds, shifts, multiplies, compares and min/max in dword lanes, the widenings and conversions, the blends, float min/max, the block shuffles, insertps, the byte shifts, the mask shifts: 75 forms, assembled and census-checked, not yet run on the card); the two form suites are 11 and 23 mnemonics short | the suites' verdicts on card 0 are the gate; the byte and word forms of the quantized kernels (vpshufb, vpmaddubsw, vpmaddwd) come after the BF16 path |
+| 3, llama.cpp (2026-10-14) | the full AVX-512 build end to end under the assembly preload (2c8ceb3), card 0, one host thread: in-card callees through PLT stubs and thunks (libggml-cpu, libggml-base, libm), uffd write tracking with the card's own diff, 2 MiB weight chunks streamed through a 4 GiB pool | llama-bench on the BF16 Flash-Next: pp4 0.0078 tok/s (511 s), tg2 0.0037 tok/s (273 s a token); about 6,900 card round trips a token for graph building alone; the elementwise ops equal to the AVX2 twin's, the router's top 10 different in 8 of 48 layers |
+
+The target is llama.phi's full AVX-512 build (every library of it
+built `-mavx512f`, nothing swapped) on the BF16 Qwen3.8 Flash-Next
+model; no stand-in program, smaller model or simulation stands for it.
+The reference is the same program on the AVX2 twin build
+(`build-phi512-cpu`, the same source), measured the same way. Under the
+assembly design every function it faulted in ran as regions on the
+cards; the C version changes that split (the section above): `mul_mat`
+and `mul_mat_id` on the cards against resident weights, the rest native
+through the twin.
+
+## What you need
+
+- The cards' software stack, the sibling repository
+  [Intel-Phi-3120A](https://github.com/Lasimeri/Intel-Phi-3120A): it
+  boots the card, serves its memory, pins the shared window, and gives
+  you the `phi` command. Install it and bring a card up (`phi up`); its
+  card kernel must carry patch 0030 (the vector unit across a signal
+  handler), which every kernel built there since 2026-09-22 does. The
+  scripts here find the stack through `PHI_STACK_ROOT`, the `phi`
+  command on PATH, or a checkout next to this one or in `$HOME`, named
+  `Intel-Phi-3120A` (a `git clone`) or `Intel Phi 3120A`
+  ([`scripts/stack.md`](scripts/stack.md)).
+- `make build` here: `libphi512.so` (the library the wrapper preloads),
+  `libggml_phi.so` (the ggml backend), `phi-vpu` (the explicit driver),
+  the translator and the encoder; and `phi-pld` where llama.cpp's
+  headers are found (`LLAMA_CPP_DIR`, default `~/llama.cpp`; skipped with
+  a note otherwise; it also needs libclang).
+- `make c` (on the rack): `host/c/out/libphi512-c.so`, the C preload
+  (gcc and GNU `as`; `make check` also wants clang-format and
+  clang-tidy). [`host/c/README.md`](host/c/README.md) is its guide.
+- The card's worker deployed once (`scripts/phi-vpu.sh -c N deploy`); it
+  lives on the card's persistent disk after that, and the wrapper starts
+  it when it is not running (`scripts/phi-vpu.sh -c N start` by hand).
+
+## How it works
+
+The wrapper preloads `libphi512-c.so` (`host/c`). Its constructor is C
+(`main.c`); every other module is still the assembly of
+`host/asm/phi512`, linked into the same library, so the path below is
+the assembly's (`make -C host/c asm-only` links the same modules all in
+assembly as `libphi512-c-asm.so`; `host/asm/phi512/build.sh` builds the
+original `libphi512-asm.so`). The host
+CPU raises SIGILL at the program's first AVX-512 instruction; the
+handler finds the function that holds it in whichever object is
+mapped there (the maps line's path and file offset, that file's symbol
+table), indexes it instruction by instruction (`decode.S`, `fnscan.S`),
+and builds its blob for the card (`blob.S`): the scalar instructions
+copied, a rip-relative operand re-based through a register, the
+branches re-laid out, every EVEX and VEX instruction written as the
+card's MVEX by its recipe (`xlate.S` over the emitter `mvex.S`: the
+operations the card has one to one, a 128- or 256-bit form as the same
+operation under a lane mask, memory operands staged through the
+card's unaligned pairs, extracts and shuffles as permutes), and the
+exits (a call, a return, a jump out of the function, a syscall) as
+jumps into a card stub that hands the register file back. The blob is
+loaded on every card (`K_LOAD`); the call is posted (`K_FEXEC`) with the
+register file from the signal frame, entered at the faulting
+instruction through the blob's rip map, and run on the program's own
+addresses: the memory it needs is made resident in 64 KiB units
+(`K_RESIDENT`, the card's DMA engine), a kernel's loop split into a
+stripe per card, the outputs fetched back (`K_PUSH`). At an exit the
+host continues natively from the address the blob named, with the
+registers as the card left them and the card's writes applied; the
+next AVX-512 instruction starts the next region.
+
+Between regions the host keeps a shadow of every resident unit and
+compares it with the program's memory before the next request: the
+lines the host changed since travel with the request and the card
+copies them in with its own stores, because a DMA fill does not replace
+a line a core still holds dirty; a unit whose floor a region lowered is
+refreshed whole between the two floors. The scalar instructions the
+P54C core lacks are rewritten in the blob: a CMOV as a jump over a
+move; prefetch, the fences, clflush and pause dropped. What no recipe
+expresses refuses the function with the instruction named
+(`xlate-check FILE FUNCTION` shows where), and `tools/recipe-census.c`
+lists what an object's code needs that no recipe gives, by the
+decoder's own mnemonic ids.
+[`host/asm/phi512/phi512.md`](host/asm/phi512/phi512.md) lists the
+units; [`card/vpu/fexec.md`](card/vpu/fexec.md) and
+[`card/vpu/resident.md`](card/vpu/resident.md) have the card's side.
+
+The hand-written blobs of stage 2 stay under `PHI512_HANDBLOBS=1`, the
+Rust library (`host/crates/phi512`, `scripts/phi512.sh` without
+`PHI512_V3`) and its emulator until their last parts are replaced, and
+the explicit path for a program written for the card (`phi-vpu poly`,
+`scripts/phi-vpu.sh`).
+
+## The cards as GPUs for AVX-512, beside the CPU: the ggml backend
+
+**Speed at a glance** (Qwen3.8-35B-A3B, both cards, llama.cpp unchanged;
+the Q6_K, 29.2 GB, offloaded so that it fits this host's memory and the
+cards without the disk, is the model for every speed figure with the
+cards, the Q4_K_M the one for correctness and for comparison):
+
+| what | tokens per second | record |
+| --- | --- | --- |
+| **writing code from a description, Q6_K offloaded** | **9.5 to 9.8** (client's clock 9.76, 9.50; nothing from disk; the program compiles and matches gzip's CRC-32 on 312 inputs up to 2.08 GB) | `docs/results/2026-09-27-code-generation-q8.md` |
+| the same, Q8_0 offloaded (37.8 GB, past the host's memory) | about 8 (8.04, 8.08) | same |
+| the same with a draft model, even the smallest (2B Q4_K_M with the Q6_K) | 6.89, 6.91: slower, not used | same |
+| the 9B Q8_0 dense, **entirely on the cards** (host 2.3 GiB) | about 8 (8.03, 7.99) | same |
+| writing code, Q6_K offloaded, phi-pld, 1024 tokens with `ignore_eos` (five prompts, twice) | 9.70 drafting off; the best drafter (n-gram caches, static corpus) 9.22, 0.95 of it: none pays | `docs/results/2026-09-29-ngram-caches.md` |
+| Q6_K offloaded with **whole experts placed by use** (`PHI_GGML_EXPERTS`), code and prose prompts, this host short of memory (every run paging) | **7.1 to 7.9** against 5.8 to 6.5 with the row share, interleaved (+20 percent); the prompt 48 to 57 against 55 to 64 | `docs/results/2026-09-29-expert-placement.md` |
+| copying code from the prompt with prompt lookup, Q4_K_M, generation phase only | about 40 (whole request 6.5 with the 2385-token prompt) | same, and `2026-09-27-prompt-lookup-llama-server.md` |
+| Q8_0 offloaded, prompt | 72 (57.8 before the two-threads pool) | `docs/results/2026-09-27-two-threads-per-core.md` |
+
+A generation rate here is llama.cpp's `predicted_per_second`: the
+generation phase, the prompt's time not in it.
+
+The instruction-level path above is exact but pays a fixed cost per
+region, and a program like llama.cpp has millions of tiny regions per
+token (`docs/results/2026-09-22-full-avx512.md`). For it the cards are
+used the way GPUs are: whole operators at a time. `host/asm/ggml-phi`
+builds `libggml_phi.so`, a ggml backend that an unmodified llama.cpp
+loads through `GGML_BACKEND_PATH`; its scheduler hands the backend
+every matrix multiply it accepts (`MUL_MAT` and `MUL_MAT_ID`, the
+mixture-of-experts one, with float16, bfloat16, float32 and llama.cpp's
+Q4_K, Q5_K, Q6_K, Q8_0 and IQ4_XS weights), and the backend shares each
+one by rows: every card keeps a share of the weight matrix resident and
+multiplies it on its 114 threads (two on each of its 57 cores) with the kernels of
+`card/vpu/kernels.S` (the quantized formats decoded on the
+vector unit, `card/vpu/kernels.md`), while
+the host computes the rest with ggml's own CPU kernels; the results are
+gathered per multiply. A card is asked only when it would finish the
+multiply sooner: three rules decide that, one of them from what the
+backend times on each weight tensor as it runs
+(`host/asm/ggml-phi/backend.md`; the design in `host/crates/phi-ggml/src/lib.md`). The program itself is an ordinary
+build for this host.
+
+```
+scripts/phi-ggml.sh ./llama-cli -m model.gguf -p "..." -t 12   # the host and every card that is up
+scripts/phi-ggml.sh --verbose ...                              # each multiply, the host part and each card's times
+```
+
+History, not the current figures (those are the table at the top of this
+section; the 27B is no longer used here): Qwen3.8-27B (UD-Q4_K_XL, 17.6
+GB) on the 5800X alone and with both cards, each keeping 31 percent of
+every weight matrix it is offered (as much as its 4.4 GB holds),
+llama-bench, 2026-09-23 night, the cards' workers then on 57 threads
+(`docs/results/2026-09-23-redundancy-and-transport.md`):
+
+| | pp512 tok/s | tg32 tok/s |
+| --- | --- | --- |
+| host alone, 16 threads | 9.20, 9.19 | 1.10, 1.10 |
+| host (12 threads) and both cards | **14.53, 14.44** | **1.94, 1.94** |
+
+The model is resident (`--load-mode none`) and the host and the split
+are **interleaved**, two rounds each, because this host's own
+throughput drifts by as much as a quarter over tens of minutes: a split
+measured now against a baseline measured an hour ago says nothing. The
+calling program gets 12 threads with the cards and 16 alone: with 16 the
+split loses five times over at generation, its threads fighting the
+card daemons (`docs/results/2026-09-23-float16-activations.md`). That is
++58 percent at prompt processing and +76 at generation. What got it
+there since the first split's 12.29 / 1.63: the activations cross as
+float16, which the card up-converts for nothing, and the share of each
+multiply the cards take at a batch is measured rather than set
+(`docs/results/2026-09-23-share-and-fusion.md`); then, at generation,
+each request's data crosses through the host window itself in 64-byte
+vector loads and stores split across the card's threads rather than
+through the block device, whose fixed cost per request was most of the
+cards' time (1.64 to 1.85), and the backend sizes the cards' share from
+the weights it is actually offered, which fills them (1.85 to 1.91,
+`docs/results/2026-09-23-redundancy-and-transport.md`). A feed-forward block
+can also go to each card as one request whose intermediate never leaves
+it (`PHI_GGML_FFN=1`, `host/crates/phi-ggml/src/ffn.md`): on this model
+that is neutral (14.68 and 14.59 / 1.63 and 1.61), because here the link
+is not what bounds either phase, and it is off by default because it
+never writes the intermediates a program's eval callback may read
+(`docs/results/2026-09-23-ffn-per-request.md`).
+
+With llama-server and the MTP draft (the earlier split, same day):
+host alone 6.93 / 2.31, host and both cards **9.56 / 2.72**.
+
+A mixture-of-experts model works the same way: ggml runs its expert
+weights through MUL_MAT_ID, which the cards take as well, each keeping
+the same rows of every expert, and the answers match the host's token
+for token. (Until 2026-09-24 that held at generation only: at a batch the
+plain split read every expert after the first at the wrong stride, so a
+prompt's outputs were wrong while its speed was measured; fixed, and
+checked on a 1,800-token prompt, in
+`docs/results/2026-09-24-q8-remeasured-and-moe-stride.md`. The offloaded
+split was never affected.) It is worth less so far: Qwen3.8-35B-A3B-Distill
+(Q4_K_M, 20.2 GiB, 256 experts with 8 used per token) generates at 9.06
+and 9.06 tokens per second with both cards against 7.89 and 7.99 for the
+host alone at its best thread count (12), 14 percent faster, and 6.90 and
+6.85 on 16; its pp512 is within 3 percent of the host's (87.34 and 87.10
+against 84.99 and 85.88 on 12, 88.12 and 92.16 on 16). Offloaded it
+generates at 8.69: its use there is the host's memory. Interleaved on
+2026-09-25 (`docs/results/2026-09-25-35b-q4km-remeasured.md`), replacing
+the 2026-09-23 figures (+26 and about -8 percent), whose prompt side was
+measured with the stride defect live and whose host ran on 16 threads.
+Verified: perplexity and KL divergence against the host alone within
+error, and in llama-server over two rounds (84 and 8.8 against 83.4 and
+7.8). Its experts stay repacked on the host: offering every weight
+(`--no-repack`) made the split 11 and 12 percent slower with one share
+over all 20.9 GB, and with a share per class (the dense matrices first,
+since 2026-09-27) it generates as fast as the repacked split (8.9) but
+keeps the unrepacked host's slower prompt (63 against 83). The default split does not repeat a greedy output between
+identical requests (its judge moves tensors by their timings);
+`PHI_GGML_JUDGE=0 PHI_GGML_PP_ADAPT=0` repeats exactly, within a server
+and across separate runs, at about 5 percent of speed
+(`docs/results/2026-09-26-repacking-and-determinism.md`). A
+card costs about 0.45 ms to involve and an MoE layer's multiply at one
+token is a few megabytes, so the backend times
+both sides on each weight tensor and leaves with the host what the
+cards would not finish sooner, which on that model is most of the
+expert work (`docs/results/2026-09-23-mixture-of-experts.md`).
+
+Offloaded, where every multiply of a tensor with rows on the cards goes
+to them, those one-token multiplies used to cost 0.95 ms each and the
+35B-A3B generated at 4.75 tokens per second (`--no-repack`, the cards
+holding 41 percent of its weights). The card worker now warms a small
+request's lines before computing, pulls a request's activations a
+fixed 32 lines or more per thread (a row copied a line or two per core
+and then read by all 57 was the costliest part), and logs requests only
+at `-v -v`: 0.33 ms each, and 7.4 tokens per second with the same text
+byte for byte (`docs/results/2026-09-27-small-requests.md`). The cards'
+budget then went to the dense matrices first, the experts sharing the
+rest, sized with the rows' own rounding, which puts the vocabulary
+matrix on the cards too: **8.9 tokens per second offloaded against 7.5
+for the host alone** in the same session, at the host's prompt rate,
+with 13.3 GiB of the host resident against 20.7, and the logits within
+the host's own kernels' differences; the dense 27B generates 7 percent
+faster for the same reason (`docs/results/2026-09-27-share-per-class.md`).
+And a layer's gate and up, two multiplies of the same activations with
+the same experts, now go to each card as one request: **9.6 tokens per
+second and 69 at the prompt offloaded**, against the host alone's 7.5
+and 63, the text byte for byte what it was
+(`docs/results/2026-09-27-gate-and-up-together.md`). The cards now run
+two threads on each core (114, the default): with the worker's pool
+rebuilt for it, the same model at Q8_0 (37.8 GB, more than this host's
+memory) processes prompts offloaded at 72 tokens per second against 57.8
+and generates at 8.3 against 7.8, the text unchanged
+(`docs/results/2026-09-27-two-threads-per-core.md`).
+
+Prompt lookup decoding (a draft copied from earlier in the context,
+verified by the model in one batch) helps only where the output repeats
+its input. On a copy task (177 lines of Rust rewritten with one rename),
+Q4_K_M with the cards, llama-server's own n-gram drafters take the
+generation phase from 9.4 to about 40 tokens per second, but that phase
+is not the whole request: the 2385-token prompt takes another 52 s, so
+the request as a whole goes from 4.2 to 6.5 tokens per second. On a
+mixture of experts a rejected draft costs a pass, so loose drafts lose
+(`docs/results/2026-09-27-prompt-lookup-llama-server.md`). `phi-pld`
+(`host/crates/phi-pld`) is this repository's own engine over libllama,
+llama.cpp unchanged: the drafter of Apoorv Saxena's prompt lookup
+decoding on flat hash tables as Hayder Tirmazi's post describes, a
+rollback that checkpoints the hybrid model's recurrent state and carries
+the kept tokens into the next batch instead of decoding them again, and
+options chosen by a simulator that runs the engine against the model's
+own output. Its generation phase matches llama-server's on the copy
+(about 40), is 1.32 times plain on an extraction (13.1, 43 percent past
+llama-server's best) and 3 percent under plain on a free answer; but it
+reads prompts 25 to 40 percent slower than llama-server (not yet
+explained), so whole requests with long prompts are slower with it
+(`docs/results/2026-09-27-phi-pld.md`). These figures are the Q4_K_M.
+Since 2026-09-29 phi-pld also drafts from llama.cpp's n-gram caches
+(context, dynamic and static, the algorithm of Tirmazi's post;
+`--drafter cache|both`). On free code generation with the Q6_K on the
+cards no drafter pays, timed (1024 tokens, `ignore_eos`, five prompts
+twice, interleaved): the caches with a static code corpus 0.95 of
+drafting off (9.22 against 9.70 tokens per second), phi-pld's default
+exact-match drafter 0.92. A token more in a verification costs about 49
+ms there, and drafting starts to pay below about 40 ms (modelled;
+`docs/results/2026-09-29-ngram-caches.md`).
+
+A model larger than this host's 31 GiB runs from its file, the page
+cache holding what it can. By default the cards' rows are a copy, so
+they save the host no memory; with `PHI_GGML_OFFLOAD=1` they leave the
+host after the upload and it never reads them again. The same model at
+Q8_0 (37.8 GB) generates at 5.03 and 5.15 tokens per second that way,
+against 4.01 and 3.75 on the host alone, and processes a prompt at 56.9
+and 56.6 against 28.0 and 21.8 (`docs/results/2026-09-24-offload-past-memory.md`).
+Re-measured that evening with less page cache free (about 21 GB): 4.98
+and 4.87 against 3.39 and 3.32 at generation, 46.5 and 58.8 against 24.0
+and 35.9 at pp512, each run re-reading 60 to 104 GB from the NVMe
+(`docs/results/2026-09-24-q8-remeasured-and-moe-stride.md`). On the
+corrected backend the next morning (measured at bd166f4, which budgets
+uploads in whole 2 MiB pages): 4.91 and 4.77 at generation, within the day before's
+spread, and 60.8 and 46.2 at pp512, against a host alone that drifted
+from 3.52 to 2.68 inside the run (same record, "On the corrected backend").
+
+Token generation is bound by weight bandwidth, and the cards add theirs
+to the host's; what bounds it now is how much of the model they hold,
+since two 6 GB cards take half of 17.6 GB and the host is the long pole
+in every multiply with the other half. Prompt processing is bound by
+arithmetic, where the cards reach 240 GFLOP/s each on Q4_K once the
+activation rows are written into the window a quarter of a page apart
+(their L1 has 64 sets, and a 5 x 4096 row stride puts eight rows in the
+same ones).
+
+## A thought stream over the GPU, the cards and host memory: Intel-Phi-Stream
+
+[Intel-Phi-Stream](https://github.com/Lasimeri/Intel-Phi-Stream) runs
+one model, the 35B-A3B at Q6_K, split three ways: everything that is not
+an expert on the GPU with the experts of as many blocks as its free
+memory allows, the experts of the remaining blocks in host memory, where
+`libggml_phi.so` takes the cards' share of them as of any host weight
+(28 of 41 blocks on the 3090 Ti, 8.0 GiB of experts in host memory, 2.94
+GB of it on the cards). Over it, one context and several sequences: a
+live sequence that generates without pause, and beside it, in the same
+decode cycles, the reading of whatever it is given, joined into the
+stream afterwards. Alone it generates 46 tokens a second and reads at
+about 295; reading beside the stream is a trade the chunk sets (7.5
+tokens a second of thoughts against 120 read at chunks of 16). It was
+written here on 2026-10-01 (commit b8be089) and moved to its own
+repository the same day; the founding record stays here
+(`docs/results/2026-10-01-phi-stream.md`). It consumes `scripts/phi-ggml.sh`
+and `libggml_phi.so` from this repository.
+
+## Layout
+
+```
+╔══ host (EPYC 7742 on the rack: no AVX-512) ════════════════════════════════════════════════════╗
+║ program built -mavx512f ──SIGILL──▶ libphi512-c.so (host/c): main.c in C, linked with the      ║
+║   assembly modules of host/asm/phi512: sigill.S the handler, elf.S the function at the fault,  ║
+║   decode.S + fnscan.S its index, xlate.S/mvex.S/blob.S its blob (EVEX and VEX as MVEX, exits   ║
+║   as stubs, the rip map), xlfn.S loads it, region.S runs a region to its exit, card.S: cards   ║
+║ llama.cpp ──GGML_BACKEND_PATH──▶ libggml_phi.so (host/asm/ggml-phi + common: the backend)      ║
+║ drivers: phi-vpu (Rust: status, poly, matmul-check); phi-vpu-ping, -fexec, -resident (asm)     ║
+║ scripts: gates.sh (card gates), bench/ (llama.cpp runs), phi-ggml.sh, phi-vpu.sh, stack.sh     ║
+║                              │ writes requests, reads replies                                  ║
+║                              ▼                                                                 ║
+║ /dev/shm/phi-hostmem[-N], 2 GiB a card (the window: card/vpu/*.h, proto.inc, layout-checked)   ║
+║   0 READY  64 REQ  256 REPLY  320 STATS  448 SLOTSEQ (u16 x 32)  13312 MATMUL  65536 SLOTS     ║
+║   48 MiB SLOTDATA (1 MiB a slot)  80 MiB LOADAREA  96 MiB RESIDENT  128/640/704 MiB A/B/D      ║
+╚═══════════════════════════════════════╤════════════════════════════════════════════════════════╝
+                                        │ 3.2 GB/s a card: uncached loads, posted stores, DMA ch 7
+╔═══════════════════════════════════════╧═ card N (Xeon Phi 3120, 57 cores x 4 threads) ═════════╗
+║ phi-vpu-worker (card/vpu/worker.S): the dispatcher on CPU 0 reads REQ and SLOTSEQ each poll    ║
+║   ├─ legacy kinds 1..8 on the spare cores' pool: exec.S (K_EXEC), matmul.S, rows.S, kernels.S  ║
+║   ├─ cdma.S: channel 7, the landing page (shared), cdma_submit_phys into a pool page's frame   ║
+║   ├─ resident.S: pool of huge pages (-R), shared table, K_RESIDENT fills, mremap to identity   ║
+║   └─ sched.S: -S slot processes of -C cores (forked): job word, K_PING, K_LOAD and K_FEXEC     ║
+║        through fexec.S (arena, the file in and out, a blob entered at its rip map offset on    ║
+║        the program stack, the exit stub at fs:1048, faults as X_FAULT with the address)        ║
+║ /opt/phi/vpu/phi-vpu-worker and worker.log; card/vpu/build.sh, audited by phi-isa-audit        ║
+╚════════════════════════════════════════════════════════════════════════════════════════════════╝
+```
+
+| path | what |
+| --- | --- |
+| `host/c` | `libphi512-c.so`, the preloaded library in C: `main.c` so far, the rest linked from `host/asm/phi512` (the hybrid build), its Makefile and checks ([`host/c/README.md`](host/c/README.md)) |
+| `host/asm/phi512` | `libphi512-asm.so`, the preloaded library in assembly, the reference and the modules `host/c` has not ported yet: the handler, the decoder and its generated tables, the function index, the recipes and emitter, the blob builder, regions, the cards' session ([`host/asm/phi512/phi512.md`](host/asm/phi512/phi512.md)) |
+| `host/crates/phi512` | the Rust library that preceded it: the SIGILL handler, the planner, the dispatcher, the emulator; replaced piece by piece |
+| `host/crates/avx512-xlate` | EVEX to MVEX: the byte-level rewriter for the seamless path and the builder-based translator for kernels |
+| `host/crates/knc-mvex` | the MVEX encoder the translator builds on |
+| `host/crates/phi-vpu` | the protocol with the card worker, the shared window, the explicit driver |
+| `host/asm/ggml-phi` | `libggml_phi.so`, the ggml backend in assembly (with `host/asm/common`): matrix multiplies shared by rows between the host and the cards; `host/crates/phi-ggml` keeps the Rust design notes |
+| `host/crates/phi-pld` | `phi-pld`, prompt lookup decoding over libllama (llama.cpp unchanged), served as llama-server serves; its simulator; built where llama.cpp is found |
+| `card/vpu` | the card-side worker: the exec engine, the explicit path's thread pool and the matrix-multiply service; built by `scripts/phi-vpu.sh deploy`, on the host with the stack's cross toolchain when it has one (`card/vpu/build.md`) |
+| `card/examples` | the AVX-512 kernel and its translation the explicit path and the ground-truth check use |
+| `tools` | the seamless, narrow, forms, review, region and libm tests, the ggml router and op tests (`ggml-router-test.c`, `ggml-op-test.c`), the decoder and scan checks against iced-x86, the recipe census and the translation check (`recipe-census`, `xlate-check`), the table generators, the protocol layout check |
+| `scripts` | `gates.sh` (the preload's card gates) and `card-users.sh`, `bench/` (llama-bench and llama-debug under the preload), `phi512.sh` (the Rust-era wrapper), `phi-vpu.sh` (the worker), `phi512-check.sh` and `phi512-ground.sh` (conformance against hardware and against the card), `phi512-install.sh` (system-wide preload) |
+| `docs/research` | the precision audit that gates the translation, and the transparency design |
+| `docs/results` | dated records with every number |
+
+`make check` runs the documentation rules, formatting, lints, the build,
+tests, the protocol layout check, the comparison of `knc-mvex` with the
+stack's copy (`mvex-check`), the decoder and function-scan checks
+against iced-x86 (`decode-check`, `fnscan-check`), and the C preload's
+checks (`c-check`: the build with `-Werror`, no AVX-512 instruction in
+the C objects, its imports against `host/c/imports.want`,
+clang-format, clang-tidy). The card gates are separate
+(`scripts/gates.sh`, [`scripts/gates.md`](scripts/gates.md)): they
+restart a card's worker. `CONTRIBUTING.md` has the rules.
+
+## The repositories
+
+| repository | what | how it is found |
+| --- | --- | --- |
+| [Intel-Phi-3120A](https://github.com/Lasimeri/Intel-Phi-3120A) | the cards' software stack: boots them, serves their memory, the `phi` command | `PHI_STACK_ROOT`, else `phi` on PATH, else a checkout next to this one, else in `$HOME` |
+| [Intel-Phi-AVX-512-C](https://github.com/Lasimeri/Intel-Phi-AVX-512-C) (this one) | the cards as an AVX-512 co-processor with the preload in C, the card worker and the `libggml_phi.so` backend; development continues here since 2026-10-14 | `PHI_AVX512_ROOT`, else a checkout next to Intel-Phi-Jev, else in `$HOME` |
+| [Intel-Phi-AVX-512-ASM](https://github.com/Lasimeri/Intel-Phi-AVX-512-ASM) | the same history to 3ee445c, the host library in assembly (Intel-Phi-AVX512 until 2026-10-13); frozen there | |
+| [Intel-Phi-Stream](https://github.com/Lasimeri/Intel-Phi-Stream) | a thought stream over the GPU, the cards and host memory, through `libggml_phi.so` and `scripts/phi-ggml.sh` | `PHI_AVX512_ROOT`, else a checkout next to it, else in `$HOME` |
+| [Intel-Phi-Jev](https://github.com/Lasimeri/Intel-Phi-Jev) | `xks`, a local Jev (TypeSafe System One) whose model runs through `libggml_phi.so` (its `cards` site) and `phi512.sh` (its `avx512` site) | by Mechanical-Jev |
+| [Mechanical-Jev](https://github.com/Lasimeri/Mechanical-Jev) | `mjev`, the asking side of that Jev | |
+
+Cloned side by side, the repositories find each other without
+configuration, under each one's clone name or the spaced one; the model
+and llama.cpp paths are set in Intel-Phi-Jev's `xks.conf`, and the cards
+need the stack's `phi` command with a card up. What Intel-Phi-Jev and Intel-Phi-Stream
+consume from here (`scripts/phi512.sh`, `scripts/phi-vpu.sh`,
+`host/target/release/libggml_phi.so`, the `PHI_GGML_*` and `PHI_VPU_*`
+variables) stays as it is across changes; [`CONTRIBUTING.md`](CONTRIBUTING.md)
+has the rules the repositories share. MIT ([`LICENSE-MIT`](LICENSE-MIT)).
+
+## History
+
+This began inside the stack's repository and was split out on
+2026-09-22 (stack commit 0f49eac) so that the co-processor and the stack
+can move independently. The commits before the split are in that
+repository's history.

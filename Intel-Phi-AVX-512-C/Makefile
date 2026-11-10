@@ -1,0 +1,79 @@
+# Top-level entry points. The real work is in scripts/, host/c (the C
+# preload, its own Makefile) and in the Cargo
+# workspace under host/. Run `make help` for the list.
+
+.DEFAULT_GOAL := help
+HOST := host
+# phi-pld links a llama.cpp build (headers here, libraries in
+# build-native/bin, or LLAMA_BUILD_DIR) and needs libclang; it joins the
+# build where both the headers and libllama.so are found, and is skipped
+# with a note naming the missing one where not (headers alone made its
+# build script stop the whole build).
+LLAMA_CPP_DIR ?= $(HOME)/llama.cpp
+LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build-native/bin
+export LLAMA_CPP_DIR LLAMA_BUILD_DIR
+PLD := $(if $(and $(wildcard $(LLAMA_CPP_DIR)/include/llama.h),$(wildcard $(LLAMA_BUILD_DIR)/libllama.so)),--workspace,)
+PLD_NOTE = $(if $(PLD),,@echo "phi-pld skipped: no $(if $(wildcard $(LLAMA_CPP_DIR)/include/llama.h),$(LLAMA_BUILD_DIR)/libllama.so (set LLAMA_BUILD_DIR),$(LLAMA_CPP_DIR)/include/llama.h (set LLAMA_CPP_DIR))")
+
+.PHONY: help build test fmt clippy docs-check layout-check mvex-check check c c-check gates clean
+
+help: ## Show this help
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
+
+build: ## Build the host workspace (libphi512.so, phi-vpu, the translator, the encoder; phi-pld where llama.cpp is found) and libggml_phi.so from host/asm
+	cd $(HOST) && cargo build $(PLD) && cargo build --release $(PLD)
+	$(PLD_NOTE)
+	host/asm/ggml-phi/build.sh --install
+	host/asm/phi-vpu/build.sh
+
+test: ## Run host tests that do not need the card
+	cd $(HOST) && cargo test $(PLD)
+
+fmt: ## Check formatting
+	cd $(HOST) && cargo fmt --all -- --check
+
+clippy: ## Lint
+	cd $(HOST) && cargo clippy $(PLD) --all-targets -- -D warnings
+
+docs-check: ## Enforce sibling .md files, the no-dash rule and relative links
+	scripts/check-docs.sh
+
+layout-check: ## Compare the C protocol layout with the Rust and assembly constants, and ggml's headers with ggml_layout.inc (tcc; the ggml check is skipped without the headers)
+	tcc -run tools/vpu-layout-check.c
+	@if [ -f $(LLAMA_CPP_DIR)/ggml/include/ggml.h ]; then \
+		tcc -I$(LLAMA_CPP_DIR)/ggml/include -I$(LLAMA_CPP_DIR)/ggml/src -run tools/ggml-layout-check.c host/asm/ggml-phi/ggml_layout.inc; \
+	else echo "ggml layout check skipped: no $(LLAMA_CPP_DIR)/ggml/include/ggml.h (set LLAMA_CPP_DIR)"; fi
+
+mvex-check: ## The knc-mvex copy matches the stack's (skipped when the stack is not found)
+	scripts/mvex-sync.sh
+
+decode-check: build ## The assembly x86-64 decoder against iced-x86 on the translator binary itself (host/asm/phi512/decode.S, tools/decode-check.c)
+	mkdir -p host/asm/out
+	as --64 -I host/asm/phi512 -o host/asm/out/p512_decode.o host/asm/phi512/decode.S
+	gcc -O2 -o host/asm/out/decode-check tools/decode-check.c host/asm/out/p512_decode.o
+	host/target/release/avx512-xlate --dump host/target/release/avx512-xlate > host/asm/out/decode-iced.dump
+	host/asm/out/decode-check host/target/release/avx512-xlate > host/asm/out/decode-asm.dump
+	@if cmp -s host/asm/out/decode-iced.dump host/asm/out/decode-asm.dump; then echo "decode-check: $$(wc -l < host/asm/out/decode-asm.dump) instructions identical to iced"; else diff host/asm/out/decode-iced.dump host/asm/out/decode-asm.dump | head -20; echo "decode-check: the decoder differs from iced"; exit 1; fi
+
+fnscan-check: decode-check ## The function scan (host/asm/phi512/fnscan.S) over the translator binary: no decode failure, no branch into an instruction
+	as --64 -I host/asm/phi512 -o host/asm/out/p512_fnscan.o host/asm/phi512/fnscan.S
+	gcc -O2 -o host/asm/out/fnscan-check tools/fnscan-check.c host/asm/out/p512_fnscan.o host/asm/out/p512_decode.o
+	host/asm/out/fnscan-check host/target/release/avx512-xlate > host/asm/out/fnscan.txt
+	@tail -1 host/asm/out/fnscan.txt
+	@if tail -1 host/asm/out/fnscan.txt | grep -q "failed 0 badtarget 0 "; then echo "fnscan-check: ok"; else echo "fnscan-check: failures"; exit 1; fi
+
+c: ## Build the C preload: host/c/out/libphi512-c.so (C_MODULES in C, the rest assembly; host/c/README.md)
+	$(MAKE) -C host/c
+
+c-check: ## The C preload's checks: the build, no AVX-512 from C, the imports, clang-format, clang-tidy
+	$(MAKE) -C host/c check
+
+gates: c ## The card gates through the C preload (restarts a card worker; not in check): GATES_ARGS="--card N --lib PATH --only ..."
+	scripts/gates.sh $(GATES_ARGS)
+
+check: docs-check fmt clippy build test layout-check mvex-check decode-check fnscan-check c-check ## Everything CI would run
+
+clean: ## Remove build outputs
+	cd $(HOST) && cargo clean
+	rm -rf host/asm/out
+	$(MAKE) -C host/c clean

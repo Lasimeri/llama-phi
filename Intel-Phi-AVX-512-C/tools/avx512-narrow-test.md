@@ -1,0 +1,121 @@
+# avx512-narrow-test.c
+
+The instruction-by-instruction check of what the translator synthesises
+(`host/crates/avx512-xlate/src/rewrite.md`): every AVX-512 form the
+card has no instruction for, executed on the card through the seamless
+path and compared bit for bit with plain C.
+
+Each check is one inline-assembly block: `vmovups` the inputs into the
+high vector registers (zmm16 and up, which force the EVEX encoding),
+the instruction under test with the `{evex}` prefix (so the assembler
+emits the EVEX form a compiler would, never the VEX one the host runs
+itself), `vmovups` the result out. The expected value is computed in C
+on the host. A mismatch prints the lane and both values; the program
+exits non-zero if any check failed.
+
+Why inline assembly and not intrinsics: gcc prefers VEX for anything it
+can, so an intrinsic on a 256-bit type would often not exercise the
+EVEX path at all, and which registers it picks decides the encoding.
+The assembly pins both.
+
+What is covered, in order: 256-bit and 128-bit forms with the upper
+lanes zeroed, merging and zeroing masks, `vinserti64x2` (the
+instruction llama.cpp first died on), extracts to a register and to
+memory, `vpternlogd` (xor-of-three, an arbitrary table, all ones),
+scalar `vaddss`/`vmulss`, `vmovd` eax to xmm, `vmovq` xmm to rax and `vmovq` m64 to xmm, float16
+conversions from 2-byte-aligned memory and from a register and back,
+`vcvttps2dq` with NaN and overflow (the integer indefinite),
+`vcvtdq2ps`, byte and word widening, 64-bit shifts, `valignq` and
+`valignd`, `vunpcklps`, `vshufps`, `vmovlhps`, `vmaxps`/`vminps` with
+NaN and signed zeros, broadcasts from a register and from eax, a
+narrow unaligned store and a narrow arithmetic memory operand, a
+16-byte load at the very end of a mapping (the next page unmapped: the
+card must not touch it), `kandw`, `kshiftlw`, `kortestw`, compare
+predicates above 7, a narrow integer compare, `vpabsd`, `vpmuludq`, a
+shift by a register count, `vpalignr`, division and square root in
+float and double (Newton-Raphson from the card's estimates: the checks
+demand the correctly rounded result), `vscalefps`, `vrndscaleps`
+(floor) and `vrndscalesd` (truncate), `vgetexpps`, the scalar
+conversions with general registers (integer to float from eax only:
+`vcvtsi2sd`, `vcvtusi2sd`, `vcvtsi2ss`; float to integer `vcvttss2si` to
+eax and rax and `vcvtsd2si` to rax; no 64-bit source, no unsigned float
+to integer), `vcvtss2sd`, and the permutes composed from
+`vpermd` (`vpermi2ps`, `vpermt2d`, `vpermq` by immediate, a 256-bit
+`vpermd` whose indices use three bits).
+
+```
+gcc -O1 -mavx512f -mavx512vl -mavx512dq -mavx512bw -mf16c \
+    -o avx512-narrow-test tools/avx512-narrow-test.c -lm
+scripts/phi512.sh ./avx512-narrow-test        # PASS: every form matched
+```
+
+What it found (2026-09-22): the qword pack-store pair faulting on a
+4-byte-aligned `vmovdqu64 ymm` store (the pairs now move dwords), a
+`vmovq` result into rax lost to the sequence's own rax restore (general
+registers are now loaded after the restores), and, after fifty regions,
+two lanes of a result silently lost: a chunk kept mapped and writable
+from a ranges-mode region gave a later demand-mode region stale reads
+and unsnapshotted writes (`card/vpu/vpu_exec.md`).
+
+## Added 2026-10-14 (74 checks)
+
+Section 30: `vinserti32x4` from an 8-aligned address, `vmovq` from a
+4-aligned one (VEX and EVEX), `vbroadcastsd` from a 4-aligned and
+`vbroadcastss` from a 2-aligned address: the card faults on such
+operands unless they go through the aligned slot
+([`mvex2.md`](../host/asm/phi512/mvex2.md)); without that change the
+run stops with #GP at the first of them (69 ok).
+
+
+`vpinsrq $1, rax` in its EVEX and VEX forms and `vcvtusi2sd eax` with
+rax's upper half set: the recipes read rax after their own mask had
+gone through eax (the element was the mask) and converted all of rax
+for a 32-bit source. With the fixes stashed the three fail (66 of 69,
+the element read back as 2); with them 69 of 69. A VEX check starts
+with an EVEX instruction: a block that begins with VEX runs it on the
+host (no fault until the first EVEX instruction), and tests nothing on
+the card.
+
+`vpextrq $1` and `vpextrd $3` to memory, EVEX and VEX (2026-10-14):
+the memory form went through the exact-footprint bounce, which stored
+the vector under the element's lanes at their own place in the
+scratch slot (lane 2 at +8) and copied the slot's start out, so the
+destination kept its old bytes. llama-server's
+`common_speculative_init` then compared an empty vector's begin with a
+stale end and walked it into address 0 (rs21, after the first forward
+pass). The bounce now packs the element to the slot's start
+(`vpackstoreld`, `EM_PACK` in [`mvex2.md`](../host/asm/phi512/mvex2.md)).
+Without the fix the four checks fail (the sentinel comes back); with it
+85 of 85.
+
+`vmovss`/`vmovsd` register forms (2026-10-14): the 11 encoding (MVR,
+GAS `{store}`: the destination is ModRM.rm, the element comes from
+ModRM.reg, bits above it from VEX.vvvv) in VEX and EVEX, and the 10
+encoding with the destination equal to the element's source. The
+recipe took every register form as 10 (it wrote the ModRM.reg register
+and left the destination stale), and moved the upper lanes first, which
+overwrote the element's source when it was the destination. gcc's
+`vmovsd %xmm10,%xmm10,%xmm3` in `ggml_compute_forward_scale` then fed a
+stale pointer into a row address (llama-bench's prompt pass faulted at
+0xffffd6ed650d2240, lb1-lb4). With the old library the four checks
+fail; with the fix 89 of 89.
+
+`vcomiss` with a memory operand indexed by rcx, above, below and equal
+(2026-10-14): the recipe composed the flags in ecx between its three
+compares, and each compare's memory operand reloaded the program's rcx
+for its address, so the flags came out as the index's low bits (65:
+0x41, "below and equal" for every case). ggml's argsort (the MoE
+router's top-k) compares `vcomiss 0x0(%r13,%rcx,4),%xmm0`: its rows came
+out unordered and llama-bench's prompt pass picked the wrong experts
+(lb5, the per-op compare against the AVX2 build: ffn_moe_topk-0 the
+first tensor to differ). The flags are composed in the scratch slot
+now. With the old library the three checks fail; with the fix 92 of 92.
+
+`vextractps $1` to memory and `$3` to a register (2026-10-14): no
+recipe, so the host ran it after each round trip; libm's `sincosf`
+stores its cosine with it, so every call from a region (ggml's rope
+cache, once libm was translated in-card) went back to the host: about
+1,300 host round trips in llama-bench's first minutes. It shares
+`xl_pextr` with `vpextrd` now. These two checks pass either way (the
+host runs the instruction right); the round trips show in the progress
+line's host exits.
