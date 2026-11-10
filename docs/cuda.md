@@ -2,8 +2,10 @@
 
 What this adds to design A ([design.md](design.md)): an NVIDIA GPU (an
 RTX 3090 Ti on PCIe Gen4 x8 here) for prompt prefill and the KV cache,
-while the weights stay in host RAM and on the Xeon Phi. llama.cpp is still
-unmodified; everything is a script, a launch setting or a program beside it.
+while the weights stay in host RAM and on the Xeon Phi. llama.cpp's source
+is still unpatched; everything is a script, a launch setting or a program
+beside it, some of which replace its functions at run time (the README's
+"What is changed in llama.cpp").
 
 | File | What it is |
 |---|---|

@@ -2,7 +2,7 @@
 # setup.sh [WORK_DIR]: fetch the three pinned upstreams, apply this
 # repository's patches, and build everything the co-processor setup runs.
 #
-#   llama.cpp            ggml-org/llama.cpp @ 4b77dee, unmodified:
+#   llama.cpp            ggml-org/llama.cpp @ 4b77dee, source not patched:
 #                        build-native-cuda (the host, design A) and,
 #                        with WITH_AVX512=1, build-avx512f-cuda (the
 #                        preload path)

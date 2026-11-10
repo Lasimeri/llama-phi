@@ -1,7 +1,7 @@
 # llama-phi
 
 An Intel Xeon Phi 7120A (Knights Corner) as a matrix co-processor for
-unmodified [llama.cpp](https://github.com/ggml-org/llama.cpp): the host
+[llama.cpp](https://github.com/ggml-org/llama.cpp): the host
 runs llama.cpp natively on its own threads, the card's 512-bit vector
 units take a share of every weight matrix multiply through a ggml
 backend, and the two exchange activations and results by the card's own
@@ -10,13 +10,37 @@ Ryzen 7 5800X.
 
 This repository holds the integration: patches to two existing public
 repositories, the scripts that fetch, patch and build everything, and
-the measurements. llama.cpp itself is used unmodified at a pinned commit.
+the measurements. llama.cpp's source is not patched: it is built from a
+pinned commit with build flags only. The program that runs is not stock
+llama.cpp, though: a fourth ggml backend and up to three preload
+libraries replace parts of what it does at run time
+([below](#what-is-changed-in-llamacpp)).
 
 | Upstream | Commit | What this repository adds |
 |---|---|---|
-| [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | `4b77dee` | nothing: build flags only (`scripts/setup.sh`) |
+| [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | `4b77dee` | no source patch: build flags (`scripts/setup.sh`), and at run time a backend and preload libraries that change its behaviour |
 | [Lasimeri/Intel-Phi-AVX-512-C](https://github.com/Lasimeri/Intel-Phi-AVX-512-C) | `db092f6` | `patches/intel-phi-avx-512-c.patch`: card worker, ggml backend, preload |
 | [Lasimeri/Intel-Phi-7120A](https://github.com/Lasimeri/Intel-Phi-7120A) | `22712a2` | `patches/intel-phi-7120a-phitop.patch`: phitop shows the worker's DMA; the card no longer swaps into host memory (`PHI_SWAP_HOSTMEM=1` opts in) |
+
+## What is changed in llama.cpp
+
+No file of llama.cpp is edited, and its checkout stays clean at
+`4b77dee`. What it does when it runs is changed from outside, by a
+backend it loads and by libraries placed in front of it with
+`LD_PRELOAD`:
+
+| Loaded | Replaces | Effect on llama.cpp | Used by |
+|---|---|---|---|
+| `libggml_phi.so` (`GGML_BACKEND_PATH`) | nothing: registers as a ggml backend | takes the weight multiplies, and with `PHI_GGML_HOSTOPS=1` the small operations between them, so ggml's scheduler splits every graph differently | every layout |
+| `libtridma.so` ([tools/tridma_router.md](tools/tridma_router.md)) | `mmap`, `munmap`, `madvise`, `posix_madvise` | the model's mapping is not prefetched, and the ranges a card holds become memory fed from the card instead of from the file | `one.sh`, `moe.sh`, `vram35.sh` |
+| `libunpin.so` ([tools/unpin.md](tools/unpin.md)) | `ggml_backend_sched_set_tensor_backend` | llama.cpp's pin of each layer's norm to the layer's device is declined for a generation step | `moe.sh`, `vram35.sh` |
+| `libhostram.so` ([tools/hostram.md](tools/hostram.md)) | `mmap`, `munmap` | the model is not a mapping of its file: llama.cpp is handed an anonymous region that is filled from the file and locked | `vram35.sh` |
+| `libnopopulate.so` ([tools/nopopulate.md](tools/nopopulate.md)) | `mmap`, `munmap`, `madvise`, `posix_madvise` | the model's mapping is not prefetched | `split.sh` |
+
+Results obtained this way are results of this combination, not of
+upstream llama.cpp: its loader, its page handling and the placement its
+scheduler computes all differ from a stock build's. `scripts/serve.sh`
+alone (the backend, no preload) is the closest to stock.
 
 ## Measured
 

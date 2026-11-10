@@ -3,7 +3,7 @@
 A software DMA router for one machine with three processing units: a Ryzen 7
 5800X (32 GB), an Intel Xeon Phi 7120A (16 GB GDDR5, PCIe Gen2 x8) and an RTX
 3090 Ti (24 GB, PCIe Gen4 x8). It serves Qwen3.8-27B Q8_0 (29.05 GB) with its
-MTP draft head through an unmodified llama.cpp with these rules:
+MTP draft head through llama.cpp (unpatched source, its mapping calls replaced at run time) with these rules:
 
 - the model lives in memory, never on the disk during inference: the host keeps
   only the rows the card does not hold;

@@ -23,8 +23,9 @@ gives the norm to the backend of the node before it in the graph, which
 under `PHI_GGML_HOSTOPS=1` is the card backend's host side
 (`host/asm/ggml-phi/glue.md` in the patched Intel-Phi-AVX-512-C). Every
 other call, a prompt's norms among them, goes through to ggml unchanged.
-llama.cpp itself is not modified: `libllama.so` reaches the function
-through the dynamic linker.
+No file of llama.cpp is edited, but its behaviour is: `libllama.so`
+reaches the function through the dynamic linker, which hands it this
+library's.
 
 | Variable | Default | Meaning |
 |---|---|---|
