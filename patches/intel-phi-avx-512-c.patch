@@ -1490,7 +1490,7 @@ index 2838cd8..b515a5c 100644
  
  Two facts about the unpack loads that `phi_probe` settled against the
 diff --git a/card/vpu/matmul.S b/card/vpu/matmul.S
-index 6451e1b..277be07 100644
+index 6451e1b..f87049b 100644
 --- a/card/vpu/matmul.S
 +++ b/card/vpu/matmul.S
 @@ -31,5 +31,6 @@ g_consts:
@@ -1583,7 +1583,179 @@ index 6451e1b..277be07 100644
 +79:	leaq 63(%r12), %r15
  	shrq $6, %r15
  	xorl %eax, %eax
-@@ -1686,5 +1738,47 @@ vpu_matmul_run:
+@@ -549,6 +601,7 @@ shape_ok:
+ 
+ # ---- the float weight types: one weight row against one or four
+-# activation rows (phi_dot*, kernels.S), the sixteen partial sums added in
+-# the x87 unit, the row's last k % 16 elements as scalars ----
++# activation rows (phi_dot*, kernels.S), the row's last k % 16 elements
++# added to the sixteen partial sums under a mask (tail_dot), the sums
++# added on the vector unit (SUM16): nothing in the x87 unit ----
+ 
+ # rows_slice(job rdi, slice esi, nslices edx): the pool's entry for one
+@@ -656,23 +709,6 @@ rows_slice:
+ 	jae 12f
+ 	shlq $6, %rcx
+-	leaq RS_OUT(%rbp,%rcx), %rax
+-	fldz
+-	fadds 0(%rax)
+-	fadds 4(%rax)
+-	fadds 8(%rax)
+-	fadds 12(%rax)
+-	fadds 16(%rax)
+-	fadds 20(%rax)
+-	fadds 24(%rax)
+-	fadds 28(%rax)
+-	fadds 32(%rax)
+-	fadds 36(%rax)
+-	fadds 40(%rax)
+-	fadds 44(%rax)
+-	fadds 48(%rax)
+-	fadds 52(%rax)
+-	fadds 56(%rax)
+-	fadds 60(%rax)
+-	# the tail: sum += av * b1[x] for x in k16 * 16 .. k
++	leaq RS_OUT(%rbp,%rcx), %rdi		# out[q]: the column's sixteen partial sums
++	# the tail: out[q] += av * b1[x] for x in k16 * 16 .. k
+ 	movq RS_C(%rbp), %rax
+ 	addq RS_Q(%rbp), %rax			# c + q
+@@ -681,4 +717,7 @@ rows_slice:
+ 	addq MJ_B(%rbx), %rsi			# b1
+ 	call tail_dot
++	SUM16 rdi				# on the vector unit (rows.md, "The sums")
++	VMOVAPS_ST rdi, 0, zmm0			# back into its own slot of out, which is done with
++	movl (%rdi), %ecx			# the float's four bytes
+ 	# d[(c + q) * m + i] = sum
+ 	movq RS_C(%rbp), %rax
+@@ -687,5 +726,5 @@ rows_slice:
+ 	addq %r15, %rax
+ 	movq MJ_D(%rbx), %rdx
+-	fstps (%rdx,%rax,4)
++	movl %ecx, (%rdx,%rax,4)
+ 	incq RS_Q(%rbp)
+ 	jmp 7b
+@@ -715,30 +754,17 @@ rows_slice:
+ 213:	call phi_dot_bf16
+ 211:	popq %rsi
+-	leaq RS_OUT(%rbp), %rax
+-	fldz
+-	fadds 0(%rax)
+-	fadds 4(%rax)
+-	fadds 8(%rax)
+-	fadds 12(%rax)
+-	fadds 16(%rax)
+-	fadds 20(%rax)
+-	fadds 24(%rax)
+-	fadds 28(%rax)
+-	fadds 32(%rax)
+-	fadds 36(%rax)
+-	fadds 40(%rax)
+-	fadds 44(%rax)
+-	fadds 48(%rax)
+-	fadds 52(%rax)
+-	fadds 56(%rax)
+-	fadds 60(%rax)
+ 	jmp 23f
+-22:	fldz
+-23:	call tail_dot
++22:	VPXORD zmm0, zmm0, zmm0			# a row shorter than a vector: the partial sums start at zero
++	VMOVAPS_ST rbp, RS_OUT, zmm0
++23:	leaq RS_OUT(%rbp), %rdi
++	call tail_dot				# out += the row's last k % 16 products
++	SUM16 rdi				# on the vector unit (rows.md, "The sums")
++	VMOVAPS_ST rdi, 0, zmm0
++	movl (%rdi), %ecx			# the float's four bytes
+ 	movq RS_C(%rbp), %rax
+ 	imulq MJ_M(%rbx), %rax
+ 	addq %r15, %rax
+ 	movq MJ_D(%rbx), %rdx
+-	fstps (%rdx,%rax,4)
++	movl %ecx, (%rdx,%rax,4)
+ 	incq RS_C(%rbp)
+ 	jmp 20b
+@@ -754,41 +780,48 @@ rows_slice:
+ 	ret
+ 
+-# tail_dot: with the sum in st(0), add av * b1[x] for x in k16 * 16 .. k,
+-# av the weight (a half up-converted, or a float) of the row at
+-# RS_TMP(%rbp), b1 the activation row at rsi. Uses the frame of
+-# rows_slice (rbp, rbx, r14).
++# tail_dot(out rdi, b1 rsi): out[16] += av * b1[x] for x in k16 * 16 .. k,
++# av the weights of the row at RS_TMP(%rbp) (float32, float16 or
++# bfloat16 by r14d), b1 the activation row: the row's last k % 16
++# elements, on the vector unit. One masked expand-load each (the low
++# k % 16 lanes take that many consecutive elements from the address, the
++# other lanes stay zero, nothing past the row is read), one multiply, and
++# the products added to the row's sixteen partial sums before they are
++# summed. Uses the frame of rows_slice (rbp, r14); keeps rdi and rsi;
++# clobbers rax, rcx, rdx, zmm8, zmm9, k1.
+ tail_dot:
+-	pushq %r12
+-	pushq %r13
+-	movq %rsi, %r12
+-	movq RS_K16(%rbp), %r13
+-	shlq $4, %r13				# x = k16 * 16
+ 	movq RS_TAIL(%rbp), %rcx
+-	addq %r13, %rcx				# k
+-	movq %rcx, RS_TMP+8(%rbp)
+-1:	cmpq RS_TMP+8(%rbp), %r13
+-	jae 9f
+-	movq RS_TMP(%rbp), %rax
++	testq %rcx, %rcx
++	jz 9f
++	movl $1, %eax
++	shll %cl, %eax
++	decl %eax				# the low k % 16 lanes
++	KMOV_KR k1, eax
++	movq RS_K16(%rbp), %rdx
++	shlq $4, %rdx				# x = k16 * 16
++	movq RS_TMP(%rbp), %rax			# the weight row
++	VPXORD zmm8, zmm8, zmm8
++	VPXORD zmm9, zmm9, zmm9
+ 	testl %r14d, %r14d
+-	jz 2f
+-	movzwl (%rax,%r13,2), %edi
++	jnz 2f
++	leaq (%rax,%rdx,4), %rax
++	VLOADUNPACKLPS zmm8, rax, 0, k=k1
++	VLOADUNPACKHPS zmm8, rax, 64, k=k1
++	jmp 4f
++2:	leaq (%rax,%rdx,2), %rax
+ 	cmpl $2, %r14d
+-	je 4f
+-	call half_to_float
+-	movl %eax, RS_TMP+16(%rbp)
+-	flds RS_TMP+16(%rbp)
+-	jmp 3f
+-4:	shll $16, %edi				# a bfloat16 is a float32's high half
+-	movl %edi, RS_TMP+16(%rbp)
+-	flds RS_TMP+16(%rbp)
+-	jmp 3f
+-2:	flds (%rax,%r13,4)
+-3:	fmuls (%r12,%r13,4)
+-	faddp %st, %st(1)
+-	incq %r13
+-	jmp 1b
+-9:	popq %r13
+-	popq %r12
+-	ret
++	je 3f
++	VLOADUNPACKLPS zmm8, rax, 0, conv=CV_F16, k=k1
++	VLOADUNPACKHPS zmm8, rax, 64, conv=CV_F16, k=k1
++	jmp 4f
++3:	VLOADUNPACKLD zmm8, rax, 0, conv=CV_U16, k=k1	# a bfloat16 is a float32's high half
++	VLOADUNPACKHD zmm8, rax, 64, conv=CV_U16, k=k1
++	VPSLLD zmm8, zmm8, 16
++4:	leaq (%rsi,%rdx,4), %rax
++	VLOADUNPACKLPS zmm9, rax, 0, k=k1
++	VLOADUNPACKHPS zmm9, rax, 64, k=k1
++	VMULPS zmm8, zmm8, zmm9
++	VADDPS zmm8, zmm8, rdi, 0
++	VMOVAPS_ST rdi, 0, zmm8
++9:	ret
+ 
+ # rows_slice_id(job rdi, slice esi, nslices edx): a mixture with float
+@@ -1686,5 +1719,47 @@ vpu_matmul_run:
  	jmp .Lok
  
 -5:	# MATMUL, MATMUL_ID, MATMUL_MORE
@@ -1632,7 +1804,7 @@ index 6451e1b..277be07 100644
 +59:	# MATMUL, MATMUL_ID, MATMUL_MORE
  	cmpq $0, MM_M(%rbx)
  	je .Lbad_said
-@@ -3244,4 +3338,6 @@ r_big:	.skip 8
+@@ -3244,4 +3319,6 @@ r_big:	.skip 8
  r_rounds:	.skip 8
  r_i:	.skip 8
 +	.globl stat_dma_push
@@ -1640,7 +1812,7 @@ index 6451e1b..277be07 100644
  
  	.section .rodata
 diff --git a/card/vpu/matmul.inc b/card/vpu/matmul.inc
-index 70eb5ef..f0177b0 100644
+index 70eb5ef..1a92cde 100644
 --- a/card/vpu/matmul.inc
 +++ b/card/vpu/matmul.inc
 @@ -109,5 +109,5 @@
@@ -1650,8 +1822,46 @@ index 70eb5ef..f0177b0 100644
 +	# (the pool slots a matrix request may use: two threads a core, 2 ncores, map_threads in matmul.S)
  	.set OWN_GROUPS_MAX, 512
  	.set MAP_POOL_MAX, 2097152
+@@ -121,4 +121,37 @@
+ 	.set C_BYTES, 896
+ 
++# SUM16 base: the sixteen floats at \base added on the vector unit; every
++# lane of zmm0 is their sum. Each float arrives as a broadcast memory
++# operand of an add, four chains of four adds (lanes i, i + 4, i + 8,
++# i + 12 in zmm<i>), so no add waits on the one before it in its chain for
++# more than the vector unit's result latency, then two levels: six adds
++# deep where the scalar unit's chain was sixteen. Uses zmm0 to zmm3; the
++# file that expands it includes mvex.inc first. (rows.md, "The sums".)
++	.macro SUM16 base
++	VPXORD zmm0, zmm0, zmm0
++	VPXORD zmm1, zmm1, zmm1
++	VPXORD zmm2, zmm2, zmm2
++	VPXORD zmm3, zmm3, zmm3
++	VADDPS zmm0, zmm0, \base, 0, conv=CV_1TO16
++	VADDPS zmm1, zmm1, \base, 4, conv=CV_1TO16
++	VADDPS zmm2, zmm2, \base, 8, conv=CV_1TO16
++	VADDPS zmm3, zmm3, \base, 12, conv=CV_1TO16
++	VADDPS zmm0, zmm0, \base, 16, conv=CV_1TO16
++	VADDPS zmm1, zmm1, \base, 20, conv=CV_1TO16
++	VADDPS zmm2, zmm2, \base, 24, conv=CV_1TO16
++	VADDPS zmm3, zmm3, \base, 28, conv=CV_1TO16
++	VADDPS zmm0, zmm0, \base, 32, conv=CV_1TO16
++	VADDPS zmm1, zmm1, \base, 36, conv=CV_1TO16
++	VADDPS zmm2, zmm2, \base, 40, conv=CV_1TO16
++	VADDPS zmm3, zmm3, \base, 44, conv=CV_1TO16
++	VADDPS zmm0, zmm0, \base, 48, conv=CV_1TO16
++	VADDPS zmm1, zmm1, \base, 52, conv=CV_1TO16
++	VADDPS zmm2, zmm2, \base, 56, conv=CV_1TO16
++	VADDPS zmm3, zmm3, \base, 60, conv=CV_1TO16
++	VADDPS zmm0, zmm0, zmm1
++	VADDPS zmm2, zmm2, zmm3
++	VADDPS zmm0, zmm0, zmm2
++	.endm
++
+ # The per-format kernel table (matmul.S, g_fmt): block bytes, then the
+ # six kernels [b_type][1, 4, 8 rows].
 diff --git a/card/vpu/matmul.md b/card/vpu/matmul.md
-index 16dc0cd..46a912e 100644
+index 16dc0cd..ef8416e 100644
 --- a/card/vpu/matmul.md
 +++ b/card/vpu/matmul.md
 @@ -6,5 +6,6 @@ The card as a matrix-multiply engine for the ggml backend
@@ -1662,7 +1872,7 @@ index 16dc0cd..46a912e 100644
 +bytes back to the window) and `VPU_K_FREE`, with the
  descriptors of `vpu_matmul.h` (their offsets in `proto.inc`). It replaces
  `vpu_matmul.c`; the row loops are `rows.S`, the kernels `kernels.S`. The
-@@ -41,5 +42,7 @@ what is where in the assembly and what its gates were.
+@@ -41,9 +42,12 @@ what is where in the assembly and what its gates were.
    `kernels.md`) are data here, in `.float` and `.long`, where the C
    computed them at start; **the kernel table** `g_fmt` names each
 -  format's block bytes and its six kernels.
@@ -1671,7 +1881,14 @@ index 16dc0cd..46a912e 100644
 +  constants, which was padding.
  - **The float weight types** (`rows_slice`, `rows_slice_id`): a row
    against four activation rows (`phi_dot4_*`) or one (`phi_dot_*`), the
-@@ -100,2 +103,16 @@ the C worker's after the timing fields are stripped. Defects met on the
+-  sixteen sums and the row's last `k % 16` elements in the x87 unit
+-  exactly as the C (`rows.md`, "The sums"). A request of several
++  row's last `k % 16` elements added to the sixteen partial sums by one
++  masked expand-load and multiply (`tail_dot`), the sums added on the
++  vector unit (`rows.md`, "The sums"). A request of several
+   matrices (`VPU_K_MATMUL_MORE`) with a float base takes pieces of the
+   base's own type only (`r_fmore`; a quantized base takes quantized
+@@ -100,2 +104,16 @@ the C worker's after the timing fields are stripped. Defects met on the
  way are in `rows.md`; the fused feed-forward's down projection is the one
  that was here (a matrix pointer read through a clobbered register).
 +
@@ -1760,9 +1977,18 @@ index e396148..91a609f 100644
  32, card 0 was 72.7% busy at 1.87 ms a request in llama-server's first
  decode; graph reservation 74.7 s with 32, 58.6 s with 110 and callee
 diff --git a/card/vpu/rows.S b/card/vpu/rows.S
-index a278b51..ba31861 100644
+index a278b51..069175e 100644
 --- a/card/vpu/rows.S
 +++ b/card/vpu/rows.S
+@@ -5,6 +5,6 @@
+ # multiplies its rows by the groups' activation rows with the kernels of
+ # kernels.S (rows_range_q), summing the sixteen partial sums of each
+-# result in the x87 unit exactly as the C worker did, so that a result
+-# is the same float to the bit. See rows.md.
++# result on the vector unit (SUM16, matmul.inc). No instruction of this
++# file runs in the x87 unit since 2026-11-09. See rows.md.
+ 
+ 	.include "defs.inc"
 @@ -15,8 +15,8 @@
  	.text
  
@@ -1834,14 +2060,229 @@ index a278b51..ba31861 100644
 +	movl ncores(%rip), %r10d
  1:	movq %rcx, %rax
  	shrq $5, %rax				# n64 / PULL_LINES
-@@ -1247,5 +1247,5 @@ rows_slice_q:
+@@ -647,47 +647,4 @@ fused_setup:
+ # ---- the rows of a quantized matrix ----
+ 
+-# half_to_float: the float32 bits of the half in di, in eax (integer
+-# exact, as the C's half_to_float). Clobbers ecx, edx.
+-	.globl half_to_float
+-half_to_float:
+-	movzwl %di, %eax
+-	movl %eax, %ecx
+-	andl $0x8000, %ecx
+-	shll $16, %ecx				# sign
+-	movl %eax, %edx
+-	shrl $10, %edx
+-	andl $0x1f, %edx			# exponent
+-	andl $0x3ff, %eax			# mantissa
+-	testl %edx, %edx
+-	jnz 2f
+-	testl %eax, %eax
+-	jnz 1f
+-	movl %ecx, %eax
+-	ret
+-1:	movl $113, %edx				# subnormal: normalise
+-11:	testl $0x400, %eax
+-	jnz 12f
+-	shll $1, %eax
+-	decl %edx
+-	jmp 11b
+-12:	andl $0x3ff, %eax
+-	shll $13, %eax
+-	shll $23, %edx
+-	orl %edx, %eax
+-	orl %ecx, %eax
+-	ret
+-2:	cmpl $31, %edx
+-	jne 3f
+-	shll $13, %eax
+-	orl $0x7f800000, %eax
+-	orl %ecx, %eax
+-	ret
+-3:	addl $112, %edx
+-	shll $23, %edx
+-	shll $13, %eax
+-	orl %edx, %eax
+-	orl %ecx, %eax
+-	ret
+-
+ # The frame of rows_range_q, addressed through rbp (its aligned base):
+ # the accumulators, the kernels' scratch table, a group's row pointers,
+@@ -726,6 +683,7 @@ half_to_float:
+ # for every weight row of the chunk); within a group the superblock
+ # outermost (its activation block and the accumulators stay in L1 across
+-# the rows, the weights stream); then each result summed in the x87 unit
+-# and stored.
++# the rows, the weights stream); then a Q8_0 row's last blocks added to
++# its accumulator (q8_0_tail), each result summed on the vector unit
++# (SUM16) and stored as its four bytes.
+ 	.globl rows_range_q
+ rows_range_q:
+@@ -896,24 +854,10 @@ rows_range_q:
+ 	shlq $6, %rax
+ 	addq RQ_A(%rbp), %rax			# acc + q * 16 floats
+-	fldz
+-	fadds 0(%rax)
+-	fadds 4(%rax)
+-	fadds 8(%rax)
+-	fadds 12(%rax)
+-	fadds 16(%rax)
+-	fadds 20(%rax)
+-	fadds 24(%rax)
+-	fadds 28(%rax)
+-	fadds 32(%rax)
+-	fadds 36(%rax)
+-	fadds 40(%rax)
+-	fadds 44(%rax)
+-	fadds 48(%rax)
+-	fadds 52(%rax)
+-	fadds 56(%rax)
+-	fadds 60(%rax)
+ 	cmpq $0, RQ_TAIL(%rbp)
+-	je 25f
+-	# q8_0_tail(blk = base + r * nb_a + ns * bb, x = g->x[c0 + q] + ns * xblock, tail / 32, b_type)
++	je 24f
++	# q8_0_tail(blk = base + r * nb_a + ns * bb, x = g->x[c0 + q] + ns * xblock, tail / 32, b_type, acc, scratch):
++	# the row's last blocks into the accumulator, before it is summed
++	movq %rax, %r8
++	leaq RQ_SCRATCH(%rbp), %r9
+ 	movq RQ_G(%rbp), %rdx
+ 	movq G_A(%rdx), %rdi
+@@ -936,5 +880,11 @@ rows_range_q:
+ 	movl MJ_B_TYPE(%rbx), %ecx
+ 	call q8_0_tail
+-25:	movq RQ_G(%rbp), %rdx
++	movq RQ_Q(%rbp), %rax
++	shlq $6, %rax
++	addq RQ_A(%rbp), %rax			# acc + q * 16 floats again
++24:	SUM16 rax				# on the vector unit: every lane of zmm0 the sum
++	leaq RQ_SCRATCH(%rbp), %rcx
++	VMOVAPS_ST rcx, 0, zmm0			# the kernels' scratch is free here; lane 0 is the result
++	movq RQ_G(%rbp), %rdx
+ 	movq RQ_C0(%rbp), %rcx
+ 	addq RQ_Q(%rbp), %rcx
+@@ -944,5 +894,6 @@ rows_range_q:
+ 	addq RQ_R(%rbp), %rax
+ 	movq MJ_D(%rbx), %rdx
+-	fstps (%rdx,%rax,4)
++	movl RQ_SCRATCH(%rbp), %ecx		# the float's four bytes: no scalar float unit
++	movl %ecx, (%rdx,%rax,4)
+ 	incq RQ_Q(%rbp)
+ 	jmp 22b
+@@ -967,70 +918,41 @@ rows_range_q:
+ 	ret
+ 
+-# q8_0_tail: the blocks of a Q8_0 row past the last superblock (a row may
+-# end with fewer than eight 34-byte blocks). With the row's partial sum in
+-# st(0): for each of edx blocks at rdi against the activations at rsi
+-# (float32, or float16 when ecx is 1), s = the sum over 32 of q * x, then
+-# tail += d * s; at the end st(0) += tail. Every step in the x87 unit as
+-# the C compiled it: the integer multiply by the signed byte widened to
+-# 16 bits, the block scale d from its half, nothing rounded before the
+-# caller's store. Returns with the sum in st(0).
++# q8_0_tail(blk rdi, x rsi, n edx, b_type ecx, acc r8, scratch r9): the
++# blocks of a Q8_0 row past the last superblock (a row may end with fewer
++# than eight 34-byte blocks), added into the row's sixteen partial sums at
++# acc before they are summed, on the vector unit. Per block: the scale's
++# half up-converted into lane 0 and stored to the scratch, the 32 signed
++# bytes as two vectors of floats, their products with the activations
++# (float32, or float16 when ecx is 1) added, and that times the scale,
++# broadcast from the scratch, into the accumulator. Clobbers rax, rdx,
++# rdi, rsi, zmm0, zmm8, zmm9, zmm16, k1.
+ q8_0_tail:
+-	pushq %rbx
+-	pushq %r12
+-	pushq %r13
+-	pushq %r14
+-	pushq %r15
+-	subq $16, %rsp
+-	movq %rdi, %rbx				# blk
+-	movq %rsi, %r12				# x
+-	movl %edx, %r13d			# nblocks
+-	movl %ecx, %r14d			# b_type
+-	xorl %r15d, %r15d			# i
+-	fldz					# tail
+-1:	cmpl %r13d, %r15d
+-	jge 9f
+-	movl %r15d, %eax
+-	imull $34, %eax, %eax
+-	movzwl (%rbx,%rax), %edi
+-	call half_to_float
+-	movl %eax, 8(%rsp)			# d
+-	fldz					# s
+-	xorl %ecx, %ecx				# j
+-2:	cmpl $32, %ecx
+-	jge 4f
+-	movl %r15d, %eax
+-	shll $5, %eax
+-	addl %ecx, %eax				# at = 32 i + j
+-	testl %r14d, %r14d
+-	jz 3f
+-	pushq %rcx
+-	movzwl (%r12,%rax,2), %edi
+-	call half_to_float
+-	popq %rcx
+-	movl %eax, 12(%rsp)
+-	flds 12(%rsp)
+-	jmp 31f
+-3:	flds (%r12,%rax,4)			# xv
+-31:	movl %r15d, %eax
+-	imull $34, %eax, %eax
+-	leal 2(%rax,%rcx), %eax
+-	movsbw (%rbx,%rax), %ax
+-	movw %ax, (%rsp)
+-	fimuls (%rsp)				# xv * q
+-	faddp %st, %st(1)			# s +=
+-	incl %ecx
+-	jmp 2b
+-4:	flds 8(%rsp)				# d
+-	fmulp %st, %st(1)			# d * s
+-	faddp %st, %st(1)			# tail +=
+-	incl %r15d
++	VMOVAPS zmm0, r8, 0
++	movl $1, %eax
++	KMOV_KR k1, eax
++1:	testl %edx, %edx
++	jz 9f
++	VPXORD zmm16, zmm16, zmm16
++	VLOADUNPACKLPS zmm16, rdi, 0, conv=CV_F16, k=k1
++	VLOADUNPACKHPS zmm16, rdi, 64, conv=CV_F16, k=k1
++	VMOVAPS_ST r9, 0, zmm16			# d, for the broadcast below
++	VLOADUNPACKLPS zmm8, rdi, 2, conv=CV_S8
++	VLOADUNPACKHPS zmm8, rdi, 66, conv=CV_S8
++	VLOADUNPACKLPS zmm9, rdi, 18, conv=CV_S8
++	VLOADUNPACKHPS zmm9, rdi, 82, conv=CV_S8
++	testl %ecx, %ecx
++	jnz 2f
++	VMULPS zmm8, zmm8, rsi, 0
++	VFMADD231PS zmm8, zmm9, rsi, 64
++	addq $128, %rsi
++	jmp 3f
++2:	VMULPS zmm8, zmm8, rsi, 0, conv=CV_F16
++	VFMADD231PS zmm8, zmm9, rsi, 32, conv=CV_F16
++	addq $64, %rsi
++3:	VFMADD231PS zmm0, zmm8, r9, 0, conv=CV_1TO16
++	addq $34, %rdi
++	decl %edx
+ 	jmp 1b
+-9:	faddp %st, %st(1)			# sum += tail
+-	addq $16, %rsp
+-	popq %r15
+-	popq %r14
+-	popq %r13
+-	popq %r12
+-	popq %rbx
++9:	VMOVAPS_ST r8, 0, zmm0
+ 	ret
+ 
+@@ -1247,5 +1169,5 @@ rows_slice_q:
  	movl %r12d, %eax
  	xorl %edx, %edx
 -	movl $NCORES, %r9d
 +	movl ncores(%rip), %r9d
  	divl %r9d
  	movl %edx, %r9d				# core
-@@ -1315,5 +1315,5 @@ rows_slice_multi:
+@@ -1315,5 +1237,5 @@ rows_slice_multi:
  3:	movl %r12d, %eax
  	xorl %edx, %edx
 -	movl $NCORES, %r9d
@@ -1849,7 +2290,7 @@ index a278b51..ba31861 100644
  	divl %r9d
  	movl %edx, %r9d				# core
 diff --git a/card/vpu/rows.md b/card/vpu/rows.md
-index ae56096..98fd291 100644
+index ae56096..7e34142 100644
 --- a/card/vpu/rows.md
 +++ b/card/vpu/rows.md
 @@ -11,6 +11,7 @@ this document says what the assembly keeps and what it must reproduce
@@ -1862,6 +2303,68 @@ index ae56096..98fd291 100644
 +  core has one; with twice that (two threads a core) the slices `s` and `s + ncores`
    share a core and take alternate rows of the same chunk, so the
    activation block they read is one and the same in their shared L1.
+@@ -60,21 +61,47 @@ exactly.
+   matrix, or of each matrix of a request of several, cut as one.
+ 
+-## The sums: the x87 unit, as the C compiled
++## The sums: the vector unit (2026-11-09)
+ 
+ A result is the sixteen partial sums of its accumulator vector added
+ together, plus, for a Q8_0 row whose length is not a multiple of 256, the
+-row's last blocks done here. The C worker wrote both as plain C float
+-arithmetic, which the card toolchain compiles to the x87 unit (the
+-`knc64-x87` ABI: no SSE), and in x87 a chain of additions stays in the
+-80-bit register until it is stored, rounding once. The card's results
+-therefore depend on exactly that: `fldz`, sixteen `fadds` in lane order,
+-then for a tail `s = sum over 32 of xv * q` per block (`fimuls` by the
+-signed byte widened to 16 bits, as clang emitted) and `tail += d * s`,
+-then `sum += tail`, then one `fstps` into the result. `rows_range_q`
+-and `matmul.S`'s float path do exactly this, read off the compiled C
+-(`knc-cc -O2 -S vpu_matmul.c`, 2026-09-30), so that a result is the same
+-float to the bit, and a model's text under the assembly worker is the
+-same byte for byte as under the C one. A vector reduction would be
+-faster and would round differently; it is not used for that reason.
++row's last blocks, and for a float row its last `k % 16` elements. All
++three are done on the vector unit; the worker has no x87 instruction.
++
++| step | how |
++| --- | --- |
++| a Q8_0 row's last blocks (`q8_0_tail`) | per 34-byte block: the scale's half up-converted into one lane and stored to the scratch, the 32 signed bytes as two vectors (`{sint8}` unpack pairs), `w0 * x0 + w1 * x1` against the activations (float32, or `{float16}` at a 32-byte stride), and that times the scale, broadcast from the scratch, into the row's accumulator |
++| a float row's last `k % 16` elements (`tail_dot`, `matmul.S`) | one masked expand-load of the weights (float32, `{float16}`, or `{uint16}` shifted left 16 for bfloat16) and one of the activations: the low `k % 16` lanes take that many consecutive elements, the others stay zero, nothing past the row is read; their product added to the sixteen partial sums |
++| the sixteen partial sums (`SUM16`, `matmul.inc`) | each float a `{1to16}` broadcast operand of an add, four chains of four (lanes `i`, `i + 4`, `i + 8`, `i + 12`), then two levels: six adds deep |
++| the store | the vector to a 64-byte aligned slot (the kernels' scratch, or the float path's own `out`), lane 0 moved to the result as four integer bytes |
++
++Both tails go into the accumulator before it is summed, so a result is
++one reduction whatever the row's length.
++
++What this replaced, and what it cost: until 2026-11-09 the sums and the
++tails were in the x87 unit, read off the C worker's compiled code
++(`fldz`, sixteen `fadds` in lane order, the tail in `fimuls`, one
++`fstps`), so that a result was the same float to the bit as under the C
++worker: in x87 a chain of additions stays in the 80-bit register and
++rounds once. The vector reduction adds in float32 and in another order,
++so a result now differs in its last bits from every run before it; the
++check's tolerance (`matmul.md` of `phi-vpu`) is unaffected.
++
++Measured on card 0, Q4_0, float16 activations, 114 threads, the card's
++compute time, the two worker binaries deployed in turn twice, best of
++15 each (`phi-vpu matmul-check --only q4_0 --act 1 --m M --k K
++--repeat 15`):
++
++| shape, activation rows | x87 sums | vector sums |
++| --- | --- | --- |
++| 17408 x 5120, 1 | 1.063 ms | 1.069 ms |
++| 17408 x 5120, 8 | 2.615 ms | 2.529 ms |
++| 17408 x 5120, 64 | 22.320 ms | 21.597 ms |
++| 61440 x 256, 1 | 0.277 ms | 0.280 ms |
++| 61440 x 256, 8 | 1.270 ms | 1.179 ms |
++| 61440 x 256, 64 | 11.485 ms | 10.123 ms |
++
++At one activation row the two are equal within the runs' spread (the
++medians cross); from eight rows the vector sums are 3 to 12 percent
++faster, more where a row is short and its reductions are a larger share.
+ 
+ ## Registers and frames
 diff --git a/card/vpu/sched.S b/card/vpu/sched.S
 index 3639727..6c6ac13 100644
 --- a/card/vpu/sched.S
@@ -2026,7 +2529,7 @@ index 0df9c2a..e2bcb4a 100644
  #define VPU_MM_PROBE 99   /* diagnostic: phi_probe writes 8 vectors to d (kernels.md) */
  #define VPU_MM_SWIGLU 98  /* diagnostic: d = silu(g) * u over m floats, g at b_off and u at b_off + nb_b, one thread (kernels.md) */
 diff --git a/card/vpu/vpu_matmul.md b/card/vpu/vpu_matmul.md
-index 40c6cb3..12f8669 100644
+index 40c6cb3..ca0d97c 100644
 --- a/card/vpu/vpu_matmul.md
 +++ b/card/vpu/vpu_matmul.md
 @@ -31,9 +31,22 @@ activations at `VPU_OFF_MORE`: "A layer's gate and up in one request").
@@ -2053,7 +2556,15 @@ index 40c6cb3..12f8669 100644
 +8, eight 18-byte blocks a superblock) Q4_0, use the superblock kernels
  `phi_<fmt>_<1|4|8>` (`card/vpu/kernels.md`):
  one 256-weight superblock against 1, 4 or 8 activation rows, the format
-@@ -384,5 +397,7 @@ The section above, "Two threads per core, measured again", found the
+@@ -181,5 +194,6 @@ float32 kernels and their `h` twins, indexed by the request's `b_type`
+ and by the group's row count. A row's stride is then `k * 2` instead of
+ `k * 4`, and `q8_0_tail`, which finishes the weights past the last whole
+-superblock on the scalar unit, reads halves or floats by the same flag.
++superblock (on the vector unit since 2026-11-09, `rows.md`, "The sums"),
++reads halves or floats by the same flag.
+ 
+ The card refuses `b_type` for a float weight type (`shape_ok`), because
+@@ -384,5 +398,7 @@ The section above, "Two threads per core, measured again", found the
  second thread no help on a prompt-sized batch (q6_K at n 64, 188 against
  209 GFLOP/s), and the service stayed capped at 58 slices (`POOL_SLOTS`,
 -`map_threads`). It is built for 114 now (`POOL_SLOTS`), because a
@@ -2950,7 +3461,7 @@ index 581f1fd..cd96f3a 100644
  the prologue, released at `.Lout`, where every path ends) serializes the
  threads, since the translation, the region path ([`region.md`](region.md):
 diff --git a/host/crates/phi-vpu/src/matmul.md b/host/crates/phi-vpu/src/matmul.md
-index e6cc7da..a5a9695 100644
+index e6cc7da..bc12785 100644
 --- a/host/crates/phi-vpu/src/matmul.md
 +++ b/host/crates/phi-vpu/src/matmul.md
 @@ -20,5 +20,5 @@ service (`K_UPLOAD`, `K_MATMUL`, `K_MATMUL_ID`, `K_FREE`, `K_FFN`,
@@ -2960,8 +3471,17 @@ index e6cc7da..a5a9695 100644
 +Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS, Q4_0: any byte pattern is a valid block, the
  float16 scales drawn small), dequantizes them on the host exactly as
  ggml-quants.c's `dequantize_row_*` do (the formulas are transcribed in
+@@ -28,5 +28,7 @@ of `4e-6` times the sum of the terms' magnitudes plus `1e-6`: the card
+ sums 16 lanes in a different order from the host, and both round each
+ product once. Shapes: 61 rows (an odd split across 57 threads), k 512
+-(two superblocks; Q8_0 also 544, a tail of one block), n 1, 4, 8 and 13
++(two superblocks; Q8_0 also 544, a tail of one block; the float types
++also 521, a tail of nine elements, the half-precision rows padded to
++their 32-byte stride), n 1, 4, 8 and 13
+ (the kernels' one-, four- and eight-row variants and a mix); with
+ `--threads` above 57 also 128 rows at n 1, 8 and 13 and a 128-row
 diff --git a/host/crates/phi-vpu/src/matmul.rs b/host/crates/phi-vpu/src/matmul.rs
-index 9034bf8..f6db354 100644
+index 9034bf8..2dc6545 100644
 --- a/host/crates/phi-vpu/src/matmul.rs
 +++ b/host/crates/phi-vpu/src/matmul.rs
 @@ -94,4 +94,5 @@ pub fn type_name(t: u32) -> &'static str {
@@ -3007,7 +3527,25 @@ index 9034bf8..f6db354 100644
 +        }
          MM_IQ4_XS => {
              for _ in 0..k / 256 {
-@@ -957,8 +978,8 @@ pub fn moe_check(w: &Window, threads: u32, only: Option<&str>, reps: u32, act: u
+@@ -411,5 +432,10 @@ fn as_bytes(v: &[f32]) -> &[u8] {
+ #[allow(clippy::too_many_arguments)]
+ fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64, rng: &mut Rng, reps: u32) -> Result<Vec<Duration>> {
+-    let nb_a = row_bytes(t, k);
++    // A half-precision row whose length is not a multiple of 16 is padded
++    // to the 32-byte stride its up-converting loads need (shape_ok).
++    let nb_a = match t {
++        MM_F16 | MM_BF16 => row_bytes(t, k).div_ceil(32) * 32,
++        _ => row_bytes(t, k),
++    };
+     // The activation rows are memory operands of the kernels, so their
+     // stride decides which L1 sets they land in: at k 5120 the stride is
+@@ -424,4 +450,5 @@ fn check_one(w: &Window, threads: u32, t: u32, m: u64, k: u64, n: u64, id: u64,
+         let (bytes, vals) = random_row(rng, t, k);
+         a.extend_from_slice(&bytes);
++        a.resize(a.len() + nb_a as usize - bytes.len(), 0);
+         rows.push(vals);
+     }
+@@ -957,8 +984,8 @@ pub fn moe_check(w: &Window, threads: u32, only: Option<&str>, reps: u32, act: u
      ACT.store(act, Ordering::Relaxed);
      let t = match only {
 -        Some(o) => [MM_Q4_K, MM_Q5_K, MM_Q6_K, MM_Q8_0, MM_IQ4_XS]
@@ -3018,7 +3556,7 @@ index 9034bf8..f6db354 100644
 +            .ok_or_else(|| anyhow::anyhow!("--moe takes a quantized type: q4_K q5_K q6_K q8_0 iq4_xs q4_0"))?,
          None => MM_Q4_K,
      };
-@@ -1030,8 +1051,8 @@ pub fn check(
+@@ -1030,8 +1057,8 @@ pub fn check(
      PAD.store(pad, Ordering::Relaxed);
      let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
 -    let all = [MM_F32, MM_F16, MM_BF16, MM_Q4_K, MM_Q5_K, MM_Q6_K, MM_Q8_0, MM_IQ4_XS];
@@ -3029,13 +3567,34 @@ index 9034bf8..f6db354 100644
 +        bail!("no such type; one of f32 f16 bf16 q4_K q5_K q6_K q8_0 iq4_xs q4_0");
      }
      // The feed-forward's SwiGLU first: the fused request (check_ffn) is
-@@ -1088,5 +1109,5 @@ pub fn check(
+@@ -1043,5 +1070,12 @@ pub fn check(
+         ACT.store(if t == MM_F32 || t == MM_F16 || t == MM_BF16 { 0 } else { act }, Ordering::Relaxed);
+         for &n in &[1u64, 4, 8, 13] {
+-            let k = if t == MM_Q8_0 && n == 13 { 544 } else { 512 };
++            // The rows with a tail, at 13 columns (the four-column and the
++            // one-column paths both run): a Q8_0 row of two superblocks
++            // and one block, a float row of 32 vectors and 9 elements.
++            let k = match t {
++                MM_Q8_0 if n == 13 => 544,
++                MM_F32 | MM_F16 | MM_BF16 if n == 13 => 521,
++                _ => 512,
++            };
+             check_one(w, threads, t, 61, k, n, id, &mut rng, 1)?;
+             id += 1;
+@@ -1088,5 +1122,5 @@ pub fn check(
          // sharing the ids (a gate and up pair, and a down-like one with a
          // row per column).
 -        let quants = [MM_Q4_K, MM_Q5_K, MM_Q6_K, MM_Q8_0, MM_IQ4_XS];
 +        let quants = [MM_Q4_K, MM_Q5_K, MM_Q6_K, MM_Q8_0, MM_IQ4_XS, MM_Q4_0];
          let other = match quants.iter().position(|&q| q == t) {
              Some(i) => quants[(i + 1) % quants.len()],
+@@ -1110,5 +1144,5 @@ pub fn check(
+         id += 4;
+         println!(
+-            "{:7} ok: 61 rows{}, k 512 (Q8_0 also 544), n 1 4 8 13, mixtures of 8 experts, and up to four matrices in one request, {threads} threads",
++            "{:7} ok: 61 rows{}, k 512 (Q8_0 also 544, the float types also 521), n 1 4 8 13, mixtures of 8 experts, and up to four matrices in one request, {threads} threads",
+             type_name(t),
+             if threads > 57 { " and 128" } else { "" },
 diff --git a/host/crates/phi-vpu/src/proto.md b/host/crates/phi-vpu/src/proto.md
 index 3fc3c8e..bac897c 100644
 --- a/host/crates/phi-vpu/src/proto.md

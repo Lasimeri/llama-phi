@@ -106,6 +106,15 @@ between them (`scripts/split.sh`), a 27 B Q4_0 model generates 2.605
 tok/s with 13.09 GB of its rows on the card, against 0.2076 tok/s when
 the card could take only its one Q6_K matrix: [docs/q4_0.md](docs/q4_0.md).
 
+The same model on one server (`scripts/one.sh`): the context and
+attention on the GPU, every row of 60 layers' matrices on the card, the
+last four layers and the output head in VRAM, so the host computes no
+matrix rows; 2.478 tok/s, prompts 313 tok/s from the second on, and half
+the VRAM of the split. The card worker no longer executes an x87
+instruction. What was measured, the order in which a layer's multiplies
+reach the card, and what is not built yet:
+[docs/one-server.md](docs/one-server.md).
+
 ## Use
 
 Requirements: a Xeon Phi x100 card booted with the
