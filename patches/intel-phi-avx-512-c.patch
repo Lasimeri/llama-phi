@@ -101,10 +101,10 @@ index c23026b..a8d70ea 100644
  	.globl cdma_poll
  # cdma_poll -> rax = the last completed sequence number (the status word),
 diff --git a/card/vpu/cdma.md b/card/vpu/cdma.md
-index 553b7bc..1f21237 100644
+index 553b7bc..e7abb18 100644
 --- a/card/vpu/cdma.md
 +++ b/card/vpu/cdma.md
-@@ -139,2 +139,20 @@ second the destination with the type (Linux `drivers/dma/mic_x100_dma.c`,
+@@ -139,2 +139,29 @@ second the destination with the type (Linux `drivers/dma/mic_x100_dma.c`,
  addresses, System Software Developer's Guide 2.1.8.2.1). Used by
  `res_push` for `K_PUSH`.
 +
@@ -125,6 +125,15 @@ index 553b7bc..1f21237 100644
 +posted (direction from `cdma_dir`, set by `cdma_submit` 0 and `cdma_push`
 +1). The worker stores the line at `OFF_CDMA_STATS` (192) after every
 +reply, beside `OFF_STATS`; phitop shows it as `card dma in, out`.
++
++## A matrix by the engine (2026-11-10)
++
++`cdma_submit_phys` had one user, the resident pool's 2 MiB chunks
++(`resident.S`). `matmul.S` now uses it for every matrix that arrives in
++the window (`engine_pull`: the pieces go straight into the frames of the
++buffer the matrix is multiplied from; `matmul.md`, "Weights straight
++from host RAM"), which makes the engine the path of every large
++transfer into the card: activations and results were already its.
 diff --git a/card/vpu/defs.inc b/card/vpu/defs.inc
 index a93e007..40eac19 100644
 --- a/card/vpu/defs.inc
@@ -1666,7 +1675,7 @@ index 2838cd8..966441f 100644
  
  Two facts about the unpack loads that `phi_probe` settled against the
 diff --git a/card/vpu/matmul.S b/card/vpu/matmul.S
-index 6451e1b..745959e 100644
+index 6451e1b..2bf30ca 100644
 --- a/card/vpu/matmul.S
 +++ b/card/vpu/matmul.S
 @@ -31,5 +31,6 @@ g_consts:
@@ -1762,7 +1771,178 @@ index 6451e1b..745959e 100644
 +79:	leaq 63(%r12), %r15
  	shrq $6, %r15
  	xorl %eax, %eax
-@@ -549,6 +604,7 @@ shape_ok:
+@@ -347,4 +402,170 @@ dma_pull:
+ 	ret
+ 
++# ---- weights straight from host RAM (2026-11-10) ----
++
++	.set ENG_PIECE, 16383 * 64		# one descriptor's length (cdma.S, CD_LEN_MAX)
++
++	.pushsection .bss
++	.balign 8
++eng_pm_fd:	.skip 8			# /proc/self/pagemap (0: not opened yet, -1: refused)
++eng_pm:		.skip 8			# one of its entries
++eng_said:	.skip 8			# bit 0: the first matrix by the engine was said, bit 1: the first by the block device
++	.popsection
++
++# engine_pull(dst rdi, len rsi, off rdx): len bytes (whole 64-byte lines)
++# of the window at off straight into dst's own page frames by the card's
++# DMA engine (cdma_submit_phys): no block device, so nothing of the
++# host's but its memory takes part, and no copy by a core of the card.
++# dst must lie in a huge-page mapping (big_alloc, MAP_HUGE): a huge page
++# is one run of frames, so a piece ends at a 2 MiB boundary of dst or at
++# a descriptor's 16383 lines. Each piece's page is read once first (a
++# private huge page gets its frame at the first fault; a read, so that
++# no dirty line of a core waits under the engine's write) and the frame
++# comes from /proc/self/pagemap. The pieces are posted back to back (the
++# ring holds 63) and the last is waited for. eax 0, or -1 when the
++# engine does not carry it: the channel down, an address or an offset
++# that is not a whole line, no frame, a copy refused or not completed
++# (pieces in flight are waited for before the answer, so the caller may
++# fill the buffer another way).
++engine_pull:
++	pushq %rbx
++	pushq %r12
++	pushq %r13
++	pushq %r14
++	pushq %r15
++	pushq %rbp
++	xorl %ebp, %ebp				# the last piece's sequence number
++	cmpq $0, cdma_ready(%rip)
++	je 8f
++	movq %rdi, %rax
++	orq %rdx, %rax
++	testq $63, %rax
++	jnz 8f
++	movq %rdi, %rbx				# dst
++	leaq 63(%rsi), %r12
++	andq $-64, %r12				# whole lines
++	movq %rdx, %r13				# the window offset
++	movq eng_pm_fd(%rip), %rax
++	testq %rax, %rax
++	jg 1f
++	js 8f
++	leaq s_eng_pagemap(%rip), %rdi
++	movl $O_RDONLY, %esi
++	xorl %edx, %edx
++	SYS SYS_open
++	testq %rax, %rax
++	jg 0f
++	movq $-1, eng_pm_fd(%rip)
++	jmp 8f
++0:	movq %rax, eng_pm_fd(%rip)
++1:	xorl %r14d, %r14d			# done
++2:	cmpq %r12, %r14
++	jae 6f
++	leaq (%rbx,%r14), %r15			# this piece
++	movq %r15, %rax
++	orq $HUGE_BYTES - 1, %rax
++	incq %rax
++	subq %r15, %rax				# to the end of its huge page
++	movq %r12, %rdx
++	subq %r14, %rdx
++	cmpq %rax, %rdx
++	jbe 3f
++	movq %rax, %rdx
++3:	cmpq $ENG_PIECE, %rdx
++	jbe 4f
++	movq $ENG_PIECE, %rdx
++4:	pushq %rdx
++	movzbl (%r15), %eax			# the page has its frame
++	movq eng_pm_fd(%rip), %rdi
++	leaq eng_pm(%rip), %rsi
++	movl $8, %edx
++	movq %r15, %r10
++	shrq $12, %r10
++	shlq $3, %r10				# the entry's offset
++	SYS SYS_pread64
++	popq %rdx
++	cmpq $8, %rax
++	jne 7f
++	movq eng_pm(%rip), %rsi
++	btq $63, %rsi
++	jnc 7f
++	movabsq $(1 << 55) - 1, %rax
++	andq %rax, %rsi
++	jz 7f					# a zero frame: never a DMA to physical 0
++	shlq $12, %rsi
++	movq %r15, %rax
++	andq $4095, %rax
++	orq %rax, %rsi				# the piece's card physical address
++	leaq (%r13,%r14), %rdi
++	pushq %rdx
++	call cdma_submit_phys
++	popq %rdx
++	testq %rax, %rax
++	jz 7f
++	movq %rax, %rbp
++	addq %rdx, %r14
++	jmp 2b
++6:	testq %rbp, %rbp
++	jz 5f					# nothing asked for
++	movq %rbp, %rdi
++	call cdma_wait
++	testl %eax, %eax
++	jz 8f
++5:	xorl %eax, %eax
++	jmp 9f
++7:	testq %rbp, %rbp
++	jz 8f
++	movq %rbp, %rdi
++	call cdma_wait
++8:	movl $-1, %eax
++9:	popq %rbp
++	popq %r15
++	popq %r14
++	popq %r13
++	popq %r12
++	popq %rbx
++	ret
++
++# pull_weights(dst rdi, len rsi, off rdx, mapping rcx): a matrix out of
++# the window into dst, the start of the mapping: by the engine into the
++# mapping's frames when it is on huge pages (engine_pull), through the
++# block device when it is not or when the engine did not carry it. The
++# first of each kind is said in the log. eax 0, or -1.
++pull_weights:
++	cmpq $0, MAP_HUGE(%rcx)
++	je 2f
++	pushq %rdi
++	pushq %rsi
++	pushq %rdx
++	call engine_pull
++	popq %rdx
++	popq %rsi
++	popq %rdi
++	testl %eax, %eax
++	jnz 2f
++	btsq $0, eng_said(%rip)
++	jc 1f
++	call l_begin
++	leaq s_eng_on(%rip), %rsi
++	call w_str
++	movl $1, %edi
++	call l_end
++1:	xorl %eax, %eax
++	ret
++2:	btsq $1, eng_said(%rip)
++	jc 3f
++	pushq %rdi
++	pushq %rsi
++	pushq %rdx
++	call l_begin
++	leaq s_eng_off(%rip), %rsi
++	call w_str
++	movl $1, %edi
++	call l_end
++	popq %rdx
++	popq %rsi
++	popq %rdi
++3:	jmp vpu_pull
++
+ # ctrl_read(dst rdi, src rsi, len rdx): a descriptor out of the control
+ # area in whole 64-byte vector loads (the area is uncached: every load is
+@@ -549,6 +770,7 @@ shape_ok:
  
  # ---- the float weight types: one weight row against one or four
 -# activation rows (phi_dot*, kernels.S), the sixteen partial sums added in
@@ -1772,7 +1952,7 @@ index 6451e1b..745959e 100644
 +# added on the vector unit (SUM16): nothing in the x87 unit ----
  
  # rows_slice(job rdi, slice esi, nslices edx): the pool's entry for one
-@@ -656,23 +712,6 @@ rows_slice:
+@@ -656,23 +878,6 @@ rows_slice:
  	jae 12f
  	shlq $6, %rcx
 -	leaq RS_OUT(%rbp,%rcx), %rax
@@ -1798,7 +1978,7 @@ index 6451e1b..745959e 100644
 +	# the tail: out[q] += av * b1[x] for x in k16 * 16 .. k
  	movq RS_C(%rbp), %rax
  	addq RS_Q(%rbp), %rax			# c + q
-@@ -681,4 +720,7 @@ rows_slice:
+@@ -681,4 +886,7 @@ rows_slice:
  	addq MJ_B(%rbx), %rsi			# b1
  	call tail_dot
 +	SUM16 rdi				# on the vector unit (rows.md, "The sums")
@@ -1806,14 +1986,14 @@ index 6451e1b..745959e 100644
 +	movl (%rdi), %ecx			# the float's four bytes
  	# d[(c + q) * m + i] = sum
  	movq RS_C(%rbp), %rax
-@@ -687,5 +729,5 @@ rows_slice:
+@@ -687,5 +895,5 @@ rows_slice:
  	addq %r15, %rax
  	movq MJ_D(%rbx), %rdx
 -	fstps (%rdx,%rax,4)
 +	movl %ecx, (%rdx,%rax,4)
  	incq RS_Q(%rbp)
  	jmp 7b
-@@ -715,30 +757,17 @@ rows_slice:
+@@ -715,30 +923,17 @@ rows_slice:
  213:	call phi_dot_bf16
  211:	popq %rsi
 -	leaq RS_OUT(%rbp), %rax
@@ -1852,7 +2032,7 @@ index 6451e1b..745959e 100644
 +	movl %ecx, (%rdx,%rax,4)
  	incq RS_C(%rbp)
  	jmp 20b
-@@ -754,41 +783,48 @@ rows_slice:
+@@ -754,41 +949,48 @@ rows_slice:
  	ret
  
 -# tail_dot: with the sum in st(0), add av * b1[x] for x in k16 * 16 .. k,
@@ -1934,7 +2114,15 @@ index 6451e1b..745959e 100644
 +9:	ret
  
  # rows_slice_id(job rdi, slice esi, nslices edx): a mixture with float
-@@ -1686,5 +1722,47 @@ vpu_matmul_run:
+@@ -1655,5 +1857,6 @@ vpu_matmul_run:
+ 	movq %r12, %rsi
+ 	movq MM_A_OFF(%rbx), %rdx
+-	call vpu_pull
++	leaq CE_MAP(%r13), %rcx
++	call pull_weights
+ 	testl %eax, %eax
+ 	jz 41f
+@@ -1686,5 +1889,47 @@ vpu_matmul_run:
  	jmp .Lok
  
 -5:	# MATMUL, MATMUL_ID, MATMUL_MORE
@@ -1983,7 +2171,15 @@ index 6451e1b..745959e 100644
 +59:	# MATMUL, MATMUL_ID, MATMUL_MORE
  	cmpq $0, MM_M(%rbx)
  	je .Lbad_said
-@@ -2327,8 +2405,19 @@ vpu_matmul_run:
+@@ -1771,5 +2016,6 @@ vpu_matmul_run:
+ 	movq %r12, %rsi
+ 	movq MM_A_OFF(%rbx), %rdx
+-	call vpu_pull
++	leaq g_a + BUF_MAP(%rip), %rcx
++	call pull_weights
+ 	testl %eax, %eax
+ 	jnz .Lpull
+@@ -2327,8 +2573,19 @@ vpu_matmul_run:
  	call now_ns
  	movq %rax, r_c0(%rip)
 +	# one matrix against one activation row and no mixture: every thread
@@ -2003,13 +2199,18 @@ index 6451e1b..745959e 100644
 +	movl $0, q40_prep_ok(%rip)
  	movq r_plive(%rip), %rcx
  	movl %eax, (%rcx)
-@@ -3244,4 +3333,6 @@ r_big:	.skip 8
+@@ -3244,6 +3501,11 @@ r_big:	.skip 8
  r_rounds:	.skip 8
  r_i:	.skip 8
 +	.globl stat_dma_push
 +stat_dma_push:	.skip 8			# result pushes carried by the DMA channel (push_data)
  
  	.section .rodata
++s_eng_pagemap:	.asciz "/proc/self/pagemap"
++s_eng_on:	.asciz "matmul: a matrix in the window comes by the card's DMA engine straight into its buffer's frames (no block device)"
++s_eng_off:	.asciz "matmul: a matrix in the window came through the block device (4 KiB pages, or the engine did not carry it)"
+ s_upload:	.asciz "matmul: upload id "
+ s_comma:	.asciz ", "
 diff --git a/card/vpu/matmul.inc b/card/vpu/matmul.inc
 index 70eb5ef..1a92cde 100644
 --- a/card/vpu/matmul.inc
@@ -2060,7 +2261,7 @@ index 70eb5ef..1a92cde 100644
  # The per-format kernel table (matmul.S, g_fmt): block bytes, then the
  # six kernels [b_type][1, 4, 8 rows].
 diff --git a/card/vpu/matmul.md b/card/vpu/matmul.md
-index 16dc0cd..01140c4 100644
+index 16dc0cd..8cd4aa3 100644
 --- a/card/vpu/matmul.md
 +++ b/card/vpu/matmul.md
 @@ -6,5 +6,6 @@ The card as a matrix-multiply engine for the ggml backend
@@ -2125,7 +2326,7 @@ index 16dc0cd..01140c4 100644
 +  one row and lie between the two.
  
  ## Gates
-@@ -100,2 +137,16 @@ the C worker's after the timing fields are stripped. Defects met on the
+@@ -100,2 +137,63 @@ the C worker's after the timing fields are stripped. Defects met on the
  way are in `rows.md`; the fused feed-forward's down projection is the one
  that was here (a matrix pointer read through a clobbered register).
 +
@@ -2142,6 +2343,53 @@ index 16dc0cd..01140c4 100644
 +blocks and the card's buffers keep `SLACK` past their data. Gated by
 +`phi-vpu matmul-check` on the 7120A (every format ok, mixtures, up to
 +four matrices, the fused feed-forward) with channel 7 up throughout.
++
++## Weights straight from host RAM (`engine_pull`, 2026-11-10)
++
++A matrix that arrives in the window (an upload, `K_UPLOAD`, or a multiply
++whose matrix is named by `a_off`, the streamed weights of the ggml
++backend) was read through the block device: `vpu_pull`, a `pread` that
++the card's kernel hands to the host daemon's DMA channels, so every
++matrix waited on host CPU time. `pull_weights` now tries the card's own
++channel first (`engine_pull`), and `vpu_pull` only when that does not
++carry it:
++
++| step | how |
++| --- | --- |
++| the destination | the buffer the matrix is multiplied from (`g_a`, or the cache entry's mapping), which `big_alloc` puts on huge pages when the card has them (`MAP_HUGE`); on 4 KiB pages the block device serves as before |
++| a piece | ends at a 2 MiB boundary of the destination (a huge page is one run of frames) or at a descriptor's 16383 lines (`ENG_PIECE`) |
++| its frame | the page is read once (a private huge page gets its frame at the first fault; a read, so no dirty line of a core lies under the engine's write), then one entry of `/proc/self/pagemap` (`eng_pm_fd`, opened at the first pull) |
++| the copy | `cdma_submit_phys(window offset, card physical address, bytes)` (`cdma.S`): the engine writes the window's bytes into the buffer's own frames; no core of the card copies, nothing of the host's takes part but its memory |
++| completion | the pieces are posted back to back (the ring holds 63) and the last is waited for (`cdma_wait`) |
++
++Any refusal (the channel down, an address or an offset that is not a
++whole line, no frame, a copy refused or not completed) answers -1 after
++the pieces in flight have landed, and the caller pulls through the block
++device. The first matrix of each kind is said once in the worker's log.
++The engine's writes are coherent with every core's cache (measured on a
++7120A: a buffer every thread had in its L2, refilled by the engine, read
++back with no stale word).
++
++Measured on card 0 (a 7120A):
++
++- `phi-vpu matmul-check --threads 114 --m 17408 --k 5120 --repeat 5`:
++  every one of its 15 format cases ok against the host reference, the
++  worker's log saying the matrices came by the engine and no line for
++  the block device. Every case uploads its matrices, so the check is a
++  check of the pulled bytes.
++- The streamed layout of the ggml backend (`PHI_GGML_STREAM=1`, a 27 B
++  Q4_0 model, 8.1 % of every matrix's rows pulled at every multiply,
++  12,352 requests a 64-token request, sampled from the host): the
++  card's pull time 27.780 s through the block device, 15.818 s by the
++  engine; its compute 1.847 and 1.852 s. Generation 1.559, 1.567, 1.536
++  tok/s before, 2.155, 2.203, 2.127 after. The host alone, the card left
++  out, gives 2.267 and 2.259: with nothing resident the same rows cross
++  the link at every token, and no transfer method removes that.
++- An upload of 10.49 GB of a 35 B Q8_0 model's rows: the server up 44 s
++  after its start, the uploads included.
++
++Not converted: the other `vpu_pull` sites (the fused feed-forward's
++descriptors, the mixture paths' small pulls), which move kilobytes.
 diff --git a/card/vpu/mvex.inc b/card/vpu/mvex.inc
 index ddd84e0..aea6059 100644
 --- a/card/vpu/mvex.inc
@@ -3549,7 +3797,7 @@ index a06d5a5..91a70c9 100644
 +card-backed pages. `phi_ggml_open` clears the word when it maps the window, since
 +a client killed between a request and its reply leaves it taken.
 diff --git a/host/asm/ggml-phi/backend.S b/host/asm/ggml-phi/backend.S
-index 9f25cff..5f70c2f 100644
+index 9f25cff..0956e43 100644
 --- a/host/asm/ggml-phi/backend.S
 +++ b/host/asm/ggml-phi/backend.S
 @@ -65,4 +65,6 @@ tg_only:	.skip 8			# PHI_GGML_TG_ONLY=K: a multiply of more than K tokens stays
@@ -3622,7 +3870,7 @@ index 9f25cff..5f70c2f 100644
 +85:	# whole experts
  	movl $0, place_any(%rip)
  	leaq e_experts(%rip), %rdi
-@@ -1968,4 +1994,50 @@ drop_pages:
+@@ -1968,4 +1994,101 @@ drop_pages:
  	ret
  
 +
@@ -3631,7 +3879,7 @@ index 9f25cff..5f70c2f 100644
 +# process has one (tridma_back, an LD_PRELOAD library: the pages then come
 +# back from the card by K_DOWNLOAD on a fault, not from the disk), else
 +# given to MADV_PAGEOUT as before (drop_pages); the bytes in rax
-+# (2026-11-06). A mixture's experts always go to drop_pages.
++# (2026-11-06). A mixture's whole experts go through back_whole.
 +	.globl back_or_drop
 +back_or_drop:
 +	pushq %rbx
@@ -3671,9 +3919,60 @@ index 9f25cff..5f70c2f 100644
 +	popq %rbx
 +	ret
 +
++# back_whole(addr rdi, len rsi, id rdx, a_off rcx, card r8): one whole
++# expert of a mixture, uploaded as bytes a_off.. of the card's slice id,
++# handed to the DMA router as back_or_drop hands a dense matrix's rows
++# (2026-11-10): a prompt computed on a GPU then reads the expert from the
++# card by K_DOWNLOAD, where its dropped pages came back from the disk.
++# The router speaks to the first card only, so an expert another card
++# holds, and every expert when the process has no router, goes to
++# drop_pages. The bytes in rax.
++	.globl back_whole
++back_whole:
++	pushq %rbx
++	pushq %r12
++	pushq %r13
++	pushq %r14
++	subq $8, %rsp
++	movq %rdi, %rbx
++	movq %rsi, %r12
++	movq %rdx, %r13
++	movq %rcx, %r14
++	testq %r8, %r8
++	jnz 8f
++	cmpl $0, tb_tried(%rip)
++	jne 1f
++	movl $1, tb_tried(%rip)
++	xorl %edi, %edi				# RTLD_DEFAULT
++	leaq s_tridma_back(%rip), %rsi
++	call dlsym@PLT
++	movq %rax, tb_fn(%rip)
++1:	cmpq $0, tb_fn(%rip)
++	je 8f
++	xorl %edi, %edi
++	call card_at				# the first card
++	movq CD_BASE(%rax), %r8
++	movl CD_THREADS(%rax), %r9d
++	movq %rbx, %rdi
++	movq %r12, %rsi
++	movq %r13, %rdx
++	movq %r14, %rcx
++	call *tb_fn(%rip)
++	testq %rax, %rax
++	jnz 9f
++8:	movq %rbx, %rdi
++	movq %r12, %rsi
++	call drop_pages
++9:	addq $8, %rsp
++	popq %r14
++	popq %r13
++	popq %r12
++	popq %rbx
++	ret
++
  # ---- the host taking everything ----
  
-@@ -3125,5 +3197,42 @@ upload_area:
+@@ -3125,5 +3248,42 @@ upload_area:
  	movq %rdi, %rbx
  	movq %rsi, %r12
 -	call mm_clear
@@ -3717,7 +4016,7 @@ index 9f25cff..5f70c2f 100644
 +5:	call mm_clear
  	movq CD_NEXT_ID(%rbx), %r13
  	leaq mm_buf(%rip), %rax
-@@ -3386,5 +3495,6 @@ plan:
+@@ -3386,5 +3546,6 @@ plan:
  	subq SP_R0(%rbx), %rsi
  	imulq pa_nb_a(%rip), %rsi
 -	call drop_pages
@@ -3725,7 +4024,19 @@ index 9f25cff..5f70c2f 100644
 +	call back_or_drop
  	addq %rax, %r14
  	incq -88(%rbp)
-@@ -4632,5 +4742,9 @@ issue:
+@@ -3681,5 +3842,10 @@ plan_whole:
+ 	addq pa_a(%rip), %rdi
+ 	movq -48(%rbp), %rsi
+-	call drop_pages
++	movsbq WH_CARD_OF(%r13,%r15), %rax	# the card that holds it
++	movq SP_ID(%rbx,%rax,8), %rdx		# that card's slice
++	movl WH_LOCAL(%r13,%r15,4), %ecx
++	imulq -48(%rbp), %rcx			# the expert's place in it
++	movq %rax, %r8
++	call back_whole
+ 	addq %rax, %r14
+ 811:	incq %r15
+@@ -4632,5 +4798,9 @@ issue:
  	movq RDW_CI(%r15), %rcx
  	movq SP_ID(%rax,%rcx,8), %rax
 -	movq %rax, MM_A_ID(%rdi)
@@ -3736,7 +4047,7 @@ index 9f25cff..5f70c2f 100644
 +1:	movq %rax, MM_A_ID(%rdi)
  	movl RD_A_TYPE(%rbx), %eax
  	movl %eax, MM_A_TYPE(%rdi)
-@@ -4901,5 +5015,9 @@ work_max:
+@@ -4901,5 +5071,9 @@ work_max:
  	.globl phi_ggml_begin_id_pair
  phi_ggml_begin_id_pair:
 -	pushq %rbp
@@ -3747,20 +4058,20 @@ index 9f25cff..5f70c2f 100644
 +1:	pushq %rbp
  	movq %rsp, %rbp
  	pushq %rbx
-@@ -5657,4 +5775,5 @@ phi_ggml_free_all:
+@@ -5657,4 +5831,5 @@ phi_ggml_free_all:
  	movq $0, CD_UPLOADED(%rbx)
  	movl $0, CD_FULL(%rbx)
 +	movq $0, CD_STREAM_AT(%rbx)		# the streamed weights' places, forgotten with the splits
  	incl %r12d
  	jmp 1b
-@@ -5669,4 +5788,4 @@ phi_ggml_free_all:
+@@ -5669,4 +5844,4 @@ phi_ggml_free_all:
  	.section .data.rel.ro,"aw"
  	.balign 8
 -type_names:	.quad t_f32, t_f16, t_q4k, t_q5k, t_q6k, t_q80, t_iq4xs, t_bf16
 +type_names:	.quad t_f32, t_f16, t_q4k, t_q5k, t_q6k, t_q80, t_iq4xs, t_bf16, t_q40
  status_names:	.quad st_ok, st_alloc, st_pull, st_push, st_request, st_kernel
 diff --git a/host/asm/ggml-phi/backend.md b/host/asm/ggml-phi/backend.md
-index 41e6344..e8786c0 100644
+index 41e6344..ae1cc5a 100644
 --- a/host/asm/ggml-phi/backend.md
 +++ b/host/asm/ggml-phi/backend.md
 @@ -126,4 +126,20 @@ ends) take them from named static blocks (`pr_*`, `pa_*`, `q_*`,
@@ -3784,7 +4095,7 @@ index 41e6344..e8786c0 100644
 +
  ## Limits, said when reached
  
-@@ -156,2 +172,37 @@ backend. The backend loaded with no tensor allowed on a card
+@@ -156,2 +172,56 @@ backend. The backend loaded with no tensor allowed on a card
  the CPU alone's 7.76 and 7.92, interleaved: the hand-offs, not the
  cards, cost about 30 ms a token (`docs/results/2026-10-07-rack-generation.md`).
 +
@@ -3796,10 +4107,26 @@ index 41e6344..e8786c0 100644
 +(`imports.list` has `dlsym`; ggml loads this library `RTLD_LOCAL`, so the router
 +is an `LD_PRELOAD` library and this side passes it the window base and the thread
 +count). When the process has it, the range goes to the router, which backs those
-+pages with the card (`VPU_K_DOWNLOAD` on a fault) instead of the disk; else, and
-+always for a mixture's experts, the pages go to `MADV_PAGEOUT` as before
++pages with the card (`VPU_K_DOWNLOAD` on a fault) instead of the disk; else the
++pages go to `MADV_PAGEOUT` as before
 +(`drop_pages`). `phi_ggml_open` also clears the window's doorbell lock
 +(`OFF_LOCK`, see `../common/window.md`) when it maps a card.
++
++A mixture's whole experts go the same way since 2026-11-10 (`back_whole`,
++called for every expert a card holds where `plan_whole` dropped its pages):
++the range is the expert's matrix in the mapped file, the id the holding
++card's slice (`SP_ID`), the card byte the expert's place in that slice
++(`WH_LOCAL` times the expert's bytes). The router speaks to the first card
++only: an expert another card holds, and every expert when the process has no
++router, is dropped as before. Until then the experts were always dropped, so a
++prompt computed on a GPU read every card-held expert back from the disk.
++Measured on a 35 B Q6_K model, a 7120A holding every dense row and 109 whole
++experts of each layer's 256 (12.92 GB), a 1,410-token prompt on an RTX 3090 Ti:
++83.4 tok/s with the experts read from the disk, 358.0 with them from the card
++(13,191 ranges card-backed; with `TRIDMA_VERIFY=4`, 225.4 tok/s and 12,008 chunks equal to
++the file, 0 differing); the first generated token's log-probabilities are the
++same to the last digit either way; the disk read during a 220-token generation fell
++from 1,836 to 437 MiB.
 +
 +## Streamed weights (`PHI_GGML_STREAM`, 2026-11-06)
 +
@@ -3814,7 +4141,10 @@ index 41e6344..e8786c0 100644
 +(`card/vpu/vpu_matmul.h`: "with a cached (a_id) or in the window
 +(a_off)"; `matmul.S` grows `g_a` and pulls `m * nb_a` bytes through
 +`vpu_pull`, the block device whose DMA is the stack's host channels,
-+3.58 GB/s measured on the desktop link, then computes). A slice that
++3.58 GB/s measured on the desktop link, then computes; since 2026-11-10
++the worker pulls it with its own DMA engine straight into the buffer's
++frames when the buffer is on huge pages, `card/vpu/matmul.md`,
++"Weights straight from host RAM"). A slice that
 +does not fit what is left of the window stays with the host
 +(`stream: the window is full; ...`). Pairs (`phi_ggml_begin_id_pair`
 +answers -2) and the fused feed-forward (`ffn_enabled` in `glue.S`) are
@@ -3846,34 +4176,73 @@ index 1f163eb..f55efc3 100644
    id on the card) lives in the split instead, `SP_ID[ci]`, which is the
    same map keyed the same way.
 diff --git a/host/asm/ggml-phi/ggml_layout.inc b/host/asm/ggml-phi/ggml_layout.inc
-index e6cea99..dd20946 100644
+index e6cea99..67ca3bf 100644
 --- a/host/asm/ggml-phi/ggml_layout.inc
 +++ b/host/asm/ggml-phi/ggml_layout.inc
-@@ -20,5 +20,5 @@
+@@ -20,5 +20,11 @@
  	.set CG_N_NODES, 4
  	.set CG_NODES, 16
 -	.set BUF_BUFT, 88
++	.set CG_BYTES, 96
++	.set CG_SIZE, 0
++	.set CG_N_LEAFS, 8
++	.set CG_GRADS, 24
++	.set CG_GRAD_ACCS, 32
++	.set CG_LEAFS, 40
 +	.set BUF_BUFT, 112
  	.set REG_BYTES, 48
  	.set REG_API_VERSION, 0
-@@ -79,4 +79,5 @@
+@@ -79,4 +85,5 @@
  	.set GGML_TYPE_F32, 0
  	.set GGML_TYPE_F16, 1
 +	.set GGML_TYPE_Q4_0, 2
  	.set GGML_TYPE_Q8_0, 8
  	.set GGML_TYPE_Q4_K, 12
-@@ -93,5 +94,5 @@
+@@ -93,5 +100,27 @@
  	.set GGML_OP_MUL_MAT, 29
  	.set GGML_OP_MUL_MAT_ID, 30
 -	.set GGML_OP_GLU, 100
 +	.set GGML_OP_GLU, 101
++	.set GGML_OP_ADD, 2
++	.set GGML_OP_SUB, 6
++	.set GGML_OP_MUL, 7
++	.set GGML_OP_DIV, 8
++	.set GGML_OP_SQR, 9
++	.set GGML_OP_SQRT, 10
++	.set GGML_OP_SCALE, 32
++	.set GGML_OP_NORM, 24
++	.set GGML_OP_RMS_NORM, 25
++	.set GGML_OP_L2_NORM, 28
++	.set GGML_OP_SOFT_MAX, 46
++	.set GGML_OP_ARGSORT, 69
++	.set GGML_OP_TOP_K, 70
++	.set GGML_OP_SUM_ROWS, 15
++	.set GGML_OP_CONCAT, 22
++	.set GGML_OP_REPEAT, 20
++	.set GGML_OP_GET_ROWS, 40
++	.set GGML_OP_CONT, 35
++	.set GGML_OP_CPY, 34
++	.set GGML_OP_UNARY, 92
++	.set GGML_OP_CLAMP, 50
++	.set GGML_OP_ROPE, 48
  	.set GGML_GLU_OP_SWIGLU, 2
  	.set GGML_TENSOR_FLAG_OUTPUT, 2
+diff --git a/host/asm/ggml-phi/ggml_layout.md b/host/asm/ggml-phi/ggml_layout.md
+index 51402de..e429a8c 100644
+--- a/host/asm/ggml-phi/ggml_layout.md
++++ b/host/asm/ggml-phi/ggml_layout.md
+@@ -21,5 +21,5 @@ built a library llama.phi would not load).
+ | --- | --- |
+ | `struct ggml_tensor` | `T_BYTES`, `T_TYPE`, `T_BUFFER`, `T_NE`, `T_NB`, `T_OP`, `T_OP_PARAMS`, `T_FLAGS`, `T_SRC`, `T_VIEW_SRC`, `T_DATA`, `T_NAME`, `GGML_MAX_SRC` |
+-| `struct ggml_cgraph` | `CG_N_NODES`, `CG_NODES` |
++| `struct ggml_cgraph` | `CG_N_NODES`, `CG_NODES`; its size and `CG_SIZE`, `CG_N_LEAFS`, `CG_GRADS`, `CG_GRAD_ACCS`, `CG_LEAFS` for the view `host_run` makes (`glue.md`, "Small operations on the host") |
+ | buffers | `BUF_BUFT` |
+ | `struct ggml_backend_reg` and its interface | `REG_BYTES`, `REG_API_VERSION`, `REG_IFACE`, `REG_CONTEXT`; `REG_I_BYTES` and the slots `REG_I_GET_NAME`, `REG_I_GET_DEVICE_COUNT`, `REG_I_GET_DEVICE`, `REG_I_GET_PROC_ADDRESS` |
 diff --git a/host/asm/ggml-phi/glue.S b/host/asm/ggml-phi/glue.S
-index 96cc2b9..f4bf77a 100644
+index 96cc2b9..0d64521 100644
 --- a/host/asm/ggml-phi/glue.S
 +++ b/host/asm/ggml-phi/glue.S
-@@ -20,4 +20,20 @@
+@@ -20,4 +20,63 @@
  	.set BE_SLOTS, 8
  
 +# A multiply issued ahead of its node (PHI_GGML_AHEAD, glue.md): what
@@ -3892,14 +4261,58 @@ index 96cc2b9..f4bf77a 100644
 +	.set AH_COPY_MAX, 1048576
 +	.set AH_DRAIN_MAX, 8388608
 +
++# The timeline (PHI_GGML_TIME, glue.md): where a generation's time goes,
++# seen from this backend. TM adds the time since the last mark to a slot
++# and keeps every register; it sits right after a call or before one,
++# where no flag is live.
++	.set TM_OUT, 0				# outside the backend: the scheduler, the other backends, the copies between them
++	.set TM_ISSUE, 1			# a request begun: the activations to the window, the descriptor, the doorbell
++	.set TM_HOST, 2				# the host's rows
++	.set TM_END, 3				# the wait for the cards, their rows gathered
++	.set TM_REST, 4				# the rest inside: the scan, a drain, the bookkeeping
++	.set TM_LONG, 5				# outside gaps over TM_LONG_NS: between requests, a prompt on a GPU
++	.set TM_AHEAD, 6			# a multiply issued ahead: its activations kept, the request begun
++	.set TM_HOSTOPS, 7			# small operations run on the host's cores (PHI_GGML_HOSTOPS)
++	.set TM_SLOTS, 8
++	.set TM_LONG_NS, 20000000
++	.set TM_EVERY, 8192			# sub-graphs between two lines
++
++# The small operations of a generation step (PHI_GGML_HOSTOPS, glue.md): a
++# tensor qualifies when no dimension past the first is over HOSTOP_DIM (a
++# prompt's tensors carry their tokens there) and it has at most
++# HOSTOP_ELEMS elements.
++	.set HOSTOP_DIM, 31
++	.set HOSTOP_ELEMS, 1048576
++
++	.macro TM slot
++	cmpl $0, time_on(%rip)
++	jle .Ltm\@
++	pushq $\slot
++	call tm_mark
++.Ltm\@:
++	.endm
++
++# TM_SAY str, slot: the words, then the slot in microseconds.
++	.macro TM_SAY str, slot
++	leaq \str(%rip), %rsi
++	call w_str
++	movq tm_acc + 8 * \slot(%rip), %rax
++	xorl %edx, %edx
++	movl $1000, %ecx
++	divq %rcx
++	movq %rax, %rdi
++	call w_dec
++	.endm
++
  	.bss
  	.balign 64
-@@ -28,4 +44,17 @@ ffn_on:	.skip 4				# -1 unasked, 0, 1
+@@ -28,4 +87,23 @@ ffn_on:	.skip 4				# -1 unasked, 0, 1
  graph_left:	.skip 4			# PHI_GGML_GRAPH sub-graphs still to dump (-1 unasked)
  verbose_on:	.skip 4			# -1 unasked
 +ahead_on:	.skip 4			# PHI_GGML_AHEAD: -1 unasked, 0, 1
 +	.balign 8
 +ah_prev:	.skip 8			# the weight of the multiply before this one
++ah_first:	.skip 8			# the weight of the first multiply this backend ran: the one a pass begins with
 +ah_valid:	.skip 8			# a multiply is issued ahead of its node
 +ah_a:	.skip 8				# its weight
 +ah_x:	.skip 8				# its activations
@@ -3910,9 +4323,14 @@ index 96cc2b9..f4bf77a 100644
 +ah_bytes:	.skip 8			# of the activations kept in ah_copy
 +ah_taken:	.skip 8			# multiplies that were with the cards before their node
 +ah_dropped:	.skip 8			# begun ahead, and not what came
++tm_prev:	.skip 8			# the last mark, ns
++tm_graphs:	.skip 8			# sub-graphs computed
++tm_acc:		.skip 8 * TM_SLOTS	# ns by slot
++time_on:	.skip 4			# PHI_GGML_TIME: -1 unasked, 0, 1
++hostops_on:	.skip 4			# PHI_GGML_HOSTOPS: -1 unasked, 0, 1
  	.balign 64
  phi_reg:	.skip REG_BYTES
-@@ -51,4 +80,10 @@ ranges:	.skip 34 * 16			# the host's ranges of a block or a pair
+@@ -51,4 +129,10 @@ ranges:	.skip 34 * 16			# the host's ranges of a block or a pair
  which:	.skip 34 * 4
  ffn_args:	.skip FA_BYTES
 +	.balign 64
@@ -3923,7 +4341,7 @@ index 96cc2b9..f4bf77a 100644
 +ah_drain:	.skip AH_DRAIN_MAX		# where the results of one nothing asked for go
  
  	.section .rodata
-@@ -68,4 +103,10 @@ e_offload:	.asciz "PHI_GGML_OFFLOAD"
+@@ -68,4 +152,22 @@ e_offload:	.asciz "PHI_GGML_OFFLOAD"
  e_graph:	.asciz "PHI_GGML_GRAPH"
  e_verbose:	.asciz "PHI_GGML_VERBOSE"
 +e_ahead:	.asciz "PHI_GGML_AHEAD"
@@ -3932,9 +4350,21 @@ index 96cc2b9..f4bf77a 100644
 +s_ah1:	.asciz "ahead: "
 +s_ah2:	.asciz " multiplies were with the cards before their node arrived, "
 +s_ah3:	.asciz " begun ahead were not what came"
++e_time:	.asciz "PHI_GGML_TIME"
++s_tm0:	.asciz "time: "
++s_tm1:	.asciz " sub-graphs; us outside "
++s_tm2:	.asciz ", issue "
++s_tm3:	.asciz ", host rows "
++s_tm4:	.asciz ", end "
++s_tm5:	.asciz ", rest "
++s_tm6:	.asciz ", issued ahead "
++s_tm7:	.asciz "; outside gaps over 20 ms "
++s_tm8:	.asciz ", host ops "
++e_hostops:	.asciz "PHI_GGML_HOSTOPS"
++s_hostops_on:	.asciz "the small operations of a generation step run on the host's cores, in the sub-graph of the multiply before them (PHI_GGML_HOSTOPS)"
  s_no_cpu:	.asciz "no CPU device registered"
  s_no_cpu_init:	.asciz "the CPU backend would not initialise"
-@@ -116,6 +157,10 @@ card_type:
+@@ -116,6 +218,10 @@ card_type:
  	cmpl $GGML_TYPE_BF16, %edi
  	je 17f
 +	cmpl $GGML_TYPE_Q4_0, %edi
@@ -3945,7 +4375,7 @@ index 96cc2b9..f4bf77a 100644
 +	ret
  10:	movl $MM_F32, %eax
  	ret
-@@ -199,5 +244,9 @@ weight_readable:
+@@ -199,5 +305,9 @@ weight_readable:
  # ffn_enabled: PHI_GGML_FFN=1, off under PHI_GGML_OFFLOAD (said once).
  ffn_enabled:
 -	cmpl $-1, ffn_on(%rip)
@@ -3956,7 +4386,7 @@ index 96cc2b9..f4bf77a 100644
 +8:	cmpl $-1, ffn_on(%rip)
  	jne 9f
  	pushq %rbx
-@@ -1691,6 +1740,110 @@ find_quad:
+@@ -1691,6 +1801,329 @@ find_quad:
  	ret
  
 +# ahead_enabled: PHI_GGML_AHEAD=1 under PHI_GGML_OFFLOAD (asked once,
@@ -3987,6 +4417,225 @@ index 96cc2b9..f4bf77a 100644
 +	popq %rbx
 +9:	movl ahead_on(%rip), %eax
 +	ret
++
++# hostops_enabled: PHI_GGML_HOSTOPS=1 (asked once, said once); eax.
++hostops_enabled:
++	cmpl $-1, hostops_on(%rip)
++	jne 9f
++	subq $8, %rsp
++	leaq e_hostops(%rip), %rdi
++	xorl %esi, %esi
++	call env_u64
++	testl %eax, %eax
++	setnz %al
++	movzbl %al, %eax
++	movl %eax, hostops_on(%rip)
++	testl %eax, %eax
++	jz 1f
++	leaq s_hostops_on(%rip), %rsi
++	call say
++1:	addq $8, %rsp
++9:	movl hostops_on(%rip), %eax
++	ret
++
++# host_op(edi op): 1 for an operation the host's cores take off a GPU at
++# a generation step: arithmetic by element, the norms, the routing of a
++# mixture (soft max, top k, the rows gathered, their sum), copies.
++host_op:
++	.irp op, ADD, SUB, MUL, DIV, SQR, SQRT, SCALE, NORM, RMS_NORM, L2_NORM, SOFT_MAX, ARGSORT, TOP_K, SUM_ROWS, CONCAT, REPEAT, GET_ROWS, CONT, CPY, UNARY, CLAMP, ROPE, GLU, MUL_MAT
++	cmpl $GGML_OP_\op, %edi
++	je 1f
++	.endr
++	xorl %eax, %eax
++	ret
++1:	movl $1, %eax
++	ret
++
++# supports_hostop(rdi node): under PHI_GGML_HOSTOPS, an operation of
++# host_op whose result is a generation step's: no dimension past the
++# first over HOSTOP_DIM, at most HOSTOP_ELEMS elements. eax.
++supports_hostop:
++	pushq %rbx
++	movq %rdi, %rbx
++	call hostops_enabled
++	testl %eax, %eax
++	jz 9f
++	movl T_OP(%rbx), %edi
++	call host_op
++	testl %eax, %eax
++	jz 9f
++	xorl %eax, %eax
++	movq T_NE(%rbx), %rcx
++	.irp d, 8, 16, 24
++	movq T_NE+\d(%rbx), %rdx
++	cmpq $HOSTOP_DIM, %rdx
++	ja 9f
++	imulq %rdx, %rcx
++	.endr
++	cmpq $HOSTOP_ELEMS, %rcx
++	ja 9f
++	movl $1, %eax
++9:	popq %rbx
++	ret
++
++# host_run(rdi graph, esi i, edx n): the nodes from i up to the next
++# multiply, GLU or node with a role, computed on the private CPU backend
++# as one view of the graph (what ggml_graph_view makes: the same arrays,
++# the nodes from i, no leafs, no gradients); eax the last node it took,
++# or -1.
++host_run:
++	pushq %rbp
++	movq %rsp, %rbp
++	pushq %rbx
++	pushq %r12
++	pushq %r13
++	pushq %r14
++	subq $128, %rsp				# the view (CG_BYTES) at (%rsp)
++	.if CG_BYTES > 128
++	.error "host_run: the view does not fit its frame"
++	.endif
++	movq %rdi, %rbx
++	movl %esi, %r12d
++	movl %edx, %r13d
++	leal 1(%r12), %r14d			# j
++1:	cmpl %r13d, %r14d
++	jge 3f
++	movslq %r14d, %rcx
++	leaq role(%rip), %rax
++	cmpb $0, (%rax,%rcx)
++	jne 3f
++	movq CG_NODES(%rbx), %rax
++	movq (%rax,%rcx,8), %rdx
++	movl T_OP(%rdx), %eax
++	cmpl $GGML_OP_MUL_MAT_ID, %eax
++	je 3f
++	cmpl $GGML_OP_MUL_MAT, %eax
++	jne 2f
++	movq %rdx, %rdi
++	call supports_mul_mat
++	testl %eax, %eax
++	jnz 3f
++2:
++	incl %r14d
++	jmp 1b
++3:	movq %rsp, %rdi
++	movq %rbx, %rsi
++	movl $CG_BYTES, %edx
++	call mem_copy
++	movl $0, CG_SIZE(%rsp)
++	movl %r14d, %eax
++	subl %r12d, %eax
++	movl %eax, CG_N_NODES(%rsp)
++	movl $0, CG_N_LEAFS(%rsp)
++	movq CG_NODES(%rbx), %rax
++	movslq %r12d, %rcx
++	leaq (%rax,%rcx,8), %rax
++	movq %rax, CG_NODES(%rsp)
++	movq $0, CG_GRADS(%rsp)
++	movq $0, CG_GRAD_ACCS(%rsp)
++	movq $0, CG_LEAFS(%rsp)
++	TM TM_REST
++	movq g_cpu(%rip), %rdi
++	movq %rsp, %rsi
++	call ggml_backend_graph_compute@PLT
++	TM TM_HOSTOPS
++	testl %eax, %eax
++	jnz 8f
++	leal -1(%r14), %eax
++	jmp 9f
++8:	movl $-1, %eax
++9:	leaq -32(%rbp), %rsp
++	popq %r14
++	popq %r13
++	popq %r12
++	popq %rbx
++	popq %rbp
++	ret
++
++# time_enabled: PHI_GGML_TIME=1 (asked once); eax.
++time_enabled:
++	cmpl $-1, time_on(%rip)
++	jne 9f
++	leaq e_time(%rip), %rdi
++	xorl %esi, %esi
++	call env_u64
++	testl %eax, %eax
++	setnz %al
++	movzbl %al, %eax
++	movl %eax, time_on(%rip)
++9:	movl time_on(%rip), %eax
++	ret
++
++# tm_mark: the time since the last mark added to the slot pushed by the
++# caller (TM), which this removes. Keeps every register.
++tm_mark:
++	pushq %rax
++	pushq %rcx
++	pushq %rdx
++	pushq %rsi
++	pushq %rdi
++	pushq %r11
++	call now_ns
++	movq %rax, %rcx
++	subq tm_prev(%rip), %rcx
++	movq %rax, tm_prev(%rip)
++	movq 56(%rsp), %rdx			# the slot: past six registers and the return address
++	leaq tm_acc(%rip), %rsi
++	addq %rcx, (%rsi,%rdx,8)
++	popq %r11
++	popq %rdi
++	popq %rsi
++	popq %rdx
++	popq %rcx
++	popq %rax
++	ret $8
++
++# tm_enter: a sub-graph arrives: the time since the last one left is the
++# outside's, or a long gap's. Clobbers rax, rcx, rdx, rsi, rdi, r11.
++tm_enter:
++	call time_enabled
++	testl %eax, %eax
++	jz 9f
++	call now_ns
++	movq %rax, %rcx
++	subq tm_prev(%rip), %rcx
++	movq %rax, tm_prev(%rip)
++	movl $TM_OUT, %edx
++	cmpq $TM_LONG_NS, %rcx
++	jbe 1f
++	movl $TM_LONG, %edx
++1:	leaq tm_acc(%rip), %rsi
++	addq %rcx, (%rsi,%rdx,8)
++9:	ret
++
++# tm_leave: a sub-graph is done: the rest inside closed, and a line every
++# TM_EVERY sub-graphs (the sums since the start, in microseconds). Keeps
++# rax.
++tm_leave:
++	cmpl $0, time_on(%rip)
++	jle 9f
++	pushq %rax
++	TM TM_REST
++	incq tm_graphs(%rip)
++	movq tm_graphs(%rip), %rax
++	testq $TM_EVERY - 1, %rax
++	jnz 8f
++	call say_begin
++	leaq s_tm0(%rip), %rsi
++	call w_str
++	movq tm_graphs(%rip), %rdi
++	call w_dec
++	TM_SAY s_tm1, TM_OUT
++	TM_SAY s_tm2, TM_ISSUE
++	TM_SAY s_tm3, TM_HOST
++	TM_SAY s_tm4, TM_END
++	TM_SAY s_tm5, TM_REST
++	TM_SAY s_tm6, TM_AHEAD
++	TM_SAY s_tm8, TM_HOSTOPS
++	TM_SAY s_tm7, TM_LONG
++	call l_end
++8:	popq %rax
++9:	ret
 +
 +# ah_slot(rdi weight): its entry of ah_succ in rax: the one that has it
 +# for a key, else the first empty one of eight from its place, else its
@@ -4067,7 +4716,7 @@ index 96cc2b9..f4bf77a 100644
 +# are dropped (ahead_drain) and the node runs as it always did.
  run_mul_mat:
  	pushq %rbp
-@@ -1710,5 +1863,65 @@ run_mul_mat:
+@@ -1710,5 +2143,70 @@ run_mul_mat:
  	movl T_TYPE(%r12), %edi
  	call card_type
 -	movl %eax, %esi
@@ -4075,6 +4724,11 @@ index 96cc2b9..f4bf77a 100644
 +	call ahead_enabled
 +	testl %eax, %eax
 +	jz 20f
++	cmpq $0, ah_first(%rip)
++	jne 101f
++	movq T_DATA(%r12), %rax
++	movq %rax, ah_first(%rip)
++101:
 +	# this multiply follows the last one: remembered under that one's weight
 +	movq ah_prev(%rip), %rdi
 +	testq %rdi, %rdi
@@ -4134,14 +4788,26 @@ index 96cc2b9..f4bf77a 100644
 +20:	movl -64(%rbp), %esi
  	movq T_DATA(%r12), %rdi
  	movq T_NE+8(%r12), %rdx
-@@ -1728,5 +1941,5 @@ run_mul_mat:
+@@ -1723,10 +2221,12 @@ run_mul_mat:
+ 	movq T_NB+8(%r13), %rax
+ 	movq %rax, 16(%rsp)
++	TM 4
+ 	call phi_ggml_begin
++	TM 1
+ 	addq $32, %rsp
+ 	testq %rax, %rax
  	js 9f
  	movq %rax, %r15				# nr
 -	xorl %r14d, %r14d			# r
 +21:	xorl %r14d, %r14d			# r
  1:	cmpq %r15, %r14
  	jge 3f
-@@ -1752,5 +1965,63 @@ run_mul_mat:
+@@ -1749,8 +2249,75 @@ run_mul_mat:
+ 3:	movq T_DATA(%rbx), %rdi
+ 	movq T_NB+8(%rbx), %rsi
++	TM 2
+ 	call phi_ggml_end
++	TM 3
  	testl %eax, %eax
  	jnz 9f
 -	xorl %eax, %eax
@@ -4160,6 +4826,12 @@ index 96cc2b9..f4bf77a 100644
 +	cmpq %rcx, AH_X(%rax)
 +	jne 30f
 +	movq %rax, %r14				# the entry
++	# never the multiply a pass begins with: its node comes with the next
++	# pass only, and until then the request would hold the window (a DMA
++	# router in the same process could not fetch a prompt's weights)
++	movq AH_A(%r14), %rcx
++	cmpq ah_first(%rip), %rcx
++	je 30f
 +	movq T_NE+8(%r13), %rax			# the activations' bytes: n * nb_b, kept for the check
 +	imulq T_NB+8(%r13), %rax
 +	cmpq $AH_COPY_MAX, %rax
@@ -4188,6 +4860,7 @@ index 96cc2b9..f4bf77a 100644
 +	movq T_NB+8(%r13), %rax
 +	movq %rax, 16(%rsp)
 +	call phi_ggml_begin
++	TM 6
 +	addq $32, %rsp
 +	testq %rax, %rax
 +	js 30f					# refused: nothing is with the cards
@@ -4206,32 +4879,162 @@ index 96cc2b9..f4bf77a 100644
 +30:	xorl %eax, %eax
  	jmp 99f
  9:	movl $-1, %eax
-@@ -1778,4 +2049,5 @@ run_ffn:
+@@ -1778,4 +2345,5 @@ run_ffn:
  	movq %rdi, %rbx
  	movq %rsi, %r12
 +	call ahead_drain			# nothing issued ahead stays with the cards
  	movslq Q_GATE(%r12), %rax
  	movq (%rbx,%rax,8), %r13		# gate
-@@ -2039,4 +2311,5 @@ run_id_pair:
+@@ -2039,4 +2607,5 @@ run_id_pair:
  	movq %rdi, %rbx				# x
  	movq %rsi, %r12				# y
 +	call ahead_drain			# nothing issued ahead stays with the cards
  	movq T_SRC(%rbx), %r13			# w1
  	movq T_SRC(%r12), %r14			# w2
-@@ -2173,4 +2446,5 @@ run_mul_mat_id:
+@@ -2092,5 +2661,7 @@ run_id_pair:
+ 	movq T_NE+8(%r13), %r8
+ 	movq T_NE(%r13), %r9
++	TM 4
+ 	call phi_ggml_begin_id_pair
++	TM 1
+ 	addq $112, %rsp
+ 	cmpq $-2, %rax
+@@ -2137,4 +2708,5 @@ run_id_pair:
+ 	movl -76(%rbp), %ecx
+ 	call host_rows_id_pair
++	TM 2
+ 	testl %eax, %eax
+ 	jnz 9f
+@@ -2146,4 +2718,5 @@ run_id_pair:
+ 	movq T_NB+16(%r12), %r9
+ 	call phi_ggml_end_id_pair
++	TM 3
+ 	testl %eax, %eax
+ 	jnz 9f
+@@ -2173,4 +2746,5 @@ run_mul_mat_id:
  	subq $56, %rsp
  	movq %rdi, %rbx
 +	call ahead_drain			# nothing issued ahead stays with the cards
  	movq T_SRC(%rbx), %r12			# src0
  	movq T_SRC+8(%rbx), %r13		# src1
-@@ -2719,4 +2993,5 @@ ggml_backend_phi_reg:
+@@ -2216,5 +2790,7 @@ run_mul_mat_id:
+ 	movq T_NB+8(%r12), %r8
+ 	movl -48(%rbp), %r9d
++	TM 4
+ 	call phi_ggml_begin_id
++	TM 1
+ 	addq $96, %rsp
+ 	testq %rax, %rax
+@@ -2243,5 +2819,7 @@ run_mul_mat_id:
+ 	movq T_NB+8(%rbx), %rsi
+ 	movq T_NB+16(%rbx), %rdx
++	TM 2
+ 	call phi_ggml_end_id
++	TM 3
+ 	testl %eax, %eax
+ 	jnz 9f
+@@ -2349,4 +2927,5 @@ phi_graph_compute:
+ 	subq $40, %rsp
+ 	movq %rsi, %rbx				# graph
++	call tm_enter
+ 	movq %rbx, %rdi
+ 	call dump_graph
+@@ -2414,9 +2993,25 @@ phi_graph_compute:
+ 	je 52f
+ 	cmpl $GGML_OP_GLU, %eax
+-	je 55f
++	jne 58f
++	cmpl $0, hostops_on(%rip)		# under PHI_GGML_HOSTOPS a GLU is one of the host's run
++	jle 55f
++58:
+ 	movl %eax, %edi
+ 	call is_view
+ 	testl %eax, %eax
+ 	jnz 7f
++	movl T_OP(%r14), %edi
++	call host_op
++	testl %eax, %eax
++	jz 56f
++59:	movq %rbx, %rdi				# a run of them, to the next multiply the cards take
++	movl %r13d, %esi
++	movl %r12d, %edx
++	call host_run
++	testl %eax, %eax
++	js 92f
++	movl %eax, %r13d
++	jmp 7f
++56:
+ 	call say_begin
+ 	leaq s_unsupported(%rip), %rsi
+@@ -2428,5 +3023,11 @@ phi_graph_compute:
+ 	call l_end
+ 	jmp 92f
+-51:	movq %r14, %rdi
++51:	cmpl $0, hostops_on(%rip)
++	jle 511f
++	movq %r14, %rdi
++	call supports_mul_mat
++	testl %eax, %eax
++	jz 59b					# the host keeps every row: with the run
++511:	movq %r14, %rdi
+ 	call run_mul_mat
+ 	testl %eax, %eax
+@@ -2467,5 +3068,6 @@ phi_graph_compute:
+ 	jmp 99f
+ 92:	movl $GGML_STATUS_FAILED, %eax
+-99:	leaq -40(%rbp), %rsp
++99:	call tm_leave
++	leaq -40(%rbp), %rsp
+ 	popq %r15
+ 	popq %r14
+@@ -2584,4 +3186,7 @@ phi_dev_supports_op:
+ 	pushq %rbp
+ 	movq %rsp, %rbp
++	pushq %rbx
++	subq $8, %rsp
++	movq %rsi, %rbx
+ 	movq %rsi, %rdi
+ 	movl T_OP(%rdi), %eax
+@@ -2594,11 +3199,28 @@ phi_dev_supports_op:
+ 	movl %eax, %edi
+ 	call is_view
++	testl %eax, %eax
++	jnz 9f
++	movq %rbx, %rdi
++	call supports_hostop
+ 	jmp 9f
+ 1:	call supports_mul_mat
++	testl %eax, %eax
++	jnz 9f
++	movq T_SRC(%rbx), %rcx			# the host keeps every row: with its neighbours, when its matrix is a weight
++	cmpq $0, T_BUFFER(%rcx)
++	je 9f
++	movq %rbx, %rdi
++	call supports_hostop
+ 	jmp 9f
+ 2:	call supports_mul_mat_id
+ 	jmp 9f
+ 3:	call supports_glu
+-9:	popq %rbp
++	testl %eax, %eax
++	jnz 9f
++	movq %rbx, %rdi				# not a fused block's: a small one, for the host's cores
++	call supports_hostop
++9:	addq $8, %rsp
++	popq %rbx
++	popq %rbp
+ 	ret
+ 
+@@ -2719,4 +3341,7 @@ ggml_backend_phi_reg:
  	movl $-1, graph_left(%rip)
  	movl $-1, verbose_on(%rip)
 +	movl $-1, ahead_on(%rip)
++	movl $-1, time_on(%rip)
++	movl $-1, hostops_on(%rip)
  1:	call tables_init
  	leaq phi_reg(%rip), %rbx
 diff --git a/host/asm/ggml-phi/glue.md b/host/asm/ggml-phi/glue.md
-index d839796..8af727a 100644
+index d839796..cbc4cec 100644
 --- a/host/asm/ggml-phi/glue.md
 +++ b/host/asm/ggml-phi/glue.md
 @@ -30,5 +30,5 @@ hands out a backend from a pool of eight (`BE_SLOT`, `BE_USED`).
@@ -4249,7 +5052,7 @@ index d839796..8af727a 100644
 +  `K_FFN` names resident slices).
  - views, reshapes, permutes and transposes are ggml's own and pass.
  
-@@ -89,4 +90,68 @@ the feed-forward's host part), with `w_elapsed_ms` giving C's `%.3f`
+@@ -89,4 +90,212 @@ the feed-forward's host part), with `w_elapsed_ms` giving C's `%.3f`
  of the elapsed milliseconds.
  
 +## A multiply issued ahead of its node (`PHI_GGML_AHEAD`, 2026-11-09)
@@ -4315,6 +5118,150 @@ index d839796..8af727a 100644
 +19 ms a token. 16384 multiplies had been taken and none dropped when
 +the count was last said. The two sets were not interleaved, and their
 +ranges touch (24.791 and 24.802 s).
++
++**Never across a pass (2026-11-10).** A request begun ahead holds the
++window's doorbell lock until its node takes it or the next multiply
++drains it. The multiply that follows a pass's last one (the output
++head) is the first of the next pass, and it was begun ahead whenever
++the two happened to read activations at the same address: an address
++ggml's allocator may give to two unrelated tensors. Nothing then came
++for the request until the next token; with a DMA router in the process
++(`back_or_drop`), a prompt arriving first needed the lock to fetch its
++weights and waited for ever (seen 2026-11-10 on a 35 B model once the
++host's small operations had changed the buffer layout: the lock byte 1,
++the request and reply sequence numbers equal, one thread spinning).
++`ah_first` is the weight of the first multiply the backend ever ran,
++the one a pass begins with; a successor with that weight is never
++begun.
++
++## The timeline (`PHI_GGML_TIME`, 2026-11-10)
++
++`PHI_GGML_TIME=1` has the backend account for a generation's time as it
++sees it. `TM slot` (a macro: the slot pushed, `tm_mark` called, every
++register kept) adds the time since the last mark to a slot; the marks
++sit right after a call or before one, where no flag is live:
++
++| slot | what it is |
++| --- | --- |
++| outside | between two sub-graphs: ggml's scheduler, the other backends' sub-graphs (a GPU's), the copies between backends; `tm_enter`, at `phi_graph_compute`'s entry |
++| issue | `phi_ggml_begin`, `_begin_id`, `_begin_id_pair`: the activations to the window, the descriptor, the doorbell (and, at a tensor's first multiply, its upload) |
++| host rows | the host's ranges on the private CPU backend |
++| end | `phi_ggml_end` and its kin: the wait for the cards after the host's rows are done, their rows gathered |
++| rest | the scan of the graph, a drain, the bookkeeping; closed by `tm_leave` at the exit |
++| issued ahead | the activations kept and the request begun for a multiply issued ahead of its node |
++| host ops | a run of small operations and of multiplies the host keeps whole (`PHI_GGML_HOSTOPS`, below) |
++| long gaps | an outside gap of more than 20 ms (between requests, a prompt on a GPU), kept apart so it does not drown the rest |
++
++`tm_leave` prints one line every 8192 sub-graphs, the sums since the
++start in microseconds (`time: N sub-graphs; us outside X, issue X, host
++rows X, end X, rest X, issued ahead X, host ops X; outside gaps over 20 ms X`); the
++difference of two lines is an interval. Off, a mark is one compare and
++a jump.
++
++Measured on a 35 B Q6_K mixture-of-experts model, card 0 (a 7120A)
++holding every dense row and 109 whole experts of each layer's 256
++(`PHI_GGML_EXPERTS`, 12.92 GB), a GPU holding the context, the
++run-ahead on; 24,576 sub-graphs of generation, 0.641 ms each:
++
++| slot | share |
++| --- | --- |
++| end | 52.6 % |
++| outside | 28.0 % |
++| host rows | 18.8 % |
++| issue | 0.33 % |
++| rest, issued ahead | 0.18 %, 0.04 % |
++
++With the marks in and the switch on, the temperature-0 output of that
++server is the plain one's byte for byte (24 tokens with their top-5
++log-probabilities). What the table says: the copies of the activations
++are not where the time goes; in that layout the host waits for the card
++half the time, and a quarter is spent outside the backend.
++
++The run-ahead on that model and layout, 220 tokens, three prompts: 7.529,
++7.842, 7.498 tok/s in graph order, 8.230, 8.280, 8.729 with
++`PHI_GGML_AHEAD=1`, the output identical; the card busy 60.3 % of the
++time before and 71.0 % after (sampled from the host); 16,384 multiplies
++taken ahead, 81 begun ahead that were not what came.
++
++## Small operations on the host (`PHI_GGML_HOSTOPS`, 2026-11-10)
++
++ggml's scheduler gives a node that has no weight to the backend of the
++node before it in the graph, when that backend accepts it
++(`ggml-backend.cpp`, the passes that expand an assignment down and up;
++every backend but the last, the CPU, expands alike). This backend
++accepted multiplies only, so with every layer's context on a GPU
++(`-ngl 99 -ot ".*=CPU"`) each norm, residual add, routing soft max and
++SwiGLU of a generated token went to the GPU and came back: the graph of
++one token of a 35 B mixture-of-experts model was cut into 612 splits
++(llama-server at `-lv 4`: `sched_graph_realloc: ... nodes = 5015,
++splits = 612`).
++
++`PHI_GGML_HOSTOPS=1` has `phi_dev_supports_op` also accept
++(`supports_hostop`):
++
++| what | condition |
++| --- | --- |
++| `ADD SUB MUL DIV SQR SQRT SCALE NORM RMS_NORM L2_NORM SOFT_MAX ARGSORT TOP_K SUM_ROWS CONCAT REPEAT GET_ROWS CONT CPY UNARY CLAMP ROPE` (`host_op`) | the result is a generation step's: no dimension past the first over 31 (`HOSTOP_DIM`: a prompt's tensors carry their tokens there and stay with the GPU), at most 1,048,576 elements |
++| a `GLU` that `supports_glu` declines (not a fused block's) | the same |
++| a `MUL_MAT` that `supports_mul_mat` declines (the host keeps every row of it) | the same, and its matrix is a weight (it has a buffer when the scheduler asks) |
++
++The last line matters as much as the first: declined, such a multiply
++went to ggml's own CPU backend and cut the chain there.
++
++`phi_graph_compute` runs these as a run (`host_run`): from the node to
++the next multiply the cards take, mixture multiply or node with a role,
++one view of the graph (the graph's structure copied, `size` 0, the node
++count, the nodes from that place, no leafs and no gradients: what
++`ggml_graph_view` makes, which ggml does not export) computed on the
++private CPU backend. `tools/ggml-layout-check.c` gives the structure's
++size and fields (`CG_BYTES` 96) and the operations' numbers.
++
++Two norms a layer stay with the GPU whatever this backend accepts:
++llama.cpp pins them to the layer's device. A preload library declines
++that pin for a generation step's norm (`tools/unpin.c` in
++Lasimeri/llama-phi).
++
++Measured on a 35 B Q6_K model, card 0 (a 7120A) holding half of every
++dense matrix's rows and 119 whole experts of each layer's 256, an RTX
++3090 Ti holding the context, one generated token's graph:
++
++| | splits |
++| --- | --- |
++| the switch off | 612 |
++| the element-wise operations only | 702 |
++| with the SwiGLU, and the norms unpinned | 543 |
++| and the multiplies the host keeps whole | 393 |
++
++A linear-attention layer is then four sub-graphs of this backend with a
++GPU sub-graph between each pair (the convolution, the attention's core
++and its state): the mixed projection; the convolution's results, alpha,
++the gate, beta; `z`; and one of 49 nodes from the attention's output
++through the residual, the norm, the routing, the experts' gate and up,
++the SwiGLU, down, their weighted sum, the shared expert and its gate to
++the next layer's norm.
++
++Generation, 220 tokens, three prompts: 10.60, 10.37, 10.51 tok/s with
++the switch off, 10.93, 10.77, 11.04 with it and the norms unpinned. The
++timeline of that run, uploads left out: the host's rows 29.5 %, the wait
++for the card 28.8 %, the host's small operations and whole multiplies
++24.4 %, outside the backend 16.6 % (44.9 % before, which counted the
++whole multiplies then run by ggml's CPU backend). Two variants measured
++the same and were not kept: the segments that hold no multiply on a
++second CPU backend of one thread (10.74, 10.87, 10.80), and the private
++pool polling instead of sleeping (10.87, 10.61, 10.75).
++
++What was checked of the results, with float32 activations
++(`PHI_GGML_ACT=0`) so that the card's and the host's rows differ only by
++their kernels, temperature 0, 24 tokens with their top five
++log-probabilities, the switch on against off: a dense 27 B Q4_0 model,
++24 of 24 tokens the same, the chosen token's log-probability at most
++0.0156 apart; the 35 B model, 24 of 24 the same, at most 0.0638 apart.
++Two builds of one card kernel that differ in the order of a row's
++additions were 0.0106 apart on that 27 B model (2026-11-09). The
++results are not bit-equal: a norm or an add on the host rounds
++differently from the GPU's. Why the mixture model shows more is not
++established (its routing picks eight experts of 256 a layer, and a
++score's last bits can change the eighth).
 +
  ## The host's rows
  
@@ -4642,10 +5589,10 @@ index 93f858b..2fa1d4c 100755
  }
  # NAME EXPECTED_OK EXTRA_ENV BIN [ARGS]: a fresh worker, the program under
 diff --git a/scripts/phi-ggml.md b/scripts/phi-ggml.md
-index 2afd9dc..176baff 100644
+index 2afd9dc..055cb2b 100644
 --- a/scripts/phi-ggml.md
 +++ b/scripts/phi-ggml.md
-@@ -55,4 +55,9 @@ every one; `tools/expert-placement.md` makes the file from a run with
+@@ -55,4 +55,17 @@ every one; `tools/expert-placement.md` makes the file from a run with
  `PHI_GGML_SPIN_US` (the wait for a card spins this many microseconds,
  then sleeps between looks; unset, it spins throughout),
 +`PHI_GGML_AHEAD` (1, with the offload: when a multiply is done, the one
@@ -4653,6 +5600,14 @@ index 2afd9dc..176baff 100644
 +activations, so the cards work while the host and a GPU handle the
 +result before; a guess that is wrong is dropped and costs no result:
 +`host/asm/ggml-phi/glue.md`),
++`PHI_GGML_TIME` (1: the backend accounts for a generation's time by
++phase, a line every 8192 sub-graphs: outside the backend, issuing, the
++host's rows, the wait for the cards; `host/asm/ggml-phi/glue.md`),
++`PHI_GGML_HOSTOPS` (1: the small operations of a generation step, and
++the multiplies the host keeps whole, run on the host in the sub-graph
++of the multiply before them, where a GPU that holds the context took
++each of them and gave it back: `host/asm/ggml-phi/glue.md`; with a
++preload library that declines llama.cpp's pin of a layer's norm),
  `PHI_GGML_JUDGE` (0: no tensor is moved by its timings; with
  `PHI_GGML_PP_ADAPT=0` the same request gives the same output),
 diff --git a/scripts/phi-vpu.md b/scripts/phi-vpu.md
@@ -4749,15 +5704,64 @@ index 88cdd3f..4f35afe 100755
              echo "phi512: could not start the worker on card $card (is the card up? phi -c $card status)" >&2
              exit 1
 diff --git a/tools/ggml-layout-check.c b/tools/ggml-layout-check.c
-index 6a556d6..82e072e 100644
+index 6a556d6..c564f71 100644
 --- a/tools/ggml-layout-check.c
 +++ b/tools/ggml-layout-check.c
-@@ -128,4 +128,5 @@ static const struct entry table[] = {
+@@ -61,4 +61,10 @@ static const struct entry table[] = {
+     { "CG_N_NODES", OFF(ggml_cgraph, n_nodes) },
+     { "CG_NODES", OFF(ggml_cgraph, nodes) },
++    { "CG_BYTES", SZ(ggml_cgraph) },
++    { "CG_SIZE", OFF(ggml_cgraph, size) },
++    { "CG_N_LEAFS", OFF(ggml_cgraph, n_leafs) },
++    { "CG_GRADS", OFF(ggml_cgraph, grads) },
++    { "CG_GRAD_ACCS", OFF(ggml_cgraph, grad_accs) },
++    { "CG_LEAFS", OFF(ggml_cgraph, leafs) },
+     /* struct ggml_backend_buffer (the buffer type of a weight's buffer) */
+     { "BUF_BUFT", OFF(ggml_backend_buffer, buft) },
+@@ -128,4 +134,5 @@ static const struct entry table[] = {
      { "GGML_TYPE_F32", GGML_TYPE_F32 },
      { "GGML_TYPE_F16", GGML_TYPE_F16 },
 +    { "GGML_TYPE_Q4_0", GGML_TYPE_Q4_0 },
      { "GGML_TYPE_Q8_0", GGML_TYPE_Q8_0 },
      { "GGML_TYPE_Q4_K", GGML_TYPE_Q4_K },
+@@ -143,4 +150,26 @@ static const struct entry table[] = {
+     { "GGML_OP_MUL_MAT_ID", GGML_OP_MUL_MAT_ID },
+     { "GGML_OP_GLU", GGML_OP_GLU },
++    { "GGML_OP_ADD", GGML_OP_ADD },
++    { "GGML_OP_SUB", GGML_OP_SUB },
++    { "GGML_OP_MUL", GGML_OP_MUL },
++    { "GGML_OP_DIV", GGML_OP_DIV },
++    { "GGML_OP_SQR", GGML_OP_SQR },
++    { "GGML_OP_SQRT", GGML_OP_SQRT },
++    { "GGML_OP_SCALE", GGML_OP_SCALE },
++    { "GGML_OP_NORM", GGML_OP_NORM },
++    { "GGML_OP_RMS_NORM", GGML_OP_RMS_NORM },
++    { "GGML_OP_L2_NORM", GGML_OP_L2_NORM },
++    { "GGML_OP_SOFT_MAX", GGML_OP_SOFT_MAX },
++    { "GGML_OP_ARGSORT", GGML_OP_ARGSORT },
++    { "GGML_OP_TOP_K", GGML_OP_TOP_K },
++    { "GGML_OP_SUM_ROWS", GGML_OP_SUM_ROWS },
++    { "GGML_OP_CONCAT", GGML_OP_CONCAT },
++    { "GGML_OP_REPEAT", GGML_OP_REPEAT },
++    { "GGML_OP_GET_ROWS", GGML_OP_GET_ROWS },
++    { "GGML_OP_CONT", GGML_OP_CONT },
++    { "GGML_OP_CPY", GGML_OP_CPY },
++    { "GGML_OP_UNARY", GGML_OP_UNARY },
++    { "GGML_OP_CLAMP", GGML_OP_CLAMP },
++    { "GGML_OP_ROPE", GGML_OP_ROPE },
+     { "GGML_GLU_OP_SWIGLU", GGML_GLU_OP_SWIGLU },
+     { "GGML_TENSOR_FLAG_OUTPUT", GGML_TENSOR_FLAG_OUTPUT },
+diff --git a/tools/ggml-layout-check.md b/tools/ggml-layout-check.md
+index c060978..bbfc288 100644
+--- a/tools/ggml-layout-check.md
++++ b/tools/ggml-layout-check.md
+@@ -24,5 +24,5 @@ tcc -I$L/ggml/include -I$L/ggml/src -run tools/ggml-layout-check.c host/asm/ggml
+ 
+ `make layout-check` skips it with a note when `LLAMA_CPP_DIR` has no
+-ggml headers. The table of 99 values is `ggml_layout.md`'s list; a
++ggml headers. The table of 129 values is `ggml_layout.md`'s list; a
+ value the glue starts to need is added to the table and the include
+ regenerated, never typed into the assembly.
 diff --git a/tools/q4_0-bench.S b/tools/q4_0-bench.S
 new file mode 100644
 index 0000000..f0b4438

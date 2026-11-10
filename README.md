@@ -120,6 +120,21 @@ card worker no longer executes an x87 instruction. What was measured,
 what each change gave, and what was tried and dropped:
 [docs/one-server.md](docs/one-server.md).
 
+A mixture-of-experts model larger than host memory allows
+(`scripts/moe.sh`, Qwen3.8-35B-A3B at Q6_K, 29.2 GB on a 32 GB host): the
+card holds half of every dense matrix and the most used whole experts
+of each layer (12.88 GB, held nowhere else), the host every other
+expert, the GPU the 262K context and every prompt, with no weights of
+its own. 10.8 to 11.0 tok/s, where the same split by rows of the Q8_0
+file gave 5.3, and prompts at 345 tok/s where they ran at 83 while the
+card's experts came back from the disk: they reach the GPU from the card
+through the router now. The backend also keeps the small operations
+between two multiplies on the host, which cut one token's graph from 612
+splits to 393, and the card worker pulls a matrix out of host RAM with
+its own DMA engine, straight into the buffer it is multiplied from.
+Every step, the timeline that chose them, and what did not work:
+[docs/moe.md](docs/moe.md).
+
 ## Use
 
 Requirements: a Xeon Phi x100 card booted with the

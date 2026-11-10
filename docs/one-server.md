@@ -174,6 +174,11 @@ same in both (20.04 to 20.09 s): what is saved is waiting. The output
 is identical byte for byte (above), and the backend's counter line at
 16,384 multiplies taken ahead reported none dropped.
 
+Since 2026-11-10 a multiply that begins a pass is never begun ahead: the
+one issued after a pass's last multiply held the window's lock until the
+next token, and a prompt arriving first waited for ever for the router's
+turn ([moe.md](moe.md), where a 35 B model's buffer layout exposed it).
+
 ## The host's threads
 
 Per-thread CPU time over a 25.4 s generation (`scripts/threads.sh`): the
@@ -332,6 +337,38 @@ row; 1024 x 5120 at nine rows a slice measured 5 % slower with it), a
 request of
 two or more activation rows, a mixture of experts, and a request of
 several matrices.
+
+## Every weight in host RAM, nothing on the card
+
+Measured 2026-11-10, the same model and prompt. The card's backend can
+leave every weight in host RAM (`PHI_GGML_STREAM=1`): the card's rows sit
+in the shared window and the card pulls them at every multiply. The
+window is 2 GiB, which leaves 1.25 GiB for rows: 8.1 % of every matrix
+(1.03 GB). The GPU takes prompts with the weights copied from host RAM
+(`-ngl 99 -ot ".*=CPU"`), and holds the context.
+
+| Layout | Generation | Prefill, second prompt |
+|---|---|---|
+| rows resident on the card (above) | 3.221 to 3.282 tok/s | 315 to 319 tok/s |
+| host RAM, the card left out | 2.267, 2.259 tok/s | 569.2 tok/s |
+| host RAM, the card pulling 8.1 % through its block device | 1.559, 1.567, 1.536 tok/s | 538.9 tok/s |
+| the same, pulled by the card's own DMA engine | 2.155, 2.203, 2.127 tok/s | 557.8, 556.1 tok/s |
+
+- Sampled from the host over one 64-token request with the block
+  device (`tools/overlap.c`): the card busy 29.911 s, of that 27.780 s
+  pulling weights, 1.847 s computing. The pull is a `pread` the card's
+  kernel hands to the host daemon, with fourteen host threads competing
+  for the cores.
+- The patch's worker pulls a matrix with the card's own DMA channel
+  straight into the frames of the buffer it is multiplied from
+  (`card/vpu/matmul.md`, "Weights straight from host RAM"): 15.818 s of
+  pulling, 1.852 s computing, and 39 % more tokens a second.
+- It is still 3 to 6 % behind leaving the card out. With nothing
+  resident the same rows cross the link at every token; no transfer
+  method removes that, and the host reads its own memory at about ten
+  times the link's rate. A card pays here only for what it holds.
+- The GPU fed from host RAM prefills faster than fed from the card
+  (569 against 315 to 319 tok/s): the card link is the slower source.
 
 ## The card worker since [q4_0.md](q4_0.md)
 

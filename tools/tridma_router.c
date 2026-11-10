@@ -49,7 +49,7 @@
 
 #define PG 4096ull
 #define MAX_GGUF 64
-#define MAX_RANGES 4096
+#define MAX_RANGES 32768   // a mixture's whole experts are a range each (chunk_rg is 16 bits)
 #define MAX_CHUNKS 65536
 
 // ---- 1. no populate for GGUF mappings ----
@@ -206,8 +206,22 @@ static uint64_t now_ns(void) {
 
 // the doorbell lock: the same test-and-set as the backend's lock.S
 static void lock_take(volatile uint32_t *l) {
+    struct timespec t0;
+    unsigned spins = 0;
+    int said = 0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE))
-        while (__atomic_load_n(l, __ATOMIC_RELAXED)) __builtin_ia32_pause();
+        while (__atomic_load_n(l, __ATOMIC_RELAXED)) {
+            __builtin_ia32_pause();
+            if (!said && (++spins & 0xfffff) == 0) {   // a look at the clock every million spins
+                struct timespec t;
+                clock_gettime(CLOCK_MONOTONIC, &t);
+                if (t.tv_sec - t0.tv_sec >= 30) {
+                    fprintf(stderr, "tridma: the window's doorbell lock has been held for 30 s (a request the backend began and has not ended); still waiting\n");
+                    said = 1;
+                }
+            }
+        }
 }
 static void lock_drop(volatile uint32_t *l) { __atomic_store_n(l, 0, __ATOMIC_RELEASE); }
 

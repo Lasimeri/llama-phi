@@ -40,6 +40,12 @@ are in [docs/router.md](../docs/router.md).
    - keeps at most `TRIDMA_BUDGET` (512 MiB) of such pages: the oldest chunks go
      back with `MADV_DONTNEED` and fault again if read again.
 
+Since 2026-11-10 the backend also calls it for every whole expert of a
+mixture-of-experts model that the card holds (`backend.S` `back_whole`: the
+expert's matrix in the file, the card slice's id, the expert's byte in that
+slice), one range an expert. `MAX_RANGES` is 32768 for that (a 35 B model with
+109 of 256 experts a layer on the card registers 13,191 ranges).
+
 A download that fails aborts the process: computing with missing weights would be
 worse than stopping.
 
