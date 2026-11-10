@@ -19,9 +19,10 @@ are in [docs/router.md](../docs/router.md).
      `MADV_NOHUGEPAGE`) over the whole pages of that range and registers it with
      userfaultfd (`UFFDIO_REGISTER_MODE_MISSING`), recording the range (sorted,
      for a binary search) with its card offset;
-   - routes every fault through three threads, each with one job (2026-11-06, router
-     v2; v1 did all of it in one thread, the card idle during each copy and the
-     first chunk of every matrix a stall):
+   - routes every fault through a fault thread and, for each card, a fetch thread
+     and a fill thread, each with one job (2026-11-06, router v2; v1 did all of it
+     in one thread, the card idle during each copy and the first chunk of every
+     matrix a stall; a pair of threads a card since 2026-11-10, below):
      - the **fault thread** (`poll` + `read` on the userfaultfd) puts a chunk
        (`TRIDMA_CHUNK`, 8 MiB) not yet asked for at the head of a demand queue and
        moves the read-ahead cursor there; it never waits for the card;
@@ -49,6 +50,46 @@ slice), one range an expert. `MAX_RANGES` is 32768 for that (a 35 B model with
 A download that fails aborts the process: computing with missing weights would be
 worse than stopping.
 
+## Several cards (2026-11-10)
+
+`tridma_back` is called once for each card's part of a matrix, with that card's
+window and thread count (`backend.S` `back_split`). The router keeps a table of
+cards keyed by the window (`cd[]`, at most 16): a range records its card, and each
+card has its own four staging slots in its own window, its own fetch thread and
+its own fill thread, started when the card is first named (`card_for`).
+
+- `take_work(card)` gives a fetch thread the demand chunks of its card first, then
+  the read-ahead chunks queued for it, then moves the shared cursor forward; a
+  chunk of another card met on the way is marked and queued for that card's
+  thread, so all the links download at once.
+- The fill threads take finished slots from one queue, so a slow copy on one card's
+  data does not hold the others.
+- `evict` picks its victims (at most 16 a pass) under the lock, marks them leaving,
+  and calls `madvise(MADV_DONTNEED)` with the lock released; a fault on a leaving
+  chunk is queued again.
+
+Until this the router knew one window: with several cards the backend's single
+range named bytes the first card does not hold, and the first prompt stopped at
+`K_DOWNLOAD ... failed: status -4`.
+
+Measured on four 3120 cards beside four GPUs, a 35 B Q8_0 mixture model, the
+first four blocks' weights on the cards (0.91 GB a card, whole experts placed),
+a 1,400-token prompt, `cache_prompt` off, `TRIDMA_VERBOSE=1`:
+
+| | one card (3.53 GB) | four cards, one fill thread | four cards, a fill thread a card |
+|---|---|---|---|
+| burst of about 3.5 GB | 1.85 GB/s | 2.66 to 2.77 GB/s (1.26 s) | 6.71, 7.04, 6.84 GB/s (0.49 to 0.52 s) |
+| prefill after the first prompt | 640, 662 tok/s | 874 to 917 tok/s | 1,736, 1,811, 1,776 tok/s |
+
+The step in the middle is what the instrument showed: with per-card fetch threads
+alone, a 1.26 s burst had the cards busy 1.13 s summed over the four, the single
+fill thread copying 1.04 s and evicting 0.20 s under the lock. `TRIDMA_VERIFY=4`:
+2,315 chunks equal to the file, 0 differ (whole experts); 12,127 and 0 with every
+tensor split by rows across the cards (12,332 ranges), where the prefill is 1,505
+and 1,548 tok/s. With the host keeping its own copy of those blocks and no router
+at all, the same prompt runs at 2,083 to 2,432 tok/s: on a host with the memory
+for it the router costs speed and saves that memory.
+
 ## The request channel
 
 `K_DOWNLOAD` is issued on the worker's ordinary request line (descriptor at
@@ -75,7 +116,7 @@ filled on fault and copied with `cudaMemcpy` to a 3090 Ti: 16,384 faults handled
 | `TRIDMA_AHEAD` | 32 | chunks read ahead past the last fault (the budget is raised to at least `TRIDMA_AHEAD` + 6 chunks) |
 | `TRIDMA_BUDGET` | 512 MiB | card-backed bytes resident at most |
 | `TRIDMA_STAGE` | 1 GiB | window offset of the staging area (the backend uses at most 768 MiB of the window) |
-| `TRIDMA_VERBOSE` | 0 | 1: log the populate changes, every backed range, a summary every 512 chunks, and one line per burst (a prompt's stream: bytes, seconds, GB/s, chunks on demand and read ahead) |
+| `TRIDMA_VERBOSE` | 0 | 1: log the populate changes, every backed range, a summary every 512 chunks, and one line per burst (a prompt's stream: bytes, seconds, GB/s, chunks on demand and read ahead, chunks evicted and bytes resident, and the seconds the cards were busy summed over them, the seconds of copies and of evictions) |
 | `TRIDMA_VERIFY` | 0 | N: a test. Every Nth chunk filled is compared, in the pages themselves, with the GGUF file at the same offset (read for it and dropped from the page cache after); the burst line counts equal and differing chunks |
 
 Build: `gcc -O2 -Wall -Wextra -shared -fPIC -I<Intel-Phi-AVX-512-C>/card/vpu -o

@@ -2001,22 +2001,25 @@ drop_pages:
 	ret
 
 
-# back_or_drop(addr rdi, len rsi, id rdx): the card's rows of a dense
-# matrix, just uploaded under id, handed to the DMA router when the
-# process has one (tridma_back, an LD_PRELOAD library: the pages then come
-# back from the card by K_DOWNLOAD on a fault, not from the disk), else
-# given to MADV_PAGEOUT as before (drop_pages); the bytes in rax
-# (2026-11-06). A mixture's whole experts go through back_whole.
 	.globl back_or_drop
+# back_or_drop(addr rdi, len rsi, id rdx, card rcx, a_off r8): one card's
+# rows of a matrix (a dense one, or one expert of a mixture, whose rows
+# begin at byte a_off of that card's slice), uploaded as that card's
+# resident id: handed to the DMA
+# router when the process has one (tridma_back, with that card's window
+# and threads, so a prompt computed on a GPU reads them back from the
+# card that holds them), else dropped from the host. The bytes in rax.
 back_or_drop:
 	pushq %rbx
 	pushq %r12
 	pushq %r13
+	pushq %r14
+	subq $8, %rsp
 	movq %rdi, %rbx
 	movq %rsi, %r12
 	movq %rdx, %r13
-	cmpq $1, pa_experts(%rip)
-	jne 8f
+	movq %rcx, %r14
+	movq %r8, (%rsp)			# where the rows begin in the card's slice
 	cmpl $0, tb_tried(%rip)
 	jne 1f
 	movl $1, tb_tried(%rip)
@@ -2026,22 +2029,71 @@ back_or_drop:
 	movq %rax, tb_fn(%rip)
 1:	cmpq $0, tb_fn(%rip)
 	je 8f
-	xorl %edi, %edi
-	call card_at				# the first card
-	# tridma_back(addr, len, id, a_off 0, window base, threads)
+	movq %r14, %rdi
+	call card_at				# the card that holds these rows
+	# tridma_back(addr, len, id, a_off, that card's window base, its threads)
 	movq CD_BASE(%rax), %r8
 	movl CD_THREADS(%rax), %r9d
 	movq %rbx, %rdi
 	movq %r12, %rsi
 	movq %r13, %rdx
-	xorl %ecx, %ecx
+	movq (%rsp), %rcx
 	call *tb_fn(%rip)
 	testq %rax, %rax
 	jnz 9f
 8:	movq %rbx, %rdi
 	movq %r12, %rsi
 	call drop_pages
-9:	popq %r13
+9:	addq $8, %rsp
+	popq %r14
+	popq %r13
+	popq %r12
+	popq %rbx
+	ret
+
+# back_split(split rdi, expert rsi): the rows of expert rsi of the tensor
+# being planned (pa_*) that the cards keep, handed to back_or_drop one
+# card's slice at a time, each with its own card and that card's id
+# (2026-11-10: they went as one range under the first card's id, which
+# is the same thing with one card and wrong with several). The bytes in rax.
+back_split:
+	pushq %rbx
+	pushq %r12
+	pushq %r13
+	pushq %r14
+	pushq %r15
+	subq $16, %rsp
+	movq %rsi, (%rsp)			# the expert
+	movq %rdi, %rbx
+	movq %rsi, %r12
+	imulq pa_nb_a2(%rip), %r12		# the expert's first byte in the tensor
+	addq pa_a(%rip), %r12
+	xorl %r13d, %r13d			# the slice
+	xorl %r14d, %r14d			# the bytes
+1:	cmpl SP_NCARDS(%rbx), %r13d
+	jae 2f
+	movq %r13, %rax
+	imulq $SPC_BYTES, %rax, %rax
+	leaq SP_CARDS(%rbx,%rax), %r15
+	movq SPC_LO(%r15), %rdi
+	imulq pa_nb_a(%rip), %rdi
+	addq %r12, %rdi
+	movq SPC_HI(%r15), %rsi
+	subq SPC_LO(%r15), %rsi
+	imulq pa_nb_a(%rip), %rsi
+	movq %rsi, %r8
+	imulq (%rsp), %r8			# its rows begin here in the card's slice
+	movq SPC_CI(%r15), %rcx
+	movq SP_ID(%rbx,%rcx,8), %rdx		# that card's id of its slice
+	call back_or_drop
+	addq %rax, %r14
+	incl %r13d
+	jmp 1b
+2:	movq %r14, %rax
+	addq $16, %rsp
+	popq %r15
+	popq %r14
+	popq %r13
 	popq %r12
 	popq %rbx
 	ret
@@ -2051,8 +2103,8 @@ back_or_drop:
 # handed to the DMA router as back_or_drop hands a dense matrix's rows
 # (2026-11-10): a prompt computed on a GPU then reads the expert from the
 # card by K_DOWNLOAD, where its dropped pages came back from the disk.
-# The router speaks to the first card only, so an expert another card
-# holds, and every expert when the process has no router, goes to
+# The router keeps a window for every card, so the expert goes to it with
+# the card that holds it; without a router in the process it goes to
 # drop_pages. The bytes in rax.
 	.globl back_whole
 back_whole:
@@ -2065,8 +2117,7 @@ back_whole:
 	movq %rsi, %r12
 	movq %rdx, %r13
 	movq %rcx, %r14
-	testq %r8, %r8
-	jnz 8f
+	movq %r8, (%rsp)			# the card that holds it
 	cmpl $0, tb_tried(%rip)
 	jne 1f
 	movl $1, tb_tried(%rip)
@@ -2076,8 +2127,8 @@ back_whole:
 	movq %rax, tb_fn(%rip)
 1:	cmpq $0, tb_fn(%rip)
 	je 8f
-	xorl %edi, %edi
-	call card_at				# the first card
+	movq (%rsp), %rdi
+	call card_at				# that card
 	movq CD_BASE(%rax), %r8
 	movl CD_THREADS(%rax), %r9d
 	movq %rbx, %rdi
@@ -3543,17 +3594,9 @@ plan:
 82:	movq -88(%rbp), %rax
 	cmpq pa_experts(%rip), %rax
 	jae 83f
-	movq %rax, %rdi
-	imulq pa_nb_a2(%rip), %rdi
-	movq SP_R0(%rbx), %rax
-	imulq pa_nb_a(%rip), %rax
-	addq %rax, %rdi
-	addq pa_a(%rip), %rdi
-	movq pa_m(%rip), %rsi
-	subq SP_R0(%rbx), %rsi
-	imulq pa_nb_a(%rip), %rsi
-	movq SP_ID(%rbx), %rdx			# the first card's id of the slice
-	call back_or_drop
+	movq %rbx, %rdi
+	movq %rax, %rsi
+	call back_split				# each card's slice to its own card
 	addq %rax, %r14
 	incq -88(%rbp)
 	jmp 82b

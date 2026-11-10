@@ -3797,7 +3797,7 @@ index a06d5a5..91a70c9 100644
 +card-backed pages. `phi_ggml_open` clears the word when it maps the window, since
 +a client killed between a request and its reply leaves it taken.
 diff --git a/host/asm/ggml-phi/backend.S b/host/asm/ggml-phi/backend.S
-index 9f25cff..303af68 100644
+index 9f25cff..5e0511b 100644
 --- a/host/asm/ggml-phi/backend.S
 +++ b/host/asm/ggml-phi/backend.S
 @@ -65,4 +65,6 @@ tg_only:	.skip 8			# PHI_GGML_TG_ONLY=K: a multiply of more than K tokens stays
@@ -3882,26 +3882,29 @@ index 9f25cff..303af68 100644
 +85:	# whole experts
  	movl $0, place_any(%rip)
  	leaq e_experts(%rip), %rdi
-@@ -1968,4 +2001,101 @@ drop_pages:
+@@ -1968,4 +2001,152 @@ drop_pages:
  	ret
  
 +
-+# back_or_drop(addr rdi, len rsi, id rdx): the card's rows of a dense
-+# matrix, just uploaded under id, handed to the DMA router when the
-+# process has one (tridma_back, an LD_PRELOAD library: the pages then come
-+# back from the card by K_DOWNLOAD on a fault, not from the disk), else
-+# given to MADV_PAGEOUT as before (drop_pages); the bytes in rax
-+# (2026-11-06). A mixture's whole experts go through back_whole.
 +	.globl back_or_drop
++# back_or_drop(addr rdi, len rsi, id rdx, card rcx, a_off r8): one card's
++# rows of a matrix (a dense one, or one expert of a mixture, whose rows
++# begin at byte a_off of that card's slice), uploaded as that card's
++# resident id: handed to the DMA
++# router when the process has one (tridma_back, with that card's window
++# and threads, so a prompt computed on a GPU reads them back from the
++# card that holds them), else dropped from the host. The bytes in rax.
 +back_or_drop:
 +	pushq %rbx
 +	pushq %r12
 +	pushq %r13
++	pushq %r14
++	subq $8, %rsp
 +	movq %rdi, %rbx
 +	movq %rsi, %r12
 +	movq %rdx, %r13
-+	cmpq $1, pa_experts(%rip)
-+	jne 8f
++	movq %rcx, %r14
++	movq %r8, (%rsp)			# where the rows begin in the card's slice
 +	cmpl $0, tb_tried(%rip)
 +	jne 1f
 +	movl $1, tb_tried(%rip)
@@ -3911,22 +3914,71 @@ index 9f25cff..303af68 100644
 +	movq %rax, tb_fn(%rip)
 +1:	cmpq $0, tb_fn(%rip)
 +	je 8f
-+	xorl %edi, %edi
-+	call card_at				# the first card
-+	# tridma_back(addr, len, id, a_off 0, window base, threads)
++	movq %r14, %rdi
++	call card_at				# the card that holds these rows
++	# tridma_back(addr, len, id, a_off, that card's window base, its threads)
 +	movq CD_BASE(%rax), %r8
 +	movl CD_THREADS(%rax), %r9d
 +	movq %rbx, %rdi
 +	movq %r12, %rsi
 +	movq %r13, %rdx
-+	xorl %ecx, %ecx
++	movq (%rsp), %rcx
 +	call *tb_fn(%rip)
 +	testq %rax, %rax
 +	jnz 9f
 +8:	movq %rbx, %rdi
 +	movq %r12, %rsi
 +	call drop_pages
-+9:	popq %r13
++9:	addq $8, %rsp
++	popq %r14
++	popq %r13
++	popq %r12
++	popq %rbx
++	ret
++
++# back_split(split rdi, expert rsi): the rows of expert rsi of the tensor
++# being planned (pa_*) that the cards keep, handed to back_or_drop one
++# card's slice at a time, each with its own card and that card's id
++# (2026-11-10: they went as one range under the first card's id, which
++# is the same thing with one card and wrong with several). The bytes in rax.
++back_split:
++	pushq %rbx
++	pushq %r12
++	pushq %r13
++	pushq %r14
++	pushq %r15
++	subq $16, %rsp
++	movq %rsi, (%rsp)			# the expert
++	movq %rdi, %rbx
++	movq %rsi, %r12
++	imulq pa_nb_a2(%rip), %r12		# the expert's first byte in the tensor
++	addq pa_a(%rip), %r12
++	xorl %r13d, %r13d			# the slice
++	xorl %r14d, %r14d			# the bytes
++1:	cmpl SP_NCARDS(%rbx), %r13d
++	jae 2f
++	movq %r13, %rax
++	imulq $SPC_BYTES, %rax, %rax
++	leaq SP_CARDS(%rbx,%rax), %r15
++	movq SPC_LO(%r15), %rdi
++	imulq pa_nb_a(%rip), %rdi
++	addq %r12, %rdi
++	movq SPC_HI(%r15), %rsi
++	subq SPC_LO(%r15), %rsi
++	imulq pa_nb_a(%rip), %rsi
++	movq %rsi, %r8
++	imulq (%rsp), %r8			# its rows begin here in the card's slice
++	movq SPC_CI(%r15), %rcx
++	movq SP_ID(%rbx,%rcx,8), %rdx		# that card's id of its slice
++	call back_or_drop
++	addq %rax, %r14
++	incl %r13d
++	jmp 1b
++2:	movq %r14, %rax
++	addq $16, %rsp
++	popq %r15
++	popq %r14
++	popq %r13
 +	popq %r12
 +	popq %rbx
 +	ret
@@ -3936,8 +3988,8 @@ index 9f25cff..303af68 100644
 +# handed to the DMA router as back_or_drop hands a dense matrix's rows
 +# (2026-11-10): a prompt computed on a GPU then reads the expert from the
 +# card by K_DOWNLOAD, where its dropped pages came back from the disk.
-+# The router speaks to the first card only, so an expert another card
-+# holds, and every expert when the process has no router, goes to
++# The router keeps a window for every card, so the expert goes to it with
++# the card that holds it; without a router in the process it goes to
 +# drop_pages. The bytes in rax.
 +	.globl back_whole
 +back_whole:
@@ -3950,8 +4002,7 @@ index 9f25cff..303af68 100644
 +	movq %rsi, %r12
 +	movq %rdx, %r13
 +	movq %rcx, %r14
-+	testq %r8, %r8
-+	jnz 8f
++	movq %r8, (%rsp)			# the card that holds it
 +	cmpl $0, tb_tried(%rip)
 +	jne 1f
 +	movl $1, tb_tried(%rip)
@@ -3961,8 +4012,8 @@ index 9f25cff..303af68 100644
 +	movq %rax, tb_fn(%rip)
 +1:	cmpq $0, tb_fn(%rip)
 +	je 8f
-+	xorl %edi, %edi
-+	call card_at				# the first card
++	movq (%rsp), %rdi
++	call card_at				# that card
 +	movq CD_BASE(%rax), %r8
 +	movl CD_THREADS(%rax), %r9d
 +	movq %rbx, %rdi
@@ -3984,7 +4035,7 @@ index 9f25cff..303af68 100644
 +
  # ---- the host taking everything ----
  
-@@ -3125,5 +3255,42 @@ upload_area:
+@@ -3125,5 +3306,42 @@ upload_area:
  	movq %rdi, %rbx
  	movq %rsi, %r12
 -	call mm_clear
@@ -4028,15 +4079,25 @@ index 9f25cff..303af68 100644
 +5:	call mm_clear
  	movq CD_NEXT_ID(%rbx), %r13
  	leaq mm_buf(%rip), %rax
-@@ -3386,5 +3553,6 @@ plan:
- 	subq SP_R0(%rbx), %rsi
- 	imulq pa_nb_a(%rip), %rsi
+@@ -3377,14 +3595,7 @@ plan:
+ 	cmpq pa_experts(%rip), %rax
+ 	jae 83f
+-	movq %rax, %rdi
+-	imulq pa_nb_a2(%rip), %rdi
+-	movq SP_R0(%rbx), %rax
+-	imulq pa_nb_a(%rip), %rax
+-	addq %rax, %rdi
+-	addq pa_a(%rip), %rdi
+-	movq pa_m(%rip), %rsi
+-	subq SP_R0(%rbx), %rsi
+-	imulq pa_nb_a(%rip), %rsi
 -	call drop_pages
-+	movq SP_ID(%rbx), %rdx			# the first card's id of the slice
-+	call back_or_drop
++	movq %rbx, %rdi
++	movq %rax, %rsi
++	call back_split				# each card's slice to its own card
  	addq %rax, %r14
  	incq -88(%rbp)
-@@ -3681,5 +3849,10 @@ plan_whole:
+@@ -3681,5 +3892,10 @@ plan_whole:
  	addq pa_a(%rip), %rdi
  	movq -48(%rbp), %rsi
 -	call drop_pages
@@ -4048,7 +4109,7 @@ index 9f25cff..303af68 100644
 +	call back_whole
  	addq %rax, %r14
  811:	incq %r15
-@@ -4632,5 +4805,9 @@ issue:
+@@ -4632,5 +4848,9 @@ issue:
  	movq RDW_CI(%r15), %rcx
  	movq SP_ID(%rax,%rcx,8), %rax
 -	movq %rax, MM_A_ID(%rdi)
@@ -4059,7 +4120,7 @@ index 9f25cff..303af68 100644
 +1:	movq %rax, MM_A_ID(%rdi)
  	movl RD_A_TYPE(%rbx), %eax
  	movl %eax, MM_A_TYPE(%rdi)
-@@ -4901,5 +5078,9 @@ work_max:
+@@ -4901,5 +5121,9 @@ work_max:
  	.globl phi_ggml_begin_id_pair
  phi_ggml_begin_id_pair:
 -	pushq %rbp
@@ -4070,20 +4131,20 @@ index 9f25cff..303af68 100644
 +1:	pushq %rbp
  	movq %rsp, %rbp
  	pushq %rbx
-@@ -5657,4 +5838,5 @@ phi_ggml_free_all:
+@@ -5657,4 +5881,5 @@ phi_ggml_free_all:
  	movq $0, CD_UPLOADED(%rbx)
  	movl $0, CD_FULL(%rbx)
 +	movq $0, CD_STREAM_AT(%rbx)		# the streamed weights' places, forgotten with the splits
  	incl %r12d
  	jmp 1b
-@@ -5669,4 +5851,4 @@ phi_ggml_free_all:
+@@ -5669,4 +5894,4 @@ phi_ggml_free_all:
  	.section .data.rel.ro,"aw"
  	.balign 8
 -type_names:	.quad t_f32, t_f16, t_q4k, t_q5k, t_q6k, t_q80, t_iq4xs, t_bf16
 +type_names:	.quad t_f32, t_f16, t_q4k, t_q5k, t_q6k, t_q80, t_iq4xs, t_bf16, t_q40
  status_names:	.quad st_ok, st_alloc, st_pull, st_push, st_request, st_kernel
 diff --git a/host/asm/ggml-phi/backend.md b/host/asm/ggml-phi/backend.md
-index 41e6344..f467cc5 100644
+index 41e6344..994c8a2 100644
 --- a/host/asm/ggml-phi/backend.md
 +++ b/host/asm/ggml-phi/backend.md
 @@ -23,5 +23,5 @@ variables (every one with its Rust default):
@@ -4114,14 +4175,14 @@ index 41e6344..f467cc5 100644
 +
  ## Limits, said when reached
  
-@@ -156,2 +172,85 @@ backend. The backend loaded with no tensor allowed on a card
+@@ -156,2 +172,128 @@ backend. The backend loaded with no tensor allowed on a card
  the CPU alone's 7.76 and 7.92, interleaved: the hand-offs, not the
  cards, cost about 30 ms a token (`docs/results/2026-10-07-rack-generation.md`).
 +
 +## The card rows handed to a DMA router (`back_or_drop`, 2026-11-06)
 +
-+Under `PHI_GGML_OFFLOAD`, after a dense matrix's card rows are uploaded (the
-+range from row `SP_R0` to the last, card byte 0 of the slice, id `SP_ID`),
++Under `PHI_GGML_OFFLOAD`, after a dense matrix's card rows are uploaded (for
++each card its rows, card byte 0 of its slice, its id in `SP_ID`),
 +`back_or_drop` looks up `tridma_back` once with `dlsym(RTLD_DEFAULT, ...)`
 +(`imports.list` has `dlsym`; ggml loads this library `RTLD_LOCAL`, so the router
 +is an `LD_PRELOAD` library and this side passes it the window base and the thread
@@ -4135,10 +4196,53 @@ index 41e6344..f467cc5 100644
 +called for every expert a card holds where `plan_whole` dropped its pages):
 +the range is the expert's matrix in the mapped file, the id the holding
 +card's slice (`SP_ID`), the card byte the expert's place in that slice
-+(`WH_LOCAL` times the expert's bytes). The router speaks to the first card
-+only: an expert another card holds, and every expert when the process has no
-+router, is dropped as before. Until then the experts were always dropped, so a
-+prompt computed on a GPU read every card-held expert back from the disk.
++(`WH_LOCAL` times the expert's bytes), the window and thread count those of
++the card that holds it (`card_at` of the card index in `r8`). Every expert
++when the process has no router is dropped as before. Until then the experts
++were always dropped, so a prompt computed on a GPU read every card-held
++expert back from the disk.
++
++### Several cards (`back_split`, 2026-11-10)
++
++`back_or_drop(addr, len, id, card, a_off)` takes the card and the byte at
++which the rows begin in that card's slice, and looks up that card's window
++and threads (`card_at`). `back_split(split, expert)` walks the split's
++slices (`SP_NCARDS`, `SP_CARDS[k]`): slice k covers rows `SPC_LO..SPC_HI` of
++the matrix, is resident on card `SPC_CI` under `SP_ID[SPC_CI]`, and goes to
++the router as its own range. For a mixture the upload lays expert e's rows
++of a card at `e` times the slice's bytes in that card's id, so `back_split`
++passes that offset and a mixture's row share goes through the router too
++(before, only dense matrices did, and the experts' rows stayed with the
++host). Until this change all card rows of a matrix went out as one range
++under the first card's id: right with one card, and with several the router
++asked the first card for bytes it does not hold (`K_DOWNLOAD` status -4, the
++router aborts).
++
++Measured on four 3120 cards beside four GPUs, a 35 B Q8_0 mixture model,
++the first four blocks on the cards (`PHI_GGML_CARDS=0,1,2,3`, 0.91 to 0.94 GB
++a card), the router's check on (`TRIDMA_VERIFY=4`): 2,315 chunks equal to the
++file and 0 differing with whole experts placed, 12,127 and 0 with every
++tensor split by rows (`PHI_GGML_ALL_ROWS=1`, 12,332 ranges). The same code
++on one card: 2,283 equal, 0 differing, and a 220-token greedy output
++byte-identical to the build before the change.
++
++Every tensor split by rows across the cards, generation of 220 tokens, two
++prompts, one run each (`PHI_GGML_ALL_ROWS=1`, `PHI_GGML_THREADS` as listed):
++
++| cards | threads a card | tok/s | ms a token |
++|---|---|---|---|
++| 1, every row | 114 | 51.3, 51.6 | 19.4 |
++| 2, half each | 57 | 57.1, 57.2 | 17.5 |
++| 4, a quarter each | 28 | 62.0, 62.2 | 16.1 |
++| 4, a quarter each | 114 | 58.5, 58.4 | 17.1 |
++| none: every block on the GPUs | | 120.5, 120.3 | 8.3 |
++
++The times fit 15.0 ms + 4.4 ms / cards: the cards' arithmetic divides by
++their number, the round trips (about 22 a token, paid by all cards at once)
++and the GPUs' blocks do not. The best thread count a card was 114 divided by
++the number of cards. A card's part of a matrix is rounded up to 64-row units
++from the last card down and the first card takes the remainder (a 640-row
++matrix: 64, 192, 192, 192; the ledger, `PHI_GGML_VERBOSE=1`).
 +Measured on a 35 B Q6_K model, a 7120A holding every dense row and 109 whole
 +experts of each layer's 256 (12.92 GB), a 1,410-token prompt on an RTX 3090 Ti:
 +83.4 tok/s with the experts read from the disk, 358.0 with them from the card

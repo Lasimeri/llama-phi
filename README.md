@@ -26,6 +26,18 @@ The rows are different models, lengths and tools (the last is
 llama-bench at 16 tokens, the others llama-server), so they are not a
 ladder; each is documented with its conditions below.
 
+On an EPYC 7742 with 251 GB, four RTX 3080 20 GB and four 3120-series
+cards ([docs/multi-card.md](docs/multi-card.md)):
+
+| Layout | Script | Model | Generation, tok/s | Prompts, tok/s |
+|---|---|---|---|---|
+| VRAM over four GPUs, the first four blocks split by rows across four cards | `scripts/cards35.sh` | Qwen3.8-35B-A3B Q8_0, 35.21 GiB | 62.0, 62.2 (no card: 120.4) | 1,505 to 1,548 |
+| experts in system memory with a GPU cache, 12 blocks' experts fixed in VRAM, the first block on four cards | `scripts/flash.sh` | a 188.2 GB Q8_0 mixture model | 22.7 to 25.1 | 174 to 419, rising with the prompt's length |
+
+The cards cost speed on this machine, where the GPUs alone hold the
+smaller model: what four cards buy over one, and why it is not four
+times, is measured in that document.
+
 This repository holds the integration: patches to two existing public
 repositories, the scripts that fetch, patch and build everything, and
 the measurements. llama.cpp's source is not patched: it is built from a
@@ -48,7 +60,7 @@ integration:
 | Directory | What it is | How to check |
 |---|---|---|
 | `llama.cpp/` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) at commit `4b77dee0524c64b8471869232e2958bd9589607d`, every file, none changed | `git rev-parse HEAD:llama.cpp` gives `b02cf014b4690a51d8530f06edecb69cb91dfce9`, the tree of that commit |
-| `Intel-Phi-AVX-512-C/` | [Lasimeri/Intel-Phi-AVX-512-C](https://github.com/Lasimeri/Intel-Phi-AVX-512-C) at `87b3920`: `db092f6` with `patches/intel-phi-avx-512-c.patch` applied (card worker, ggml backend) | `git rev-parse HEAD:Intel-Phi-AVX-512-C` gives `6e11e7d6c410a04161290b39ff55760422b888e9`, the tree of that commit |
+| `Intel-Phi-AVX-512-C/` | [Lasimeri/Intel-Phi-AVX-512-C](https://github.com/Lasimeri/Intel-Phi-AVX-512-C) at `e56d8a5`: `db092f6` with `patches/intel-phi-avx-512-c.patch` applied (card worker, ggml backend) | `git rev-parse HEAD:Intel-Phi-AVX-512-C` gives `f604c826379fd9d23e18b4fce26e703e3b2be200`, the tree of that commit |
 | `tools/`, `cuda/`, `scripts/` | this repository's own: the preload libraries, the CUDA programs, the launchers | |
 
 Both directories were placed as git trees, not re-added file by file, so

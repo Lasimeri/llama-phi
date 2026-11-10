@@ -138,10 +138,11 @@ int posix_madvise(void *addr, size_t len, int advice) {
 //
 // fault thread  reads userfaultfd; a chunk not yet asked for goes on the demand queue and
 //               moves the read-ahead cursor there; it never waits for the card.
-// fetch thread  owns the card channel: demand chunks first, then read-ahead along the
-//               cursor, K_DOWNLOAD after K_DOWNLOAD into NSLOT staging slots of the
-//               window, so the card's link never waits for the host's copies.
-// fill thread   UFFDIO_COPY from a finished slot into the pages (which wakes the threads
+// fetch thread  one a card, owning that card's channel: its demand chunks first, then
+//               read-ahead along the cursor, K_DOWNLOAD after K_DOWNLOAD into NSLOT staging
+//               slots of that card's window, so no card's link waits for the host's copies
+//               or for another card: with several cards their downloads overlap.
+// fill thread   one a card as well: UFFDIO_COPY from a finished slot into the pages (which wakes the threads
 //               blocked on them), the slot back to the fetcher, the budget kept.
 //
 // The cursor crosses from the end of one range into the range that followed it last time
@@ -150,6 +151,8 @@ int posix_madvise(void *addr, size_t len, int advice) {
 
 #define NSLOT 4
 #define DQ_CAP 1024
+#define MAXC 16            // cards, each known by its window
+#define WQ_CAP 64          // chunks read ahead for a card whose fetcher has not taken them yet
 
 struct range {
     uintptr_t a, b;        // the anonymous range, page aligned
@@ -157,6 +160,7 @@ struct range {
     uint64_t card_off;     // the card byte of a
     uint32_t chunk0;       // this range's first index in chunk_state
     uint32_t n;            // its chunks
+    uint32_t card;         // the card that holds it: an index of cd
 };
 
 static struct range rg[MAX_RANGES];              // in registration order, never moved
@@ -172,8 +176,12 @@ static uint64_t resident;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t work_cv = PTHREAD_COND_INITIALIZER, fill_cv = PTHREAD_COND_INITIALIZER;
 static int uffd = -1;
-static unsigned char *win;                      // the card's window (the backend's mapping)
-static uint32_t card_threads;
+static struct {
+    unsigned char *win;                         // the card's window (the backend's mapping)
+    uint32_t threads;
+    int slot_free[NSLOT], nfree;                // its staging slots: free stack
+} cd[MAXC];
+static int ncards;
 static uint64_t opt_chunk, opt_budget, opt_stage, opt_ahead, slot_bytes;
 
 static uint32_t dq[DQ_CAP];                     // demand chunks, oldest first
@@ -182,11 +190,13 @@ static int pf_rg = -1;                          // the read-ahead cursor: range,
 static uint32_t pf_k, pf_count;                 // and chunks read ahead since the last fault
 static int tail_rg = -1;                        // the range the stream is in
 
-static int slot_free[NSLOT], nfree;             // staging slots: free stack
-static struct { uint32_t ci; uint64_t delta, len; } ready[NSLOT];
-static int ready_slot[NSLOT], ready_head, ready_len;
+static uint32_t wq[WQ_CAP], wq_len;             // read ahead, waiting for their card's fetcher
+static struct { uint32_t ci; uint64_t delta, len; } ready[MAXC][NSLOT];
+static uint16_t ready_q[MAXC * NSLOT];          // filled slots, oldest first: card << 8 | slot
+static int ready_head, ready_len;
 
 static uint64_t st_faults, st_demand, st_prefetch, st_bytes, st_evicted, st_dl_ns;
+static uint64_t b_dl_ns, b_fill_ns, b_evict_ns;               // the current burst: card time summed over the cards, copies, evictions
 static uint64_t opt_verify, st_vseen, st_vok, st_vbad;          // TRIDMA_VERIFY: a test of the data path
 static uint64_t b_bytes, b_t0, b_t1, b_demand, b_prefetch;   // the current burst
 
@@ -225,8 +235,11 @@ static void lock_take(volatile uint32_t *l) {
 }
 static void lock_drop(volatile uint32_t *l) { __atomic_store_n(l, 0, __ATOMIC_RELEASE); }
 
-// K_DOWNLOAD: bytes [off, off + bytes) of resident id into the window at d_off; 0 or the status
-static int card_download(uint64_t id, uint64_t off, uint64_t bytes, uint64_t d_off) {
+// K_DOWNLOAD: bytes [off, off + bytes) of card c's resident id into its window at d_off; 0 or
+// the status
+static int card_download(int c, uint64_t id, uint64_t off, uint64_t bytes, uint64_t d_off) {
+    unsigned char *win = cd[c].win;
+    const uint32_t card_threads = cd[c].threads;
     volatile uint32_t *lk = (volatile uint32_t *) (win + VPU_OFF_LOCK);
     lock_take(lk);
     struct vpu_matmul mm;
@@ -284,59 +297,111 @@ static int64_t next_prefetch(void) {
     return -1;
 }
 
-// the oldest chunks out while over budget (their pages fault again if read again; mu held)
+// The oldest chunks out while over budget (their pages fault again if read again). Called
+// and left with mu held, but the unmapping itself runs without it, so the fill threads of
+// the other cards go on: a chunk is 3 (leaving) for that time, which keeps a fetcher from
+// bringing it back while its old pages are still there, and it is 0 only once they are gone.
+#define EV_MAX 16
 static void evict(void) {
-    while (resident > opt_budget && fifo_len) {
-        const uint32_t ci = fifo[fifo_head];
-        fifo_head = (fifo_head + 1) % MAX_CHUNKS;
-        fifo_len--;
-        if (chunk_state[ci] != 2) continue;
-        const struct range *r = &rg[chunk_rg[ci]];
-        const uintptr_t a = r->a + (uint64_t) (ci - r->chunk0) * opt_chunk;
-        const uint64_t len = (r->b - a) < opt_chunk ? (r->b - a) : opt_chunk;
-        if (!real_madvise) real_madvise = (int (*)(void *, size_t, int)) dlsym(RTLD_NEXT, "madvise");
-        real_madvise((void *) a, len, MADV_DONTNEED);
-        resident -= len;
-        st_evicted++;
-        chunk_state[ci] = 0;
+    if (!real_madvise) real_madvise = (int (*)(void *, size_t, int)) dlsym(RTLD_NEXT, "madvise");
+    for (;;) {
+        struct { uintptr_t a; uint64_t len; uint32_t ci; } v[EV_MAX];
+        int n = 0;
+        while (n < EV_MAX && resident > opt_budget && fifo_len) {
+            const uint32_t ci = fifo[fifo_head];
+            fifo_head = (fifo_head + 1) % MAX_CHUNKS;
+            fifo_len--;
+            if (chunk_state[ci] != 2) continue;
+            const struct range *r = &rg[chunk_rg[ci]];
+            v[n].a = r->a + (uint64_t) (ci - r->chunk0) * opt_chunk;
+            v[n].len = (r->b - v[n].a) < opt_chunk ? (r->b - v[n].a) : opt_chunk;
+            v[n].ci = ci;
+            chunk_state[ci] = 3;
+            resident -= v[n].len;
+            n++;
+        }
+        if (!n) return;
+        pthread_mutex_unlock(&mu);
+        for (int i = 0; i < n; i++) real_madvise((void *) v[i].a, v[i].len, MADV_DONTNEED);
+        pthread_mutex_lock(&mu);
+        for (int i = 0; i < n; i++) chunk_state[v[i].ci] = 0;
+        st_evicted += (uint64_t) n;
+        pthread_cond_broadcast(&work_cv);
     }
 }
 
+static uint32_t chunk_card(uint32_t ci) { return rg[chunk_rg[ci]].card; }
+
+// nothing queued, in flight or waiting to be copied (mu held)
+static int all_idle(void) {
+    if (ready_len || wq_len) return 0;
+    for (int i = 0; i < ncards; i++)
+        if (cd[i].nfree != NSLOT) return 0;
+    return 1;
+}
+
+// the next chunk for card c to fetch, or -1 (mu held): a demand chunk of that card first,
+// then what was read ahead for it, then the cursor itself. A chunk the cursor yields for
+// another card is queued for that card's fetcher, which is how the cards' downloads overlap:
+// each fetcher keeps its own link busy and none waits for a chunk that is not its own.
+static int64_t take_work(uint32_t c, int *pre) {
+    if (!cd[c].nfree) return -1;
+    int64_t got = -1;
+    uint32_t keep = 0;
+    for (uint32_t i = 0; i < dq_len; i++) {
+        const uint32_t x = dq[(dq_head + i) % DQ_CAP];
+        if (chunk_state[x] == 1 || chunk_state[x] == 2) continue;   // fetched or queued since
+        if (got < 0 && chunk_state[x] == 0 && chunk_card(x) == c) { got = x; continue; }
+        dq[(dq_head + keep++) % DQ_CAP] = x;                // another card's, or still leaving
+    }
+    dq_len = keep;
+    if (got >= 0) { *pre = 0; return got; }
+    for (uint32_t i = 0; i < wq_len; i++)
+        if (chunk_card(wq[i]) == c) {
+            got = wq[i];
+            memmove(&wq[i], &wq[i + 1], (wq_len - i - 1) * sizeof wq[0]);
+            wq_len--;
+            *pre = 1;
+            return got;
+        }
+    while (wq_len < WQ_CAP) {
+        const int64_t x = next_prefetch();
+        if (x < 0) break;
+        chunk_state[x] = 1;
+        if (chunk_card((uint32_t) x) == c) { *pre = 1; return x; }
+        wq[wq_len++] = (uint32_t) x;
+        pthread_cond_broadcast(&work_cv);
+    }
+    return -1;
+}
+
 static void *fetcher(void *arg) {
-    (void) arg;
+    const uint32_t c = (uint32_t) (uintptr_t) arg;
     pthread_mutex_lock(&mu);
     for (;;) {
         int64_t ci = -1;
         int pre = 0;
         while (ci < 0) {
-            if (nfree) {
-                while (dq_len && ci < 0) {
-                    const uint32_t c = dq[dq_head];
-                    dq_head = (dq_head + 1) % DQ_CAP;
-                    dq_len--;
-                    if (chunk_state[c] == 0) ci = c;
-                }
-                if (ci < 0 && (ci = next_prefetch()) >= 0) pre = 1;
-            }
-            if (ci >= 0) break;
+            if ((ci = take_work(c, &pre)) >= 0) break;
             struct timespec t;
             clock_gettime(CLOCK_REALTIME, &t);
             t.tv_nsec += 200000000L;
             if (t.tv_nsec >= 1000000000L) { t.tv_sec++; t.tv_nsec -= 1000000000L; }
-            if (pthread_cond_timedwait(&work_cv, &mu, &t) && b_bytes && vb() && !ready_len && nfree == NSLOT) {
+            if (pthread_cond_timedwait(&work_cv, &mu, &t) && b_bytes && vb() && all_idle()) {
                 char v[96] = "";
                 if (opt_verify)
                     snprintf(v, sizeof v, "; verified %llu chunks equal to the GGUF, %llu differ",
                              (unsigned long long) st_vok, (unsigned long long) st_vbad);
                 fprintf(stderr, "tridma: burst %.3f GB in %.3f s (%.2f GB/s): %llu chunks on demand, %llu read ahead; "
-                                "%llu evicted, %.0f MiB resident%s\n", b_bytes / 1e9, (b_t1 - b_t0) / 1e9,
+                                "%llu evicted, %.0f MiB resident; cards busy %.3f s in all, copies %.3f s, evictions %.3f s%s\n", b_bytes / 1e9, (b_t1 - b_t0) / 1e9,
                         b_bytes / ((b_t1 - b_t0) * 1e-9) / 1e9, (unsigned long long) b_demand,
-                        (unsigned long long) b_prefetch, (unsigned long long) st_evicted, resident / 1048576.0, v);
-                b_bytes = b_demand = b_prefetch = 0;
+                        (unsigned long long) b_prefetch, (unsigned long long) st_evicted, resident / 1048576.0,
+                        b_dl_ns / 1e9, b_fill_ns / 1e9, b_evict_ns / 1e9, v);
+                b_bytes = b_demand = b_prefetch = b_dl_ns = b_fill_ns = b_evict_ns = 0;
             }
         }
         chunk_state[ci] = 1;
-        const int s = slot_free[--nfree];
+        const int s = cd[c].slot_free[--cd[c].nfree];
         const struct range *r = &rg[chunk_rg[ci]];
         const uintptr_t a = r->a + (uint64_t) (ci - r->chunk0) * opt_chunk;
         const uint64_t len = (r->b - a) < opt_chunk ? (r->b - a) : opt_chunk;
@@ -348,24 +413,25 @@ static void *fetcher(void *arg) {
         pthread_mutex_unlock(&mu);
 
         const uint64_t t0 = now_ns();
-        const int st = card_download(id, off0, bytes, opt_stage + (uint64_t) s * slot_bytes);
+        const int st = card_download((int) c, id, off0, bytes, opt_stage + (uint64_t) s * slot_bytes);
         const uint64_t t1 = now_ns();
         if (st) {
-            fprintf(stderr, "tridma: K_DOWNLOAD of id %llu, %llu bytes at %llu failed: status %d; aborting rather than "
-                            "giving the GPU wrong weights\n", (unsigned long long) id, (unsigned long long) bytes,
-                    (unsigned long long) off0, st);
+            fprintf(stderr, "tridma: K_DOWNLOAD from card %u of id %llu, %llu bytes at %llu failed: status %d; aborting "
+                            "rather than giving the GPU wrong weights\n", c, (unsigned long long) id,
+                    (unsigned long long) bytes, (unsigned long long) off0, st);
             abort();
         }
 
         pthread_mutex_lock(&mu);
         st_dl_ns += t1 - t0;
-        if (!b_bytes) b_t0 = t0;
-        b_t1 = t1;
+        b_dl_ns += t1 - t0;
+        if (!b_bytes || t0 < b_t0) b_t0 = t0;
+        if (t1 > b_t1) b_t1 = t1;
         b_bytes += len;
-        ready[s].ci = (uint32_t) ci;
-        ready[s].delta = delta;
-        ready[s].len = len;
-        ready_slot[(ready_head + ready_len) % NSLOT] = s;
+        ready[c][s].ci = (uint32_t) ci;
+        ready[c][s].delta = delta;
+        ready[c][s].len = len;
+        ready_q[(ready_head + ready_len) % (MAXC * NSLOT)] = (uint16_t) (c << 8 | (uint32_t) s);
         ready_len++;
         pthread_cond_signal(&fill_cv);
     }
@@ -374,7 +440,14 @@ static void *fetcher(void *arg) {
 
 // TRIDMA_VERIFY=N: every Nth chunk filled is compared, in the pages themselves, with the GGUF
 // file at the same offset (read for the test only and dropped from the page cache after).
-static void verify_chunk(uintptr_t a, uint64_t len) {
+static void verify_one(uintptr_t a, uint64_t len);
+static void verify_chunk(uintptr_t a, uint64_t len) {   // one fill thread at a time: it shares a buffer
+    static pthread_mutex_t vmu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&vmu);
+    verify_one(a, len);
+    pthread_mutex_unlock(&vmu);
+}
+static void verify_one(uintptr_t a, uint64_t len) {
     static int vfd[MAX_GGUF] = {[0 ... MAX_GGUF - 1] = -1};
     static unsigned char *buf;
     int gi = -1;
@@ -408,22 +481,25 @@ static void *filler(void *arg) {
     pthread_mutex_lock(&mu);
     for (;;) {
         while (!ready_len) pthread_cond_wait(&fill_cv, &mu);
-        const int s = ready_slot[ready_head];
-        ready_head = (ready_head + 1) % NSLOT;
+        const uint32_t q = ready_q[ready_head], c = q >> 8;
+        const int s = (int) (q & 255);
+        ready_head = (ready_head + 1) % (MAXC * NSLOT);
         ready_len--;
-        const uint32_t ci = ready[s].ci;
+        const uint32_t ci = ready[c][s].ci;
         const struct range *r = &rg[chunk_rg[ci]];
         const uintptr_t a = r->a + (uint64_t) (ci - r->chunk0) * opt_chunk;
-        const uint64_t len = ready[s].len;
-        const uintptr_t src = (uintptr_t) (win + opt_stage + (uint64_t) s * slot_bytes + ready[s].delta);
+        const uint64_t len = ready[c][s].len;
+        const uintptr_t src = (uintptr_t) (cd[c].win + opt_stage + (uint64_t) s * slot_bytes + ready[c][s].delta);
         pthread_mutex_unlock(&mu);
 
-        struct uffdio_copy c = {.dst = a, .src = src, .len = len, .mode = 0};
-        if (ioctl(uffd, UFFDIO_COPY, &c) && errno != EEXIST) {
+        const uint64_t f0 = now_ns();
+        struct uffdio_copy cp = {.dst = a, .src = src, .len = len, .mode = 0};
+        if (ioctl(uffd, UFFDIO_COPY, &cp) && errno != EEXIST) {
             fprintf(stderr, "tridma: UFFDIO_COPY at %#lx: %s\n", (unsigned long) a, strerror(errno));
             abort();
         }
-        if (opt_verify && st_vseen++ % opt_verify == 0) verify_chunk(a, len);
+        const uint64_t f1 = now_ns();
+        if (opt_verify && __atomic_fetch_add(&st_vseen, 1, __ATOMIC_RELAXED) % opt_verify == 0) verify_chunk(a, len);
 
         pthread_mutex_lock(&mu);
         chunk_state[ci] = 2;
@@ -431,9 +507,12 @@ static void *filler(void *arg) {
         fifo_len++;
         resident += len;
         st_bytes += len;
+        b_fill_ns += f1 - f0;
+        const uint64_t e0 = now_ns();
         evict();
-        slot_free[nfree++] = s;
-        pthread_cond_signal(&work_cv);
+        b_evict_ns += now_ns() - e0;
+        cd[c].slot_free[cd[c].nfree++] = s;
+        pthread_cond_broadcast(&work_cv);
         if (vb() && (st_demand + st_prefetch) % 512 == 0)
             fprintf(stderr, "tridma: %llu faults, %llu chunks on demand, %llu read ahead (%.2f GB, card %.2f GB/s), "
                             "%llu evicted, %.0f MiB resident\n", (unsigned long long) st_faults,
@@ -472,16 +551,41 @@ static void *faults(void *arg) {
             pf_rg = j;
             pf_k = k + 1;
             pf_count = 0;
+        } else if (chunk_state[ci] == 3) {    // on its way out: wanted again once it has gone
+            if (dq_len < DQ_CAP) { dq[(dq_head + dq_len) % DQ_CAP] = ci; dq_len++; }
+            pf_count = 0;
         } else {                              // asked for already: the reader caught up
             pf_count = 0;
         }
-        pthread_cond_signal(&work_cv);
+        pthread_cond_broadcast(&work_cv);
         pthread_mutex_unlock(&mu);
     }
     return NULL;
 }
 
-static int router_init(unsigned char *window, uint32_t threads) {
+// the card whose window this is, known from now on with a fetch thread of its own and one
+// more fill thread (the copies into place were the narrow part with several cards: one
+// thread spent 1.04 s copying what four cards had delivered in 0.29 s each); -1 (mu held)
+static int card_for(unsigned char *window, uint32_t threads) {
+    for (int i = 0; i < ncards; i++)
+        if (cd[i].win == window) return i;
+    if (ncards == MAXC) return -1;
+    const int c = ncards;
+    cd[c].win = window;
+    cd[c].threads = threads;
+    cd[c].nfree = 0;
+    for (int i = 0; i < NSLOT; i++) cd[c].slot_free[cd[c].nfree++] = NSLOT - 1 - i;
+    pthread_t t;
+    if (pthread_create(&t, NULL, fetcher, (void *) (uintptr_t) c)) return -1;
+    pthread_detach(t);
+    if (pthread_create(&t, NULL, filler, NULL)) return -1;
+    pthread_detach(t);
+    ncards++;
+    if (vb()) fprintf(stderr, "tridma: card %d: a fetch thread and a fill thread of its own, %d staging slots in its window\n", c, NSLOT);
+    return c;
+}
+
+static int router_init(void) {
     if (uffd >= 0) return 0;
     opt_chunk = env_u64("TRIDMA_CHUNK", 8ull << 20) & ~(PG - 1);
     opt_ahead = env_u64("TRIDMA_AHEAD", 32);
@@ -489,40 +593,37 @@ static int router_init(unsigned char *window, uint32_t threads) {
     opt_stage = env_u64("TRIDMA_STAGE", 1ull << 30);
     opt_verify = env_u64("TRIDMA_VERIFY", 0);
     if (!opt_chunk || opt_stage % PG) return -1;
-    if (opt_budget < (opt_ahead + NSLOT + 2) * opt_chunk) {
+    // what is read ahead and what four cards hold in their slots must fit the budget
+    if (opt_budget < (opt_ahead + 4 * NSLOT + 2) * opt_chunk) {
         fprintf(stderr, "tridma: TRIDMA_BUDGET under (TRIDMA_AHEAD + %d) chunks would evict what was read ahead; "
-                        "raising it\n", NSLOT + 2);
-        opt_budget = (opt_ahead + NSLOT + 2) * opt_chunk;
+                        "raising it\n", 4 * NSLOT + 2);
+        opt_budget = (opt_ahead + 4 * NSLOT + 2) * opt_chunk;
     }
     slot_bytes = opt_chunk + 2 * PG;
     for (int i = 0; i < MAX_RANGES; i++) succ[i] = -1;
-    for (int i = 0; i < NSLOT; i++) slot_free[nfree++] = NSLOT - 1 - i;
     uffd = (int) syscall(SYS_userfaultfd, O_CLOEXEC | UFFD_USER_MODE_ONLY);
     if (uffd < 0) { fprintf(stderr, "tridma: userfaultfd: %s\n", strerror(errno)); return -1; }
     struct uffdio_api api = {.api = UFFD_API, .features = 0};
     if (ioctl(uffd, UFFDIO_API, &api)) { fprintf(stderr, "tridma: UFFDIO_API: %s\n", strerror(errno)); return -1; }
-    win = window;
-    card_threads = threads;
-    void *(*fn[3])(void *) = {faults, fetcher, filler};
-    for (int i = 0; i < 3; i++) {
-        pthread_t t;
-        if (pthread_create(&t, NULL, fn[i], NULL)) return -1;
-        pthread_detach(t);
-    }
-    fprintf(stderr, "tridma: card-backed pages on: chunk %llu KiB, %llu read ahead, %d staging slots, budget %llu MiB, "
-                    "staging at %llu MiB of the window\n", (unsigned long long) (opt_chunk >> 10),
+    pthread_t t;
+    if (pthread_create(&t, NULL, faults, NULL)) return -1;
+    pthread_detach(t);
+    fprintf(stderr, "tridma: card-backed pages on: chunk %llu KiB, %llu read ahead, %d staging slots a card, budget %llu MiB, "
+                    "staging at %llu MiB of each card's window\n", (unsigned long long) (opt_chunk >> 10),
             (unsigned long long) opt_ahead, NSLOT, (unsigned long long) (opt_budget >> 20),
             (unsigned long long) (opt_stage >> 20));
     return 0;
 }
 
-// Called by libggml_phi.so (back_or_drop) right after it uploaded a dense matrix's card
-// rows [addr, addr + len) as resident id, card byte a_off; the bytes now card-backed, or 0
-// (the caller then drops the pages as before).
+// Called by libggml_phi.so (back_or_drop, back_whole) right after it uploaded one card's
+// rows [addr, addr + len) as that card's resident id, card byte a_off; window and threads
+// are that card's. The bytes now card-backed, or 0 (the caller then drops the pages as
+// before).
 size_t tridma_back(void *addr, size_t len, uint64_t id, uint64_t a_off, unsigned char *window, uint32_t threads) {
     pthread_mutex_lock(&mu);
     size_t done = 0;
-    if (router_init(window, threads) == 0 && nranges < MAX_RANGES) {
+    const int card = router_init() == 0 ? card_for(window, threads) : -1;
+    if (card >= 0 && nranges < MAX_RANGES) {
         const uintptr_t a = ((uintptr_t) addr + PG - 1) & ~(PG - 1);
         const uintptr_t b = ((uintptr_t) addr + len) & ~(PG - 1);
         const uint64_t n = b > a ? (b - a + opt_chunk - 1) / opt_chunk : 0;
@@ -536,7 +637,7 @@ size_t tridma_back(void *addr, size_t len, uint64_t id, uint64_t a_off, unsigned
                 struct uffdio_register reg = {.range = {.start = a, .len = b - a}, .mode = UFFDIO_REGISTER_MODE_MISSING};
                 if (ioctl(uffd, UFFDIO_REGISTER, &reg) == 0) {
                     const int idx = nranges++;
-                    rg[idx] = (struct range){a, b, id, a_off + (a - (uintptr_t) addr), nchunks, (uint32_t) n};
+                    rg[idx] = (struct range){a, b, id, a_off + (a - (uintptr_t) addr), nchunks, (uint32_t) n, (uint32_t) card};
                     for (uint32_t c = 0; c < n; c++) chunk_rg[nchunks + c] = (uint16_t) idx;
                     nchunks += (uint32_t) n;
                     int i = idx;   // the address index, kept sorted

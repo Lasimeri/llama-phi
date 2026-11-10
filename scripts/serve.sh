@@ -38,16 +38,23 @@ mkdir -p "$runs"
 # not to the card. pool_release returns the pool's free pages to the card (nr_hugepages down
 # to the pages still in use: the worker's own buffers); pool_reserve grows it back first.
 pages=${PHI_VPU_HUGEPAGES:-5600}
-card_sh() { timeout 60 phi -c "${PHI_GGML_CARDS:-0}" run sh -c "$1" < /dev/null; }
+# PHI_GGML_CARDS may name several cards (0,1,2,3): each has a pool of its own.
+cards=${PHI_GGML_CARDS:-0}
+card_sh() { timeout 60 phi -c "$1" run sh -c "$2" < /dev/null; }
 pool_reserve() {
-    local have
-    have=$(card_sh "echo $pages > /proc/sys/vm/nr_hugepages; cat /proc/sys/vm/nr_hugepages")
-    echo "serve: card huge-page pool $have of $pages pages"
-    [ "$have" = "$pages" ] || echo "serve: the card granted $have of $pages; larger uploads fall back to 4 KiB pages" >&2
+    local c have
+    for c in ${cards//,/ }; do
+        have=$(card_sh "$c" "echo $pages > /proc/sys/vm/nr_hugepages; cat /proc/sys/vm/nr_hugepages")
+        echo "serve: card $c huge-page pool $have of $pages pages"
+        [ "$have" = "$pages" ] || echo "serve: card $c granted $have of $pages; larger uploads fall back to 4 KiB pages" >&2
+    done
 }
 pool_release() {
-    card_sh 'set -- $(awk "/HugePages_Total/ {t=\$2} /HugePages_Free/ {f=\$2} END {print t, f}" /proc/meminfo); echo $(($1 - $2)) > /proc/sys/vm/nr_hugepages; grep -E "HugePages_Total|MemFree" /proc/meminfo' | tr '\n' ' '
-    echo
+    local c
+    for c in ${cards//,/ }; do
+        card_sh "$c" 'set -- $(awk "/HugePages_Total/ {t=\$2} /HugePages_Free/ {f=\$2} END {print t, f}" /proc/meminfo); echo $(($1 - $2)) > /proc/sys/vm/nr_hugepages; grep -E "HugePages_Total|MemFree" /proc/meminfo' | tr '\n' ' '
+        echo
+    done
 }
 
 server_pid() {   # the pid in the pid file, if it is still a llama-server

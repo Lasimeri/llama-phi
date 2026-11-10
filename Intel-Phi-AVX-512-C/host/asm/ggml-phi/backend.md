@@ -174,8 +174,8 @@ cards, cost about 30 ms a token (`docs/results/2026-10-07-rack-generation.md`).
 
 ## The card rows handed to a DMA router (`back_or_drop`, 2026-11-06)
 
-Under `PHI_GGML_OFFLOAD`, after a dense matrix's card rows are uploaded (the
-range from row `SP_R0` to the last, card byte 0 of the slice, id `SP_ID`),
+Under `PHI_GGML_OFFLOAD`, after a dense matrix's card rows are uploaded (for
+each card its rows, card byte 0 of its slice, its id in `SP_ID`),
 `back_or_drop` looks up `tridma_back` once with `dlsym(RTLD_DEFAULT, ...)`
 (`imports.list` has `dlsym`; ggml loads this library `RTLD_LOCAL`, so the router
 is an `LD_PRELOAD` library and this side passes it the window base and the thread
@@ -189,10 +189,53 @@ A mixture's whole experts go the same way since 2026-11-10 (`back_whole`,
 called for every expert a card holds where `plan_whole` dropped its pages):
 the range is the expert's matrix in the mapped file, the id the holding
 card's slice (`SP_ID`), the card byte the expert's place in that slice
-(`WH_LOCAL` times the expert's bytes). The router speaks to the first card
-only: an expert another card holds, and every expert when the process has no
-router, is dropped as before. Until then the experts were always dropped, so a
-prompt computed on a GPU read every card-held expert back from the disk.
+(`WH_LOCAL` times the expert's bytes), the window and thread count those of
+the card that holds it (`card_at` of the card index in `r8`). Every expert
+when the process has no router is dropped as before. Until then the experts
+were always dropped, so a prompt computed on a GPU read every card-held
+expert back from the disk.
+
+### Several cards (`back_split`, 2026-11-10)
+
+`back_or_drop(addr, len, id, card, a_off)` takes the card and the byte at
+which the rows begin in that card's slice, and looks up that card's window
+and threads (`card_at`). `back_split(split, expert)` walks the split's
+slices (`SP_NCARDS`, `SP_CARDS[k]`): slice k covers rows `SPC_LO..SPC_HI` of
+the matrix, is resident on card `SPC_CI` under `SP_ID[SPC_CI]`, and goes to
+the router as its own range. For a mixture the upload lays expert e's rows
+of a card at `e` times the slice's bytes in that card's id, so `back_split`
+passes that offset and a mixture's row share goes through the router too
+(before, only dense matrices did, and the experts' rows stayed with the
+host). Until this change all card rows of a matrix went out as one range
+under the first card's id: right with one card, and with several the router
+asked the first card for bytes it does not hold (`K_DOWNLOAD` status -4, the
+router aborts).
+
+Measured on four 3120 cards beside four GPUs, a 35 B Q8_0 mixture model,
+the first four blocks on the cards (`PHI_GGML_CARDS=0,1,2,3`, 0.91 to 0.94 GB
+a card), the router's check on (`TRIDMA_VERIFY=4`): 2,315 chunks equal to the
+file and 0 differing with whole experts placed, 12,127 and 0 with every
+tensor split by rows (`PHI_GGML_ALL_ROWS=1`, 12,332 ranges). The same code
+on one card: 2,283 equal, 0 differing, and a 220-token greedy output
+byte-identical to the build before the change.
+
+Every tensor split by rows across the cards, generation of 220 tokens, two
+prompts, one run each (`PHI_GGML_ALL_ROWS=1`, `PHI_GGML_THREADS` as listed):
+
+| cards | threads a card | tok/s | ms a token |
+|---|---|---|---|
+| 1, every row | 114 | 51.3, 51.6 | 19.4 |
+| 2, half each | 57 | 57.1, 57.2 | 17.5 |
+| 4, a quarter each | 28 | 62.0, 62.2 | 16.1 |
+| 4, a quarter each | 114 | 58.5, 58.4 | 17.1 |
+| none: every block on the GPUs | | 120.5, 120.3 | 8.3 |
+
+The times fit 15.0 ms + 4.4 ms / cards: the cards' arithmetic divides by
+their number, the round trips (about 22 a token, paid by all cards at once)
+and the GPUs' blocks do not. The best thread count a card was 114 divided by
+the number of cards. A card's part of a matrix is rounded up to 64-row units
+from the last card down and the first card takes the remainder (a 640-row
+matrix: 64, 192, 192, 192; the ledger, `PHI_GGML_VERBOSE=1`).
 Measured on a 35 B Q6_K model, a 7120A holding every dense row and 109 whole
 experts of each layer's 256 (12.92 GB), a 1,410-token prompt on an RTX 3090 Ti:
 83.4 tok/s with the experts read from the disk, 358.0 with them from the card
