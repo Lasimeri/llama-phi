@@ -109,10 +109,15 @@ the card could take only its one Q6_K matrix: [docs/q4_0.md](docs/q4_0.md).
 The same model on one server (`scripts/one.sh`): the context and
 attention on the GPU, every row of 60 layers' matrices on the card, the
 last four layers and the output head in VRAM, so the host computes no
-matrix rows; 2.478 tok/s, prompts 313 tok/s from the second on, and half
-the VRAM of the split. The card worker no longer executes an x87
-instruction. What was measured, the order in which a layer's multiplies
-reach the card, and what is not built yet:
+matrix rows; 3.22 to 3.28 tok/s, prompts 315 to 319 tok/s from the
+second on, and half the VRAM of the split. Three changes took it there
+from 2.42 to 2.54: the backend begins a multiply whose input is ready
+before its node arrives, so the card works while the host and the GPU
+handle the previous result; a kernel for one activation row that needs
+72 vector operations for 256 weights where the first took 114; and long
+rows walked in segments that fit a core's first-level cache twice. The
+card worker no longer executes an x87 instruction. What was measured,
+what each change gave, and what was tried and dropped:
 [docs/one-server.md](docs/one-server.md).
 
 ## Use

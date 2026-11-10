@@ -15,6 +15,8 @@
 #                          the GPU, the weights copied over per batch
 # stop also frees every weight the card holds (VPU_K_FREE 0 through repo/cuda vpu_dma -F),
 # so nothing stays resident on the card while no server uses it.
+# CARD_THREADS (120) is the number of slices a multiply is cut into on the card: two a
+# core on a 7120A; a worker started with more pool threads takes more (docs/one-server.md).
 set -euo pipefail
 work=${1:?usage: serve.sh WORK_DIR MODEL.gguf start|stop|status}
 model=${2:?usage: serve.sh WORK_DIR MODEL.gguf start|stop|status}
@@ -62,7 +64,7 @@ case "$cmd" in
         pool_reserve
         log=$runs/server-$(date +%Y%m%d-%H%M%S).log
         env GGML_BACKEND_PATH="$work/Intel-Phi-AVX-512-C/host/asm/out/libggml_phi.so" \
-            PHI_GGML_CARDS=${PHI_GGML_CARDS:-0} PHI_GGML_THREADS=120 \
+            PHI_GGML_CARDS=${PHI_GGML_CARDS:-0} PHI_GGML_THREADS=${CARD_THREADS:-120} \
             PHI_GGML_CARD_BYTES=${CARD_BYTES:-10500000000} PHI_GGML_OFFLOAD=1 \
             PHI_GGML_HOST_THREADS=${HOST_THREADS:-14} PHI_GGML_TG_ONLY=${TG_ONLY:-31} \
             nohup "$bin" -m "$model" --alias "$alias" "${place[@]}" \

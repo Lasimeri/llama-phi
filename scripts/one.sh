@@ -23,6 +23,13 @@
 #   CARD_BYTES, PHI_VPU_HUGEPAGES, HOST_THREADS, TG_ONLY, SERVE_CTX,
 #   SERVE_ALIAS, SERVE_ARGS, SERVE_PORT: as in serve.sh, with the defaults
 #   of this layout below
+#   CARD_THREADS    the slices a multiply is cut into on the card (120:
+#                   two a core; 180 with a worker started with 181 threads)
+# Read by the backend from the environment, passed through untouched:
+#   PHI_GGML_AHEAD=1         a multiply whose input is ready is begun
+#                            before its node (the measured layout sets it)
+#   OMP_WAIT_POLICY=PASSIVE  the host's idle threads sleep: about six
+#                            cores freed, generation about 5 % slower
 set -euo pipefail
 work=${1:?usage: one.sh WORK_DIR MODEL.gguf start|stop|status}
 model=${2:?usage: one.sh WORK_DIR MODEL.gguf start|stop|status}

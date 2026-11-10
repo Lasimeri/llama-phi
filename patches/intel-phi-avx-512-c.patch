@@ -176,10 +176,10 @@ index 4d66789..e511976 100644
    worker's (`vpu_worker.md`, "What a dispatch costs").
  - **The per-thread block**: the thread pointer convention wants the
 diff --git a/card/vpu/kernels.S b/card/vpu/kernels.S
-index 9a6a772..9cbb9b3 100644
+index 9a6a772..ffd3e8f 100644
 --- a/card/vpu/kernels.S
 +++ b/card/vpu/kernels.S
-@@ -7337,2 +7337,1265 @@ phi_bench:
+@@ -7337,2 +7337,1373 @@ phi_bench:
      .size phi_bench, .-phi_bench
  
 +# The Q4_0 kernels (2026-11-09): the output of tools/q4_0-kernels.c.
@@ -1445,32 +1445,143 @@ index 9a6a772..9cbb9b3 100644
 +    pop %rbx
 +    ret
 +    .size phi_q4_0_8h, .-phi_q4_0_8h
++
++# phi_q4_0_row1p: a Q4_0 weight row, or a segment of one, against 1 prepared activation row
++    .globl phi_q4_0_row1p
++    .type phi_q4_0_row1p, @function
++phi_q4_0_row1p:
++	VMOVAPS zmm0, r8, 0	# vmovaps zmm0, [r8+0]
++	VPXORD zmm1, zmm1, zmm1	# vpxord zmm1, zmm1, zmm1
++	VPXORD zmm2, zmm2, zmm2	# vpxord zmm2, zmm2, zmm2
++	VPXORD zmm3, zmm3, zmm3	# vpxord zmm3, zmm3, zmm3
++    lea 576(%rdi), %r10
++    cmp $4, %rdx
++    ja 1f
++    add %rcx, %r10
++1:
++	VPREFETCH0 r10, 0	# vprefetch0 [r10+0]
++	VPREFETCH0 r10, 64	# vprefetch0 [r10+64]
++	VPREFETCH0 r10, 128	# vprefetch0 [r10+128]
++	VPREFETCH1 rdi, 2304	# vprefetch1 [rdi+2304]
++	VPREFETCH1 rdi, 2368	# vprefetch1 [rdi+2368]
++	VPREFETCH1 rdi, 2432	# vprefetch1 [rdi+2432]
++	VLOADUNPACKLPS zmm8, rdi, 2, conv=CV_U8	# vloadunpacklps zmm8, [rdi+2]{uint8}
++	VLOADUNPACKLPS zmm9, rdi, 20, conv=CV_U8	# vloadunpacklps zmm9, [rdi+20]{uint8}
++	VLOADUNPACKLPS zmm10, rdi, 38, conv=CV_U8	# vloadunpacklps zmm10, [rdi+38]{uint8}
++	VLOADUNPACKLPS zmm11, rdi, 56, conv=CV_U8	# vloadunpacklps zmm11, [rdi+56]{uint8}
++	VLOADUNPACKHPS zmm8, rdi, 66, conv=CV_U8	# vloadunpackhps zmm8, [rdi+66]{uint8}
++	VLOADUNPACKHPS zmm9, rdi, 84, conv=CV_U8	# vloadunpackhps zmm9, [rdi+84]{uint8}
++	VLOADUNPACKHPS zmm10, rdi, 102, conv=CV_U8	# vloadunpackhps zmm10, [rdi+102]{uint8}
++	VLOADUNPACKHPS zmm11, rdi, 120, conv=CV_U8	# vloadunpackhps zmm11, [rdi+120]{uint8}
++	VBROADCASTSS zmm16, rdi, 0, conv=CV_F16	# vbroadcastss zmm16, [rdi+0]{float16}
++	VBROADCASTSS zmm17, rdi, 18, conv=CV_F16	# vbroadcastss zmm17, [rdi+18]{float16}
++	VBROADCASTSS zmm18, rdi, 36, conv=CV_F16	# vbroadcastss zmm18, [rdi+36]{float16}
++	VBROADCASTSS zmm19, rdi, 54, conv=CV_F16	# vbroadcastss zmm19, [rdi+54]{float16}
++	VMULPS zmm12, zmm8, r9, 24, conv=CV_1TO16	# vmulps zmm12, zmm8, [r9+24]{1to16}
++	VMULPS zmm13, zmm9, r9, 24, conv=CV_1TO16	# vmulps zmm13, zmm9, [r9+24]{1to16}
++	VMULPS zmm14, zmm10, r9, 24, conv=CV_1TO16	# vmulps zmm14, zmm10, [r9+24]{1to16}
++	VMULPS zmm15, zmm11, r9, 24, conv=CV_1TO16	# vmulps zmm15, zmm11, [r9+24]{1to16}
++	VMULPS zmm8, zmm8, rsi, 0	# vmulps zmm8, zmm8, [rsi+0]
++	VMULPS zmm9, zmm9, rsi, 128	# vmulps zmm9, zmm9, [rsi+128]
++	VMULPS zmm10, zmm10, rsi, 256	# vmulps zmm10, zmm10, [rsi+256]
++	VMULPS zmm11, zmm11, rsi, 384	# vmulps zmm11, zmm11, [rsi+384]
++	VRNDFXPNTPS zmm12, zmm12, 1	# vrndfxpntps zmm12, zmm12, 1
++	VRNDFXPNTPS zmm13, zmm13, 1	# vrndfxpntps zmm13, zmm13, 1
++	VRNDFXPNTPS zmm14, zmm14, 1	# vrndfxpntps zmm14, zmm14, 1
++	VRNDFXPNTPS zmm15, zmm15, 1	# vrndfxpntps zmm15, zmm15, 1
++	VFMADD231PS zmm8, zmm12, rsi, 64	# vfmadd231ps zmm8, zmm12, [rsi+64]
++	VFMADD231PS zmm9, zmm13, rsi, 192	# vfmadd231ps zmm9, zmm13, [rsi+192]
++	VFMADD231PS zmm10, zmm14, rsi, 320	# vfmadd231ps zmm10, zmm14, [rsi+320]
++	VFMADD231PS zmm11, zmm15, rsi, 448	# vfmadd231ps zmm11, zmm15, [rsi+448]
++	VSUBPS zmm8, zmm8, rsi, 1024, conv=CV_4TO16	# vsubps zmm8, zmm8, [rsi+1024]{4to16}
++	VSUBPS zmm9, zmm9, rsi, 1040, conv=CV_4TO16	# vsubps zmm9, zmm9, [rsi+1040]{4to16}
++	VSUBPS zmm10, zmm10, rsi, 1056, conv=CV_4TO16	# vsubps zmm10, zmm10, [rsi+1056]{4to16}
++	VSUBPS zmm11, zmm11, rsi, 1072, conv=CV_4TO16	# vsubps zmm11, zmm11, [rsi+1072]{4to16}
++	VFMADD231PS zmm0, zmm8, zmm16	# vfmadd231ps zmm0, zmm8, zmm16
++	VFMADD231PS zmm1, zmm9, zmm17	# vfmadd231ps zmm1, zmm9, zmm17
++	VFMADD231PS zmm2, zmm10, zmm18	# vfmadd231ps zmm2, zmm10, zmm18
++	VFMADD231PS zmm3, zmm11, zmm19	# vfmadd231ps zmm3, zmm11, zmm19
++	VLOADUNPACKLPS zmm8, rdi, 74, conv=CV_U8	# vloadunpacklps zmm8, [rdi+74]{uint8}
++	VLOADUNPACKLPS zmm9, rdi, 92, conv=CV_U8	# vloadunpacklps zmm9, [rdi+92]{uint8}
++	VLOADUNPACKLPS zmm10, rdi, 110, conv=CV_U8	# vloadunpacklps zmm10, [rdi+110]{uint8}
++	VLOADUNPACKLPS zmm11, rdi, 128, conv=CV_U8	# vloadunpacklps zmm11, [rdi+128]{uint8}
++	VLOADUNPACKHPS zmm8, rdi, 138, conv=CV_U8	# vloadunpackhps zmm8, [rdi+138]{uint8}
++	VLOADUNPACKHPS zmm9, rdi, 156, conv=CV_U8	# vloadunpackhps zmm9, [rdi+156]{uint8}
++	VLOADUNPACKHPS zmm10, rdi, 174, conv=CV_U8	# vloadunpackhps zmm10, [rdi+174]{uint8}
++	VLOADUNPACKHPS zmm11, rdi, 192, conv=CV_U8	# vloadunpackhps zmm11, [rdi+192]{uint8}
++	VBROADCASTSS zmm16, rdi, 72, conv=CV_F16	# vbroadcastss zmm16, [rdi+72]{float16}
++	VBROADCASTSS zmm17, rdi, 90, conv=CV_F16	# vbroadcastss zmm17, [rdi+90]{float16}
++	VBROADCASTSS zmm18, rdi, 108, conv=CV_F16	# vbroadcastss zmm18, [rdi+108]{float16}
++	VBROADCASTSS zmm19, rdi, 126, conv=CV_F16	# vbroadcastss zmm19, [rdi+126]{float16}
++	VMULPS zmm12, zmm8, r9, 24, conv=CV_1TO16	# vmulps zmm12, zmm8, [r9+24]{1to16}
++	VMULPS zmm13, zmm9, r9, 24, conv=CV_1TO16	# vmulps zmm13, zmm9, [r9+24]{1to16}
++	VMULPS zmm14, zmm10, r9, 24, conv=CV_1TO16	# vmulps zmm14, zmm10, [r9+24]{1to16}
++	VMULPS zmm15, zmm11, r9, 24, conv=CV_1TO16	# vmulps zmm15, zmm11, [r9+24]{1to16}
++	VMULPS zmm8, zmm8, rsi, 512	# vmulps zmm8, zmm8, [rsi+512]
++	VMULPS zmm9, zmm9, rsi, 640	# vmulps zmm9, zmm9, [rsi+640]
++	VMULPS zmm10, zmm10, rsi, 768	# vmulps zmm10, zmm10, [rsi+768]
++	VMULPS zmm11, zmm11, rsi, 896	# vmulps zmm11, zmm11, [rsi+896]
++	VRNDFXPNTPS zmm12, zmm12, 1	# vrndfxpntps zmm12, zmm12, 1
++	VRNDFXPNTPS zmm13, zmm13, 1	# vrndfxpntps zmm13, zmm13, 1
++	VRNDFXPNTPS zmm14, zmm14, 1	# vrndfxpntps zmm14, zmm14, 1
++	VRNDFXPNTPS zmm15, zmm15, 1	# vrndfxpntps zmm15, zmm15, 1
++	VFMADD231PS zmm8, zmm12, rsi, 576	# vfmadd231ps zmm8, zmm12, [rsi+576]
++	VFMADD231PS zmm9, zmm13, rsi, 704	# vfmadd231ps zmm9, zmm13, [rsi+704]
++	VFMADD231PS zmm10, zmm14, rsi, 832	# vfmadd231ps zmm10, zmm14, [rsi+832]
++	VFMADD231PS zmm11, zmm15, rsi, 960	# vfmadd231ps zmm11, zmm15, [rsi+960]
++	VSUBPS zmm8, zmm8, rsi, 1088, conv=CV_4TO16	# vsubps zmm8, zmm8, [rsi+1088]{4to16}
++	VSUBPS zmm9, zmm9, rsi, 1104, conv=CV_4TO16	# vsubps zmm9, zmm9, [rsi+1104]{4to16}
++	VSUBPS zmm10, zmm10, rsi, 1120, conv=CV_4TO16	# vsubps zmm10, zmm10, [rsi+1120]{4to16}
++	VSUBPS zmm11, zmm11, rsi, 1136, conv=CV_4TO16	# vsubps zmm11, zmm11, [rsi+1136]{4to16}
++	VFMADD231PS zmm0, zmm8, zmm16	# vfmadd231ps zmm0, zmm8, zmm16
++	VFMADD231PS zmm1, zmm9, zmm17	# vfmadd231ps zmm1, zmm9, zmm17
++	VFMADD231PS zmm2, zmm10, zmm18	# vfmadd231ps zmm2, zmm10, zmm18
++	VFMADD231PS zmm3, zmm11, zmm19	# vfmadd231ps zmm3, zmm11, zmm19
++    add $144, %rdi
++    add $144, %r10
++    add $1152, %rsi
++    dec %rdx
++    cmp $4, %rdx
++    jne 2f
++    add %rcx, %r10
++2:
++    test %rdx, %rdx
++    jnz 1b
++	VADDPS zmm0, zmm0, zmm1	# vaddps zmm0, zmm0, zmm1
++	VADDPS zmm2, zmm2, zmm3	# vaddps zmm2, zmm2, zmm3
++	VADDPS zmm0, zmm0, zmm2	# vaddps zmm0, zmm0, zmm2
++	VMOVAPS_ST r8, 0, zmm0	# vmovaps [r8+0], zmm0
++    ret
++    .size phi_q4_0_row1p, .-phi_q4_0_row1p
 diff --git a/card/vpu/kernels.md b/card/vpu/kernels.md
-index 2838cd8..b515a5c 100644
+index 2838cd8..966441f 100644
 --- a/card/vpu/kernels.md
 +++ b/card/vpu/kernels.md
 @@ -1,5 +1,5 @@
  # kernels.S: the dot-product kernels
  
 -The card's matrix-multiply kernels: 41 routines the service (`matmul.S`,
-+The card's matrix-multiply kernels: 47 routines the service (`matmul.S`,
++The card's matrix-multiply kernels: 48 routines the service (`matmul.S`,
  until the port completes `vpu_matmul.c`) calls per superblock or per
  row, written with the MVEX macros of `mvex.inc` around plain x86-64
-@@ -18,5 +18,5 @@ about the kernels' design.
+@@ -18,5 +18,6 @@ about the kernels' design.
  | `phi_dot4_f16(a, b, k16, out, nb)`, `phi_dot4_f32` | one weight row against four activation rows `nb` bytes apart, 64 sums into `out` |
  | `phi_dot_bf16(a, b, k16, out)`, `phi_dot4_bf16(a, b, k16, out, nb)` | the same for bfloat16 weights: a `{uint16}` load zero-extends 16 of them into int32 lanes and `vpslld` by 16 puts each in a float32's high half, exactly the value it stands for (32-byte alignment as float16); 2026-10-08, for Flash Next BF16 |
 -| `phi_{q4k,q5k,q6k,q8_0,iq4xs}_{1,4,8}` and their `h` twins | one 256-weight superblock of a quantized row against 1, 4 or 8 activation rows, float32 or (`h`) float16 |
 +| `phi_{q4k,q5k,q6k,q8_0,iq4xs,q4_0}_{1,4,8}` and their `h` twins | one 256-weight superblock of a quantized row against 1, 4 or 8 activation rows, float32 or (`h`) float16 |
++| `phi_q4_0_row1p(row, prepared, ns, jump, acc, consts)` | `ns` superblocks of a Q4_0 weight row (the whole row, or a segment of it) against one prepared activation row (below, "Q4_0, one row, prepared") |
  | `phi_swiglu`, `phi_swiglu16`, `phi_swiglu_edge`, `phi_swiglu16_edge` | the feed-forward's SwiGLU on the vector unit |
  | `phi_copy64(dst, src, count)` | `count` 64-byte vectors, whole-vector loads and stores |
-@@ -26,5 +26,5 @@ Every quantized kernel is emitted twice, `phi_q4k_8` reading float32
+@@ -26,5 +27,7 @@ Every quantized kernel is emitted twice, `phi_q4k_8` reading float32
  activation rows and `phi_q4k_8h` float16 ones: the same instructions
  with `{float16}` on the product's memory operand and a 32-byte row
 -stride, 30 kernels in all; the card picks the twin by the request's
-+stride, 36 kernels in all; the card picks the twin by the request's
++stride, 36 kernels in all (and `phi_q4_0_row1p`, which has no twin:
++its activations are prepared float32 whatever the request sent); the
++card picks the twin by the request's
  `b_type`. The float weight formats have no twin (their kernels are the
  `phi_dot4_*` family) and the card refuses a float16 activation request
-@@ -100,4 +100,18 @@ ggml-quants.c, the reference each kernel reproduces):
+@@ -100,4 +103,83 @@ ggml-quants.c, the reference each kernel reproduces):
  | Q8_0 | 34 bytes: d, qs[32]; eight per call | signed bytes at 34 i + 2 | unpack pairs |
  | IQ4_XS | 136 bytes: d, scales_h, scales_l[4], qs[128] | nibbles index `kvalues_iq4nl`; low nibbles of qs[16 ib..) are weights 32 ib.., high ones the next sixteen | unpack pairs (qs is 8-byte aligned) |
 +| Q4_0 | 18 bytes: d, qs[16]; eight per call (144 bytes) | low nibbles of qs are weights 0..15 of the block, high ones 16..31, each `(q - 8) * d` | unpack pairs (18 is not a multiple of 16) |
@@ -1487,10 +1598,75 @@ index 2838cd8..b515a5c 100644
 +the card's compute time only (`matmul-check --only q4_0 --repeat 3`):
 +float32 activations 139.3 GFLOP/s at one row, 246.4 at eight, 251.3 at
 +sixty-four; float16 126.4, 452.9, 490.3.
++
++### Q4_0, one row, prepared (2026-11-09)
++
++Against one activation row (a token's multiply) a decoded weight feeds
++one product, so the decode is the cost: `phi_q4_0_1` is 114 vector
++operations a superblock, 16 of them one chain of masked scale loads.
++`phi_q4_0_row1p` does not compute the low nibble or the `q - 8`. With
++`b` a block's sixteen bytes as floats, `hi = floor(b / 16)`, `x0` and
++`x1` the block's two activation vectors:
++
++```
++sum (lo - 8) x0 + (hi - 8) x1  =  sum b x0 + hi (x1 - 16 x0) - 8 sum (x0 + x1)
++```
++
++The right side's `y = x1 - 16 x0` and the last term depend on the
++activations alone, so `rows.S` (`q4_0_prepare`) computes them once a
++request: a prepared superblock is 1152 bytes, `x0` at `128 i`, `y` at
++`128 i + 64`, and at `1024 + 16 i` four floats `p` that a `{4to16}`
++operand subtracts from all sixteen lanes (`4 sum(p) = 8 sum(x0 + x1)`:
++no reduction to one lane is needed, two rotations fold the sum to four).
++
++| step, per block | instructions |
++| --- | --- |
++| the bytes | a `vloadunpacklps`/`hps` `{uint8}` pair at `18 i + 2` |
++| the scale | `vbroadcastss [18 i]{float16}` (`mvex.inc`, new with this kernel) |
++| `hi` | `vmulps` by 2^-4, `vrndfxpntps` round down |
++| `b x0 + hi y - p` | `vmulps [x0]`, `vfmadd231ps [y]`, `vsubps [p]{4to16}` |
++| times the scale | `vfmadd231ps acc, t, d`, four accumulators in turn |
++
++Nine a block, 72 a superblock, with six prefetches; the kernel takes a
++whole row (the accumulators stay in registers, the row is one
++sequential stream: three lines 576 bytes ahead to the first-level
++cache through a pointer that takes the caller's jump when four
++superblocks are left, so the last four prefetches of a call fetch the
++next call's first four; three lines 2304 ahead to the second). The weights are not the
++reference's bit for bit any more (the sums associate differently); the
++check against the host reference passes as before.
++
++Measured on card 0 (a 7120A) with `tools/q4_0-bench.S` and
++`tools/q4_0-stream.S` (their documents have the commands):
++
++| | `phi_q4_0_1` | `phi_q4_0_row1p` |
++| --- | --- | --- |
++| cycles a superblock, one thread, everything in the first-level cache | 306, 306 | 204, 204 |
++| the same streaming 64 MiB of weights, prefetch as built | | 202.2, 203.6 |
++| with no prefetch (the core's own streamer) | | 248.6, 249.9 |
++| with only the second-level prefetch | | 245.7, 247.1 |
++| 40 such streams at once, one a core, the median | | 201.3, 200.5 |
++| two a core, each with a prepared row of its own | | 560.5, 560.5 |
++
++The last row is why a core's threads share one prepared row
++(`rows.md`): 46080 bytes of activations do not fit a 32 KiB cache.
++
++Any eight vector operations of these kernels cost 24 cycles on a lone
++thread, 11 of that the call: no instruction in them is slow, and a lone
++thread issues one every other cycle. In the service
++(`matmul-check --only q4_0 --act 1 --repeat 15`, the two workers
++deployed in turn, twice, 114 slices, the card's compute time, one row):
++
++| shape | before | after |
++| --- | --- | --- |
++| 17408 x 5120 | 1.058, 1.062 ms | 0.891, 0.681 ms |
++| 5120 x 5120 | 0.372, 0.383 ms | 0.238, 0.229 ms |
++| 5120 x 17408 (then on `phi_q4_0_1`; in half segments since, `rows.md`: 1.043, 1.026, 1.037 against 0.889, 0.866 ms at 120 slices) | 1.058, 1.091 ms | 1.079, 1.187 ms |
++| 1024 x 5120 (not taken: nine rows a slice) | 0.082, 0.081 ms | 0.089, 0.082 ms |
  
  Two facts about the unpack loads that `phi_probe` settled against the
 diff --git a/card/vpu/matmul.S b/card/vpu/matmul.S
-index 6451e1b..f87049b 100644
+index 6451e1b..745959e 100644
 --- a/card/vpu/matmul.S
 +++ b/card/vpu/matmul.S
 @@ -31,5 +31,6 @@ g_consts:
@@ -1507,21 +1683,24 @@ index 6451e1b..f87049b 100644
 +	.quad 144, phi_q4_0_1, phi_q4_0_4, phi_q4_0_8, phi_q4_0_1h, phi_q4_0_4h, phi_q4_0_8h, 0	# eight 18-byte blocks
  	.globl g_fmt
  
-@@ -167,5 +169,6 @@ copy_pool:
+@@ -167,5 +169,9 @@ copy_pool:
  	jmp vpu_pool_map
  
 -# map_threads: edi clamped to 1..min(pool + 1, POOL_SLOTS), in eax.
-+# map_threads: edi clamped to 1..min(pool + 1, two threads on each of the
-+# card's cores: 114 on a 3120A, 122 on a 7120A), in eax.
++# map_threads: edi clamped to 1..min(pool + 1, every hardware thread of
++# the card's cores: 228 on a 3120A, 244 on a 7120A), in eax. The pool
++# the worker is started with decides how many a core has (its thread t
++# is on core t mod the cores, worker.S create_thread); the cap was two a
++# core until 2026-11-09.
  map_threads:
  	pushq %rdi
-@@ -173,8 +176,12 @@ map_threads:
+@@ -173,8 +179,12 @@ map_threads:
  	popq %rdi
  	incl %eax
 -	cmpl $POOL_SLOTS, %eax
 +	pushq %rcx
 +	movl ncores(%rip), %ecx
-+	addl %ecx, %ecx
++	shll $2, %ecx
 +	cmpl %ecx, %eax
  	jle 1f
 -	movl $POOL_SLOTS, %eax
@@ -1531,7 +1710,7 @@ index 6451e1b..f87049b 100644
 +	cmpl %eax, %edi
  	jg 2f
  	movl %edi, %eax
-@@ -259,5 +266,50 @@ push_data:
+@@ -259,5 +269,50 @@ push_data:
  	movq %rdx, %r13
  	movl %ecx, %r14d
 -	leaq 63(%r12), %r15
@@ -1583,7 +1762,7 @@ index 6451e1b..f87049b 100644
 +79:	leaq 63(%r12), %r15
  	shrq $6, %r15
  	xorl %eax, %eax
-@@ -549,6 +601,7 @@ shape_ok:
+@@ -549,6 +604,7 @@ shape_ok:
  
  # ---- the float weight types: one weight row against one or four
 -# activation rows (phi_dot*, kernels.S), the sixteen partial sums added in
@@ -1593,7 +1772,7 @@ index 6451e1b..f87049b 100644
 +# added on the vector unit (SUM16): nothing in the x87 unit ----
  
  # rows_slice(job rdi, slice esi, nslices edx): the pool's entry for one
-@@ -656,23 +709,6 @@ rows_slice:
+@@ -656,23 +712,6 @@ rows_slice:
  	jae 12f
  	shlq $6, %rcx
 -	leaq RS_OUT(%rbp,%rcx), %rax
@@ -1619,7 +1798,7 @@ index 6451e1b..f87049b 100644
 +	# the tail: out[q] += av * b1[x] for x in k16 * 16 .. k
  	movq RS_C(%rbp), %rax
  	addq RS_Q(%rbp), %rax			# c + q
-@@ -681,4 +717,7 @@ rows_slice:
+@@ -681,4 +720,7 @@ rows_slice:
  	addq MJ_B(%rbx), %rsi			# b1
  	call tail_dot
 +	SUM16 rdi				# on the vector unit (rows.md, "The sums")
@@ -1627,14 +1806,14 @@ index 6451e1b..f87049b 100644
 +	movl (%rdi), %ecx			# the float's four bytes
  	# d[(c + q) * m + i] = sum
  	movq RS_C(%rbp), %rax
-@@ -687,5 +726,5 @@ rows_slice:
+@@ -687,5 +729,5 @@ rows_slice:
  	addq %r15, %rax
  	movq MJ_D(%rbx), %rdx
 -	fstps (%rdx,%rax,4)
 +	movl %ecx, (%rdx,%rax,4)
  	incq RS_Q(%rbp)
  	jmp 7b
-@@ -715,30 +754,17 @@ rows_slice:
+@@ -715,30 +757,17 @@ rows_slice:
  213:	call phi_dot_bf16
  211:	popq %rsi
 -	leaq RS_OUT(%rbp), %rax
@@ -1673,7 +1852,7 @@ index 6451e1b..f87049b 100644
 +	movl %ecx, (%rdx,%rax,4)
  	incq RS_C(%rbp)
  	jmp 20b
-@@ -754,41 +780,48 @@ rows_slice:
+@@ -754,41 +783,48 @@ rows_slice:
  	ret
  
 -# tail_dot: with the sum in st(0), add av * b1[x] for x in k16 * 16 .. k,
@@ -1755,7 +1934,7 @@ index 6451e1b..f87049b 100644
 +9:	ret
  
  # rows_slice_id(job rdi, slice esi, nslices edx): a mixture with float
-@@ -1686,5 +1719,47 @@ vpu_matmul_run:
+@@ -1686,5 +1722,47 @@ vpu_matmul_run:
  	jmp .Lok
  
 -5:	# MATMUL, MATMUL_ID, MATMUL_MORE
@@ -1804,7 +1983,27 @@ index 6451e1b..f87049b 100644
 +59:	# MATMUL, MATMUL_ID, MATMUL_MORE
  	cmpq $0, MM_M(%rbx)
  	je .Lbad_said
-@@ -3244,4 +3319,6 @@ r_big:	.skip 8
+@@ -2327,8 +2405,19 @@ vpu_matmul_run:
+ 	call now_ns
+ 	movq %rax, r_c0(%rip)
++	# one matrix against one activation row and no mixture: every thread
++	# of this dispatch prepares the same row, so the threads of a core may
++	# share a prepared buffer (rows.S, q40_prep_ok)
++	xorl %eax, %eax
++	cmpq $1, MM_N(%rbx)
++	jne 451f
++	cmpq $0, r_mixture(%rip)
++	jne 451f
++	movl $1, %eax
++451:	movl %eax, q40_prep_ok(%rip)
+ 	movq r_slice(%rip), %rdi
+ 	movq %r13, %rsi
+ 	movl r_threads(%rip), %edx
+ 	call vpu_pool_map
++	movl $0, q40_prep_ok(%rip)
+ 	movq r_plive(%rip), %rcx
+ 	movl %eax, (%rcx)
+@@ -3244,4 +3333,6 @@ r_big:	.skip 8
  r_rounds:	.skip 8
  r_i:	.skip 8
 +	.globl stat_dma_push
@@ -1861,7 +2060,7 @@ index 70eb5ef..1a92cde 100644
  # The per-format kernel table (matmul.S, g_fmt): block bytes, then the
  # six kernels [b_type][1, 4, 8 rows].
 diff --git a/card/vpu/matmul.md b/card/vpu/matmul.md
-index 16dc0cd..ef8416e 100644
+index 16dc0cd..01140c4 100644
 --- a/card/vpu/matmul.md
 +++ b/card/vpu/matmul.md
 @@ -6,5 +6,6 @@ The card as a matrix-multiply engine for the ggml backend
@@ -1888,7 +2087,45 @@ index 16dc0cd..ef8416e 100644
 +  vector unit (`rows.md`, "The sums"). A request of several
    matrices (`VPU_K_MATMUL_MORE`) with a float base takes pieces of the
    base's own type only (`r_fmore`; a quantized base takes quantized
-@@ -100,2 +104,16 @@ the C worker's after the timing fields are stripped. Defects met on the
+@@ -91,4 +95,37 @@ what is where in the assembly and what its gates were.
+   warm-up, the longest rows phase and its thread (`vpu_phase`,
+   `rows.md`), which is what found the slow mode of the fused copy.
++- **`q40_prep_ok`** (2026-11-09): set to 1 around the dispatch of a
++  request of one matrix against one activation row with no mixture
++  (label 45, `MM_N` 1 and `r_mixture` 0), 0 otherwise. It tells
++  `rows_range_q` that every thread of the dispatch prepares the same
++  activation row, which is the condition under which the threads of a
++  core may share one prepared buffer (`rows.md`, "Q4_0 against one row").
++- **`map_threads`** (2026-11-09): a request's threads are clamped to
++  the pool plus the dispatcher and to four a core, where the clamp was
++  two a core. The pool the worker is started with decides (its thread
++  `t` is on core `t` mod the cores, `worker.S` `create_thread`: 121
++  threads are two a core on a 7120A, 181 three, 241 four). Measured on
++  card 0, Q4_0, float16 activations, each pool with as many slices,
++  best of 15, the rounds in order (`matmul-check --only q4_0 --act 1
++  --threads N --repeat 15`):
++
++  | shape | two a core (121) | three (181) | four (241) |
++  | --- | --- | --- | --- |
++  | 17408 x 5120, one row | 0.640, 0.689 ms | 0.719, 0.700 ms | 0.783 ms |
++  | 5120 x 5120, one row | 0.254, 0.246 ms | 0.261, 0.258 ms | 0.329 ms |
++  | 17408 x 5120, eight rows | 2.720, 2.410 ms | 2.406, 2.297 ms | 2.125 ms |
++  | 5120 x 5120, eight rows | 0.671, 0.685 ms | 0.746, 0.735 ms | 0.702 ms |
++
++  A third thread costs 2 to 12 % at one row and gains 5 to 12 % on the
++  large shape at eight; two a core stays the start scripts' default.
++  The row kernel alone, as streams pinned to 40 cores with the
++  activations costing nothing (an unwritten row, `tools/q4_0-stream.md`),
++  gives a core 5.39 superblocks per 1000 cycles at one stream, 9.96 at
++  two, 10.90 at three and 10.86 at four: two threads already issue
++  nearly every cycle. With a prepared row of its own for every stream
++  (`tools/q4_0-bench.sh`, two runs) it is 4.97 to 4.99, 3.57, 4.69 to
++  4.70 and 5.55 to 5.56: the activations of two streams no longer fit
++  the core's first-level cache. The worker's threads of a core share
++  one row and lie between the two.
+ 
+ ## Gates
+@@ -100,2 +137,16 @@ the C worker's after the timing fields are stripped. Defects met on the
  way are in `rows.md`; the fused feed-forward's down projection is the one
  that was here (a matrix pointer read through a clobbered register).
 +
@@ -1905,6 +2142,32 @@ index 16dc0cd..ef8416e 100644
 +blocks and the card's buffers keep `SLACK` past their data. Gated by
 +`phi-vpu matmul-check` on the 7120A (every format ok, mixtures, up to
 +four matrices, the fused feed-forward) with channel 7 up throughout.
+diff --git a/card/vpu/mvex.inc b/card/vpu/mvex.inc
+index ddd84e0..aea6059 100644
+--- a/card/vpu/mvex.inc
++++ b/card/vpu/mvex.inc
+@@ -291,4 +291,11 @@
+ 	MVEX_M MAP_0F38, PP_66, 0, 0x58, \dst, 0, \base, \disp, 0, \k
+ 	.endm
++# vbroadcastss dst, [base + disp]: one float32 to the sixteen lanes, or
++# with a conversion one float16 or integer converted first
++# (MVEX.512.66.0F38.W0 18 /r, Uf32(mt): the memory read is one element of
++# the converted size, two bytes for CV_F16).
++	.macro VBROADCASTSS dst, base, disp, conv=0, k=0
++	MVEX_M MAP_0F38, PP_66, 0, 0x18, \dst, 0, \base, \disp, \conv, \k
++	.endm
+ 
+ # ---- stores: `base, disp, src` ----
+diff --git a/card/vpu/mvex.md b/card/vpu/mvex.md
+index adc1ce6..19c471b 100644
+--- a/card/vpu/mvex.md
++++ b/card/vpu/mvex.md
+@@ -75,4 +75,5 @@ bytes; `MVEX_R` and `MVEX_M` add the rest; `MVEX_NDS`, `MVEX_RM` and
+ | `VPACKSTORELD/HD` | MVEX.512.66.0F38.W0 D0 D4 | knc-mvex's tests; the rewriter's unaligned stores on the card |
+ | `VPBROADCASTD` | MVEX.512.66.0F38.W0 58 | the integer test |
++| `VBROADCASTSS` | MVEX.512.66.0F38.W0 18, SSS a conversion (`CV_F16` reads the two bytes of one float16) | `phi_q4_0_row1p`: the card check of 2026-11-09 passes with a block's float16 scale broadcast this way |
+ | `VCVTFXPNTDQ2PS VCVTFXPNTPS2DQ VRNDFXPNTPS` | MVEX.512.0F3A.W0 CB (no prefix / 66) 52 ib | the kernel file |
+ | `VEXP223PS VRCP23PS` | MVEX.512.66.0F38.W0 C8 CA | the kernel file (the SwiGLU kernels) |
 diff --git a/card/vpu/proto.inc b/card/vpu/proto.inc
 index 8653d9b..9a189b5 100644
 --- a/card/vpu/proto.inc
@@ -1977,7 +2240,7 @@ index e396148..91a609f 100644
  32, card 0 was 72.7% busy at 1.87 ms a request in llama-server's first
  decode; graph reservation 74.7 s with 32, 58.6 s with 110 and callee
 diff --git a/card/vpu/rows.S b/card/vpu/rows.S
-index a278b51..069175e 100644
+index a278b51..716b270 100644
 --- a/card/vpu/rows.S
 +++ b/card/vpu/rows.S
 @@ -5,6 +5,6 @@
@@ -2108,7 +2371,47 @@ index a278b51..069175e 100644
 -
  # The frame of rows_range_q, addressed through rbp (its aligned base):
  # the accumulators, the kernels' scratch table, a group's row pointers,
-@@ -726,6 +683,7 @@ half_to_float:
+@@ -719,5 +676,38 @@ half_to_float:
+ 	.set RQ_MINE, RQ_FMT + 168		# the rows this thread takes of the chunk
+ 	.set RQ_BASE0, RQ_FMT + 176		# the first of them, in the group's matrix
+-	.set RQ_FRAME, RQ_FMT + 192
++	.set RQ_PREP, RQ_FMT + 184		# this thread's prepared activations when the group runs phi_q4_0_row1p, else 0
++	.set RQ_PREP_X, RQ_FMT + 192		# the activation row they were prepared from, in this call
++	.set RQ_SEG, RQ_FMT + 200		# the superblocks of the segment being walked
++	.set RQ_FRAME, RQ_FMT + 208
++
++# A Q4_0 matrix against one activation row (a token's multiply) runs
++# phi_q4_0_row1p on activations each thread prepares once a call
++# (q4_0_prepare): a superblock of PREP_SB bytes, sixteen vectors and
++# eight groups of four floats (kernels.md, "Q4_0, one row, prepared").
++# The columns go in segments of PREP_SEG superblocks (5120 weights:
++# 23040 prepared bytes, which stay in the 32 KiB first-level cache
++# beside a weight row), the segments outermost and this thread's rows
++# inside, so a row of up to 5120 weights is one call a row and a longer
++# one a call a row a segment. It is taken for rows of up to PREP_SB_MAX
++# superblocks (the buffer) when the range still has PREP_ROWS_MIN rows
++# to repay the preparation; every other case runs phi_q4_0_1 with the
++# superblocks outermost.
++#
++# The buffer is the core's (TLS_CORE; the dispatcher, which takes a slice
++# of every request itself, has the last core to itself): two threads of
++# a core each walking 23040 bytes of their own every row put 46080 bytes
++# through one 32 KiB first-level cache (measured 2026-11-09: 1.48 ms
++# where one thread a core took 1.15). Both threads fill it, with the
++# same bytes, and each reads it only after its own fill, so a load sees
++# the row whichever store it follows; that holds while every thread of
++# the request prepares the same activation row, which matmul.S says with
++# q40_prep_ok (one matrix, one row, no mixture) around the dispatch.
++	.set PREP_SB, 1152
++	.set PREP_SEG, 20
++	.set PREP_SEG_LONG, 10			# a longer row: the two threads of a core are on different segments, and two of 11520 bytes fit one cache
++	.set PREP_SB_MAX, 128
++	.set PREP_BYTES, PREP_SB * PREP_SB_MAX
++	.set PREP_CORES, 64
++	.set PREP_ROWS_MIN, 24
+ 
+ # rows_range_q: rows rsi..rdx of the job rdi, shared with r8d threads on
+@@ -726,6 +716,7 @@ half_to_float:
  # for every weight row of the chunk); within a group the superblock
  # outermost (its activation block and the accumulators stay in L1 across
 -# the rows, the weights stream); then each result summed in the x87 unit
@@ -2118,7 +2421,102 @@ index a278b51..069175e 100644
 +# (SUM16) and stored as its four bytes.
  	.globl rows_range_q
  rows_range_q:
-@@ -896,24 +854,10 @@ rows_range_q:
+@@ -759,4 +750,5 @@ rows_range_q:
+ 	andq $255, %rax
+ 	movq %rax, RQ_TAIL(%rbp)
++	movq $0, RQ_PREP_X(%rbp)
+ 1:	cmpq RQ_I1(%rbp), %r12
+ 	jae 99f
+@@ -806,5 +798,39 @@ rows_range_q:
+ 	movq FMT_K(%rcx,%rax,8), %rax
+ 	movq %rax, RQ_KERN(%rbp)
+-	# mine = the rows the pair (r0, rstep) gives this thread; accumulators to zero
++	# Q4_0 against one row: the prepared row kernel, on this thread's
++	# buffer, filled when the row is not the one it holds from earlier in
++	# this call (and then only with rows enough left to repay it)
++	movq $0, RQ_PREP(%rbp)
++	cmpl $MM_Q4_0, MJ_TYPE(%rbx)
++	jne 61f
++	cmpq $1, RQ_T(%rbp)
++	jne 61f
++	movq RQ_NS(%rbp), %rdx
++	cmpq $PREP_SB_MAX, %rdx
++	ja 61f
++	cmpl $0, q40_prep_ok(%rip)		# one matrix, one activation row (matmul.S)
++	je 61f
++	movq %fs:TLS_CORE, %rax			# the core's buffer, its threads' both
++	cmpq $PREP_CORES, %rax
++	jae 61f
++	imulq $PREP_BYTES, %rax, %rax
++	leaq prep_bufs(%rip), %rdi
++	addq %rax, %rdi
++	movq RQ_G(%rbp), %rax
++	movq RQ_C0(%rbp), %rcx
++	movq G_X(%rax,%rcx,8), %rsi
++	cmpq RQ_PREP_X(%rbp), %rsi
++	je 60f
++	movq RQ_I1(%rbp), %rax
++	subq %r12, %rax
++	cmpq $PREP_ROWS_MIN, %rax
++	jb 61f
++	movq %rsi, RQ_PREP_X(%rbp)
++	movq %rdi, RQ_PREP(%rbp)
++	movl MJ_B_TYPE(%rbx), %ecx
++	call q4_0_prepare
++	jmp 61f
++60:	movq %rdi, RQ_PREP(%rbp)
++61:	# mine = the rows the pair (r0, rstep) gives this thread; accumulators to zero
+ 	xorl %esi, %esi
+ 	movq RQ_R0(%rbp), %rcx
+@@ -836,5 +862,46 @@ rows_range_q:
+ 	addq G_A(%rdx), %rax
+ 	movq %rax, RQ_BASE0(%rbp)
+-	# superblock outermost
++	# the prepared row: the segments outermost, this thread's rows inside,
++	# each a sequential run of the segment's bytes:
++	# rowkern(row + 144 s, prepared + PREP_SB s, seg, acc, consts, jump),
++	# the jump the distance from a run's end to the next row's run (the
++	# kernel's prefetch takes it; it keeps r13, r14, r15)
++	cmpq $0, RQ_PREP(%rbp)
++	je 10f
++	cmpq $0, RQ_MINE(%rbp)
++	je 20f
++	movq $0, RQ_S(%rbp)
++18:	movq RQ_NS(%rbp), %rax
++	movl $PREP_SEG, %ecx			# a row of one segment: the whole row
++	cmpq %rcx, %rax
++	jbe 182f
++	movl $PREP_SEG_LONG, %ecx		# of several: two different ones fit the cache
++182:	subq RQ_S(%rbp), %rax
++	jbe 20f
++	cmpq %rcx, %rax
++	jbe 181f
++	movq %rcx, %rax
++181:	movq %rax, RQ_SEG(%rbp)
++	movq RQ_MINE(%rbp), %r13
++	imulq $144, RQ_S(%rbp), %r14
++	addq RQ_BASE0(%rbp), %r14
++	leaq RQ_ACC(%rbp), %r15
++17:	movq %r14, %rdi
++	imulq $PREP_SB, RQ_S(%rbp), %rsi
++	addq RQ_PREP(%rbp), %rsi
++	movq RQ_SEG(%rbp), %rdx
++	movq %r15, %r8
++	leaq g_consts(%rip), %r9
++	imulq $-144, %rdx, %rcx
++	addq RQ_STRIDE(%rbp), %rcx
++	call phi_q4_0_row1p
++	addq RQ_STRIDE(%rbp), %r14
++	addq $64, %r15
++	decq %r13
++	jnz 17b
++	movq RQ_SEG(%rbp), %rax
++	addq %rax, RQ_S(%rbp)
++	jmp 18b
++10:	# superblock outermost
+ 	movq $0, RQ_S(%rbp)
+ 11:	movq RQ_S(%rbp), %r9
+@@ -896,24 +963,10 @@ rows_range_q:
  	shlq $6, %rax
  	addq RQ_A(%rbp), %rax			# acc + q * 16 floats
 -	fldz
@@ -2148,7 +2546,7 @@ index a278b51..069175e 100644
 +	leaq RQ_SCRATCH(%rbp), %r9
  	movq RQ_G(%rbp), %rdx
  	movq G_A(%rdx), %rdi
-@@ -936,5 +880,11 @@ rows_range_q:
+@@ -936,5 +989,11 @@ rows_range_q:
  	movl MJ_B_TYPE(%rbx), %ecx
  	call q8_0_tail
 -25:	movq RQ_G(%rbp), %rdx
@@ -2161,7 +2559,7 @@ index a278b51..069175e 100644
 +	movq RQ_G(%rbp), %rdx
  	movq RQ_C0(%rbp), %rcx
  	addq RQ_Q(%rbp), %rcx
-@@ -944,5 +894,6 @@ rows_range_q:
+@@ -944,5 +1003,6 @@ rows_range_q:
  	addq RQ_R(%rbp), %rax
  	movq MJ_D(%rbx), %rdx
 -	fstps (%rdx,%rax,4)
@@ -2169,7 +2567,7 @@ index a278b51..069175e 100644
 +	movl %ecx, (%rdx,%rax,4)
  	incq RQ_Q(%rbp)
  	jmp 22b
-@@ -967,70 +918,41 @@ rows_range_q:
+@@ -967,70 +1027,132 @@ rows_range_q:
  	ret
  
 -# q8_0_tail: the blocks of a Q8_0 row past the last superblock (a row may
@@ -2180,16 +2578,7 @@ index a278b51..069175e 100644
 -# the C compiled it: the integer multiply by the signed byte widened to
 -# 16 bits, the block scale d from its half, nothing rounded before the
 -# caller's store. Returns with the sum in st(0).
-+# q8_0_tail(blk rdi, x rsi, n edx, b_type ecx, acc r8, scratch r9): the
-+# blocks of a Q8_0 row past the last superblock (a row may end with fewer
-+# than eight 34-byte blocks), added into the row's sixteen partial sums at
-+# acc before they are summed, on the vector unit. Per block: the scale's
-+# half up-converted into lane 0 and stored to the scratch, the 32 signed
-+# bytes as two vectors of floats, their products with the activations
-+# (float32, or float16 when ecx is 1) added, and that times the scale,
-+# broadcast from the scratch, into the accumulator. Clobbers rax, rdx,
-+# rdi, rsi, zmm0, zmm8, zmm9, zmm16, k1.
- q8_0_tail:
+-q8_0_tail:
 -	pushq %rbx
 -	pushq %r12
 -	pushq %r13
@@ -2234,11 +2623,111 @@ index a278b51..069175e 100644
 -	fimuls (%rsp)				# xv * q
 -	faddp %st, %st(1)			# s +=
 -	incl %ecx
--	jmp 2b
++# One block of q4_0_prepare: x0 kept, y = x1 - 16 x0, and the four floats
++# p whose sum times four is 8 * sum(x0 + x1): x0 + x1 folded to its four
++# sums by lane mod 4 (two rotations, zmm6 by eight lanes and zmm7 by
++# four), doubled, and the four lanes of the block's place stored under
++# its mask.
++	.macro Q40_PREP_BLOCK i, k, half
++	.if \half
++	VMOVAPS zmm0, rsi, (64*\i), conv=CV_F16
++	VMOVAPS zmm1, rsi, (64*\i+32), conv=CV_F16
++	.else
++	VMOVAPS zmm0, rsi, (128*\i)
++	VMOVAPS zmm1, rsi, (128*\i+64)
++	.endif
++	VADDPS zmm2, zmm0, zmm1
++	VFNMADD231PS zmm1, zmm0, r9, 0, conv=CV_1TO16
++	VMOVAPS_ST rdi, (128*\i), zmm0
++	VMOVAPS_ST rdi, (128*\i+64), zmm1
++	VPERMD zmm3, zmm6, zmm2
++	VADDPS zmm2, zmm2, zmm3
++	VPERMD zmm3, zmm7, zmm2
++	VADDPS zmm2, zmm2, zmm3
++	VMULPS zmm2, zmm2, r9, 8, conv=CV_1TO16
++	VMOVAPS_ST rdi, (1024+64*(\i>>2)), zmm2, k=\k
++	.endm
++
++# q4_0_prepare(dst rdi, x rsi, ns rdx, b_type ecx): an activation row of
++# ns superblocks (256 float32 each, or float16 when ecx is 1) rewritten
++# for phi_q4_0_1p: per superblock PREP_SB bytes, for block i the vector
++# x0 = x[32 i..] at 128 i, y = x[32 i + 16..] - 16 x0 at 128 i + 64, and
++# at 1024 + 16 i four floats p with 4 sum(p) = 8 sum(x[32 i..32 i + 31]).
++# With b a block's bytes and hi = floor(b / 16):
++#   sum (lo - 8) x0 + (hi - 8) x1 = sum b x0 + hi y - p{4to16}.
++# Clobbers rax, rdx, rsi, rdi, r9, zmm0..3, zmm6, zmm7, k1..k4.
++q4_0_prepare:
++	leaq g_consts(%rip), %r9
++	leaq prep_rot(%rip), %rax
++	VMOVDQA32 zmm6, rax, 0
++	VMOVDQA32 zmm7, rax, 64
++	movl $0x000f, %eax
++	KMOV_KR k1, eax
++	movl $0x00f0, %eax
++	KMOV_KR k2, eax
++	movl $0x0f00, %eax
++	KMOV_KR k3, eax
++	movl $0xf000, %eax
++	KMOV_KR k4, eax
++	testl %ecx, %ecx
++	jnz 2f
++1:	testq %rdx, %rdx
++	jz 9f
++	Q40_PREP_BLOCK 0, k1, 0
++	Q40_PREP_BLOCK 1, k2, 0
++	Q40_PREP_BLOCK 2, k3, 0
++	Q40_PREP_BLOCK 3, k4, 0
++	Q40_PREP_BLOCK 4, k1, 0
++	Q40_PREP_BLOCK 5, k2, 0
++	Q40_PREP_BLOCK 6, k3, 0
++	Q40_PREP_BLOCK 7, k4, 0
++	addq $1024, %rsi
++	addq $PREP_SB, %rdi
++	decq %rdx
++	jmp 1b
++2:	testq %rdx, %rdx
++	jz 9f
++	Q40_PREP_BLOCK 0, k1, 1
++	Q40_PREP_BLOCK 1, k2, 1
++	Q40_PREP_BLOCK 2, k3, 1
++	Q40_PREP_BLOCK 3, k4, 1
++	Q40_PREP_BLOCK 4, k1, 1
++	Q40_PREP_BLOCK 5, k2, 1
++	Q40_PREP_BLOCK 6, k3, 1
++	Q40_PREP_BLOCK 7, k4, 1
++	addq $512, %rsi
++	addq $PREP_SB, %rdi
++	decq %rdx
+ 	jmp 2b
 -4:	flds 8(%rsp)				# d
 -	fmulp %st, %st(1)			# d * s
 -	faddp %st, %st(1)			# tail +=
 -	incl %r15d
++9:	ret
++
++	.section .rodata
++	.balign 64
++prep_rot:
++	.long 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7	# by eight lanes
++	.long 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3	# by four
++	.bss
++	.balign 64
++prep_bufs:	.skip PREP_CORES * PREP_BYTES
++	.balign 64
++	.globl q40_prep_ok
++q40_prep_ok:	.skip 64		# set by the dispatcher around a dispatch whose threads all prepare one row
++	.text
++
++# q8_0_tail(blk rdi, x rsi, n edx, b_type ecx, acc r8, scratch r9): the
++# blocks of a Q8_0 row past the last superblock (a row may end with fewer
++# than eight 34-byte blocks), added into the row's sixteen partial sums at
++# acc before they are summed, on the vector unit. Per block: the scale's
++# half up-converted into lane 0 and stored to the scratch, the 32 signed
++# bytes as two vectors of floats, their products with the activations
++# (float32, or float16 when ecx is 1) added, and that times the scale,
++# broadcast from the scratch, into the accumulator. Clobbers rax, rdx,
++# rdi, rsi, zmm0, zmm8, zmm9, zmm16, k1.
++q8_0_tail:
 +	VMOVAPS zmm0, r8, 0
 +	movl $1, %eax
 +	KMOV_KR k1, eax
@@ -2275,14 +2764,14 @@ index a278b51..069175e 100644
 +9:	VMOVAPS_ST r8, 0, zmm0
  	ret
  
-@@ -1247,5 +1169,5 @@ rows_slice_q:
+@@ -1247,5 +1369,5 @@ rows_slice_q:
  	movl %r12d, %eax
  	xorl %edx, %edx
 -	movl $NCORES, %r9d
 +	movl ncores(%rip), %r9d
  	divl %r9d
  	movl %edx, %r9d				# core
-@@ -1315,5 +1237,5 @@ rows_slice_multi:
+@@ -1315,5 +1437,5 @@ rows_slice_multi:
  3:	movl %r12d, %eax
  	xorl %edx, %edx
 -	movl $NCORES, %r9d
@@ -2290,7 +2779,7 @@ index a278b51..069175e 100644
  	divl %r9d
  	movl %edx, %r9d				# core
 diff --git a/card/vpu/rows.md b/card/vpu/rows.md
-index ae56096..7e34142 100644
+index ae56096..eb5973a 100644
 --- a/card/vpu/rows.md
 +++ b/card/vpu/rows.md
 @@ -11,6 +11,7 @@ this document says what the assembly keeps and what it must reproduce
@@ -2303,10 +2792,73 @@ index ae56096..7e34142 100644
 +  core has one; with twice that (two threads a core) the slices `s` and `s + ncores`
    share a core and take alternate rows of the same chunk, so the
    activation block they read is one and the same in their shared L1.
-@@ -60,21 +61,47 @@ exactly.
+@@ -60,21 +61,110 @@ exactly.
    matrix, or of each matrix of a request of several, cut as one.
  
 -## The sums: the x87 unit, as the C compiled
++## Q4_0 against one row: the prepared row (2026-11-09)
++
++A Q4_0 group of one column does not go superblock by superblock. Its
++activation row is rewritten once by every thread (`q4_0_prepare`: per
++block `x0`, `y = x1 - 16 x0` and the four floats `p`, `kernels.md`,
++"Q4_0, one row, prepared") and `phi_q4_0_row1p` then takes this thread's
++weight rows a whole row a call (or a segment of each, below), the rows outermost: at one activation
++row the whole prepared row stays in the first-level cache, so nothing
++is gained by keeping a superblock's activations hot across the rows,
++and a row is one sequential stream the prefetch can lead.
++
++It is taken when all of these hold, and `phi_q4_0_1` with the
++superblocks outermost runs otherwise:
++
++| condition | why |
++| --- | --- |
++| `q40_prep_ok`: the request is one matrix against one activation row, no mixture (`matmul.S` sets it around the dispatch) | the buffer is shared, below |
++| the row is at most `PREP_SB_MAX` superblocks (128: 32768 weights) | the core's buffer, 147456 bytes |
++| the range still has `PREP_ROWS_MIN` rows (24) | the preparation is about 96 vector operations a superblock; 1024 x 5120, nine rows a slice, measured 5 % slower with it |
++
++Two things decided the design, both found by measuring, not by
++reading the code:
++
++- **The dispatcher takes a slice of every request itself.** With a
++  buffer for pool threads only, the dispatcher ran `phi_q4_0_1` and its
++  slice set the request's time whatever the pool did (the worker's `-t`
++  trace: `dispatcher's slice 1182.7` of a 1480.5 us dispatch): three
++  kernels of 114, 77 and 77 operations measured alike. With the
++  dispatcher on the prepared path one slice a core went from 1.81 to
++  1.15 ms (17408 x 5120).
++- **The buffer is the core's, not the thread's** (`prep_bufs`, indexed
++  by `TLS_CORE`; the dispatcher has the last core to itself). Two
++  threads of a core with 23040 bytes each put 46080 bytes through one
++  32 KiB cache: 1.48 ms at two slices a core where one took 1.15. With
++  one buffer a core: 0.67 ms. Both threads fill it with the same bytes
++  and each reads it only after its own fill, so a load sees the row
++  whichever of the two stores it follows; no lock. That argument needs
++  every thread of the dispatch to prepare the same row, which is what
++  `q40_prep_ok` asserts. The same effect outside the worker
++  (`tools/q4_0-stream.md`): the kernel as one stream a core costs 200.5
++  to 201.3 cycles a superblock, as two streams a core with a row each
++  560.5 apiece, less work a core than one stream.
++
++- **A longer row goes in segments, and half-size ones.** A prepared row
++  of more than 5120 weights does not fit the cache (17408 weights are
++  78336 bytes), so its columns are walked in segments, the segments
++  outermost and the thread's rows inside; the kernel adds to the row's
++  accumulator, and its prefetch is told the jump from the end of one
++  row's run to the start of the next row's (`phi_q4_0_row1p`'s sixth
++  argument). With segments of 20 superblocks (23040 bytes, `PREP_SEG`)
++  5120 x 17408 gained nothing (1.054, 1.092, 1.118 ms against 1.054,
++  1.122, 1.034), and the trace said why: the dispatcher, alone on its
++  core, took 627 us for its slice and the longest pool slice 891. The
++  two threads of a core are on different segments most of the time,
++  two times 23040 bytes in one cache. With segments of 10
++  (`PREP_SEG_LONG`, 11520 bytes: two fit) it is 0.889, 0.866 ms
++  against 1.043, 1.026, 1.037 (the two workers deployed in turn, 120
++  slices), and a row of one segment is unchanged (17408 x 5120: 0.652,
++  0.668 against 0.662, 0.641, 0.636).
++
++`rows_range_q` remembers in its frame the row it prepared (`RQ_PREP_X`),
++so a call prepares once however many chunks it walks.
++
 +## The sums: the vector unit (2026-11-09)
  
  A result is the sixteen partial sums of its accumulator vector added
@@ -3318,10 +3870,71 @@ index e6cea99..dd20946 100644
  	.set GGML_GLU_OP_SWIGLU, 2
  	.set GGML_TENSOR_FLAG_OUTPUT, 2
 diff --git a/host/asm/ggml-phi/glue.S b/host/asm/ggml-phi/glue.S
-index 96cc2b9..c27fe64 100644
+index 96cc2b9..f4bf77a 100644
 --- a/host/asm/ggml-phi/glue.S
 +++ b/host/asm/ggml-phi/glue.S
-@@ -116,6 +116,10 @@ card_type:
+@@ -20,4 +20,20 @@
+ 	.set BE_SLOTS, 8
+ 
++# A multiply issued ahead of its node (PHI_GGML_AHEAD, glue.md): what
++# followed each weight last time, by the weight's address, and the two
++# buffers the scheme needs.
++	.set AH_SLOTS, 2048
++	.set AH_BYTES, 64
++	.set AH_KEY, 0				# a weight
++	.set AH_A, 8				# the weight multiplied after it
++	.set AH_X, 16				# that multiply's activations
++	.set AH_M, 24
++	.set AH_K, 32
++	.set AH_NB_A, 40
++	.set AH_TYPE, 48			# the card's type (4 bytes)
++	.set AH_KEEP, 52			# (4 bytes)
++	.set AH_COPY_MAX, 1048576
++	.set AH_DRAIN_MAX, 8388608
++
+ 	.bss
+ 	.balign 64
+@@ -28,4 +44,17 @@ ffn_on:	.skip 4				# -1 unasked, 0, 1
+ graph_left:	.skip 4			# PHI_GGML_GRAPH sub-graphs still to dump (-1 unasked)
+ verbose_on:	.skip 4			# -1 unasked
++ahead_on:	.skip 4			# PHI_GGML_AHEAD: -1 unasked, 0, 1
++	.balign 8
++ah_prev:	.skip 8			# the weight of the multiply before this one
++ah_valid:	.skip 8			# a multiply is issued ahead of its node
++ah_a:	.skip 8				# its weight
++ah_x:	.skip 8				# its activations
++ah_n:	.skip 8
++ah_nb_b:	.skip 8
++ah_m:	.skip 8
++ah_nr:	.skip 8				# its host ranges
++ah_bytes:	.skip 8			# of the activations kept in ah_copy
++ah_taken:	.skip 8			# multiplies that were with the cards before their node
++ah_dropped:	.skip 8			# begun ahead, and not what came
+ 	.balign 64
+ phi_reg:	.skip REG_BYTES
+@@ -51,4 +80,10 @@ ranges:	.skip 34 * 16			# the host's ranges of a block or a pair
+ which:	.skip 34 * 4
+ ffn_args:	.skip FA_BYTES
++	.balign 64
++ah_succ:	.skip AH_SLOTS * AH_BYTES	# what followed each weight last time
++	.balign 64
++ah_copy:	.skip AH_COPY_MAX		# the activations a multiply was issued ahead with
++	.balign 64
++ah_drain:	.skip AH_DRAIN_MAX		# where the results of one nothing asked for go
+ 
+ 	.section .rodata
+@@ -68,4 +103,10 @@ e_offload:	.asciz "PHI_GGML_OFFLOAD"
+ e_graph:	.asciz "PHI_GGML_GRAPH"
+ e_verbose:	.asciz "PHI_GGML_VERBOSE"
++e_ahead:	.asciz "PHI_GGML_AHEAD"
++s_ahead_on:	.asciz "a multiply whose activations are ready is issued ahead of its node (PHI_GGML_AHEAD)"
++s_ahead_off:	.asciz "PHI_GGML_AHEAD needs PHI_GGML_OFFLOAD (without it a multiply is timed from its start and judged)"
++s_ah1:	.asciz "ahead: "
++s_ah2:	.asciz " multiplies were with the cards before their node arrived, "
++s_ah3:	.asciz " begun ahead were not what came"
+ s_no_cpu:	.asciz "no CPU device registered"
+ s_no_cpu_init:	.asciz "the CPU backend would not initialise"
+@@ -116,6 +157,10 @@ card_type:
  	cmpl $GGML_TYPE_BF16, %edi
  	je 17f
 +	cmpl $GGML_TYPE_Q4_0, %edi
@@ -3332,7 +3945,7 @@ index 96cc2b9..c27fe64 100644
 +	ret
  10:	movl $MM_F32, %eax
  	ret
-@@ -199,5 +203,9 @@ weight_readable:
+@@ -199,5 +244,9 @@ weight_readable:
  # ffn_enabled: PHI_GGML_FFN=1, off under PHI_GGML_OFFLOAD (said once).
  ffn_enabled:
 -	cmpl $-1, ffn_on(%rip)
@@ -3343,8 +3956,282 @@ index 96cc2b9..c27fe64 100644
 +8:	cmpl $-1, ffn_on(%rip)
  	jne 9f
  	pushq %rbx
+@@ -1691,6 +1740,110 @@ find_quad:
+ 	ret
+ 
++# ahead_enabled: PHI_GGML_AHEAD=1 under PHI_GGML_OFFLOAD (asked once,
++# and said once either way); eax.
++ahead_enabled:
++	cmpl $-1, ahead_on(%rip)
++	jne 9f
++	pushq %rbx
++	leaq e_ahead(%rip), %rdi
++	xorl %esi, %esi
++	call env_u64
++	movl %eax, %ebx
++	testl %ebx, %ebx
++	jz 1f
++	movl $1, %ebx
++	leaq e_offload(%rip), %rdi
++	xorl %esi, %esi
++	call env_u64
++	testl %eax, %eax
++	jnz 2f
++	leaq s_ahead_off(%rip), %rsi
++	call say
++	xorl %ebx, %ebx
++	jmp 1f
++2:	leaq s_ahead_on(%rip), %rsi
++	call say
++1:	movl %ebx, ahead_on(%rip)
++	popq %rbx
++9:	movl ahead_on(%rip), %eax
++	ret
++
++# ah_slot(rdi weight): its entry of ah_succ in rax: the one that has it
++# for a key, else the first empty one of eight from its place, else its
++# place (to be overwritten). Clobbers rcx, rdx, rsi, r8.
++ah_slot:
++	movq %rdi, %rax
++	shrq $14, %rax
++	movq %rdi, %rcx
++	shrq $25, %rcx
++	xorq %rcx, %rax
++	andl $AH_SLOTS - 1, %eax
++	movl %eax, %edx				# its place
++	movl $8, %ecx
++	leaq ah_succ(%rip), %r8
++1:	movl %eax, %esi
++	shlq $6, %rsi
++	addq %r8, %rsi
++	cmpq %rdi, AH_KEY(%rsi)
++	je 2f
++	cmpq $0, AH_KEY(%rsi)
++	je 2f
++	incl %eax
++	andl $AH_SLOTS - 1, %eax
++	decl %ecx
++	jnz 1b
++	movl %edx, %esi
++	shlq $6, %rsi
++	addq %r8, %rsi
++2:	movq %rsi, %rax
++	ret
++
++# ahead_drain: a multiply issued ahead that the node now here is not:
++# its results go to ah_drain, so the card's one request slot (and the
++# window's doorbell lock) is free for what comes; eax 0 or -1.
++ahead_drain:
++	xorl %eax, %eax
++	cmpq $0, ah_valid(%rip)
++	je 9f
++	movq $0, ah_valid(%rip)
++	incq ah_dropped(%rip)
++	subq $8, %rsp
++	leaq ah_drain(%rip), %rdi
++	movq ah_m(%rip), %rsi
++	shlq $2, %rsi
++	call phi_ggml_end
++	addq $8, %rsp
++9:	ret
++
++# ah_report: the scheme's two counts so far, as one line.
++ah_report:
++	subq $8, %rsp
++	call say_begin
++	leaq s_ah1(%rip), %rsi
++	call w_str
++	movq ah_taken(%rip), %rdi
++	call w_dec
++	leaq s_ah2(%rip), %rsi
++	call w_str
++	movq ah_dropped(%rip), %rdi
++	call w_dec
++	leaq s_ah3(%rip), %rsi
++	call w_str
++	call l_end
++	addq $8, %rsp
++	ret
++
+ # run_mul_mat(rdi node): one multiply the plain way: the cards start,
+ # the host's ranges here, the cards' rows gathered; eax 0 or -1.
++#
++# Under PHI_GGML_AHEAD the cards do not wait for the host between two
++# multiplies that read the same activations: when this one is done, the
++# multiply that followed its weight last time is begun at once if it
++# reads the activations this one read (ah_succ, learned at every call),
++# and the node that then arrives finds its request already with the
++# cards. It is that node's only when the weight, the activations'
++# address, their count and stride, the rows, and the activations' bytes
++# (kept in ah_copy) are the ones it was begun with; otherwise its results
++# are dropped (ahead_drain) and the node runs as it always did.
+ run_mul_mat:
+ 	pushq %rbp
+@@ -1710,5 +1863,65 @@ run_mul_mat:
+ 	movl T_TYPE(%r12), %edi
+ 	call card_type
+-	movl %eax, %esi
++	movl %eax, -64(%rbp)			# the card's type
++	call ahead_enabled
++	testl %eax, %eax
++	jz 20f
++	# this multiply follows the last one: remembered under that one's weight
++	movq ah_prev(%rip), %rdi
++	testq %rdi, %rdi
++	jz 11f
++	call ah_slot
++	movq ah_prev(%rip), %rcx
++	movq %rcx, AH_KEY(%rax)
++	movq T_DATA(%r12), %rcx
++	movq %rcx, AH_A(%rax)
++	movq T_DATA(%r13), %rcx
++	movq %rcx, AH_X(%rax)
++	movq T_NE+8(%r12), %rcx
++	movq %rcx, AH_M(%rax)
++	movq T_NE(%r12), %rcx
++	movq %rcx, AH_K(%rax)
++	movq T_NB+8(%r12), %rcx
++	movq %rcx, AH_NB_A(%rax)
++	movl -64(%rbp), %ecx
++	movl %ecx, AH_TYPE(%rax)
++	movl %r14d, AH_KEEP(%rax)
++11:	# is this the multiply that was issued ahead?
++	cmpq $0, ah_valid(%rip)
++	je 20f
++	movq T_DATA(%r12), %rax
++	cmpq ah_a(%rip), %rax
++	jne 15f
++	movq T_DATA(%r13), %rax
++	cmpq ah_x(%rip), %rax
++	jne 15f
++	movq T_NE+8(%r13), %rax
++	cmpq ah_n(%rip), %rax
++	jne 15f
++	movq T_NB+8(%r13), %rax
++	cmpq ah_nb_b(%rip), %rax
++	jne 15f
++	movq T_NE+8(%r12), %rax
++	cmpq ah_m(%rip), %rax
++	jne 15f
++	movq T_DATA(%r13), %rsi			# the activations here against the ones it was begun with
++	leaq ah_copy(%rip), %rdi
++	movq ah_bytes(%rip), %rcx
++	repe cmpsb
++	jne 15f
++	movq $0, ah_valid(%rip)			# it is: its host ranges, then its end
++	incq ah_taken(%rip)
++	movq ah_taken(%rip), %rax		# the count said at 256 and then every 16384
++	cmpq $256, %rax
++	je 12f
++	testq $16383, %rax
++	jnz 13f
++12:	call ah_report
++13:	movq ah_nr(%rip), %r15
++	jmp 21f
++15:	call ahead_drain			# it is not
++	testl %eax, %eax
++	jnz 9f
++20:	movl -64(%rbp), %esi
+ 	movq T_DATA(%r12), %rdi
+ 	movq T_NE+8(%r12), %rdx
+@@ -1728,5 +1941,5 @@ run_mul_mat:
+ 	js 9f
+ 	movq %rax, %r15				# nr
+-	xorl %r14d, %r14d			# r
++21:	xorl %r14d, %r14d			# r
+ 1:	cmpq %r15, %r14
+ 	jge 3f
+@@ -1752,5 +1965,63 @@ run_mul_mat:
+ 	testl %eax, %eax
+ 	jnz 9f
+-	xorl %eax, %eax
++	call ahead_enabled
++	testl %eax, %eax
++	jz 30f
++	# the multiply that followed this weight last time, when it reads the
++	# activations this one read: begun now, ahead of its node
++	movq T_DATA(%r12), %rdi
++	movq %rdi, ah_prev(%rip)
++	call ah_slot
++	movq T_DATA(%r12), %rcx
++	cmpq %rcx, AH_KEY(%rax)
++	jne 30f
++	movq T_DATA(%r13), %rcx
++	cmpq %rcx, AH_X(%rax)
++	jne 30f
++	movq %rax, %r14				# the entry
++	movq T_NE+8(%r13), %rax			# the activations' bytes: n * nb_b, kept for the check
++	imulq T_NB+8(%r13), %rax
++	cmpq $AH_COPY_MAX, %rax
++	ja 30f
++	movq AH_M(%r14), %rcx			# its results' bytes: m * n floats, should they be dropped
++	imulq T_NE+8(%r13), %rcx
++	shlq $2, %rcx
++	cmpq $AH_DRAIN_MAX, %rcx
++	ja 30f
++	movq %rax, ah_bytes(%rip)
++	leaq ah_copy(%rip), %rdi
++	movq T_DATA(%r13), %rsi
++	movq %rax, %rdx
++	call mem_copy
++	movq AH_A(%r14), %rdi
++	movl AH_TYPE(%r14), %esi
++	movq AH_M(%r14), %rdx
++	movq AH_K(%r14), %rcx
++	movq AH_NB_A(%r14), %r8
++	movl AH_KEEP(%r14), %r9d
++	subq $32, %rsp
++	movq T_DATA(%r13), %rax
++	movq %rax, (%rsp)
++	movq T_NE+8(%r13), %rax
++	movq %rax, 8(%rsp)
++	movq T_NB+8(%r13), %rax
++	movq %rax, 16(%rsp)
++	call phi_ggml_begin
++	addq $32, %rsp
++	testq %rax, %rax
++	js 30f					# refused: nothing is with the cards
++	movq %rax, ah_nr(%rip)
++	movq AH_A(%r14), %rax
++	movq %rax, ah_a(%rip)
++	movq AH_M(%r14), %rax
++	movq %rax, ah_m(%rip)
++	movq T_DATA(%r13), %rax
++	movq %rax, ah_x(%rip)
++	movq T_NE+8(%r13), %rax
++	movq %rax, ah_n(%rip)
++	movq T_NB+8(%r13), %rax
++	movq %rax, ah_nb_b(%rip)
++	movq $1, ah_valid(%rip)
++30:	xorl %eax, %eax
+ 	jmp 99f
+ 9:	movl $-1, %eax
+@@ -1778,4 +2049,5 @@ run_ffn:
+ 	movq %rdi, %rbx
+ 	movq %rsi, %r12
++	call ahead_drain			# nothing issued ahead stays with the cards
+ 	movslq Q_GATE(%r12), %rax
+ 	movq (%rbx,%rax,8), %r13		# gate
+@@ -2039,4 +2311,5 @@ run_id_pair:
+ 	movq %rdi, %rbx				# x
+ 	movq %rsi, %r12				# y
++	call ahead_drain			# nothing issued ahead stays with the cards
+ 	movq T_SRC(%rbx), %r13			# w1
+ 	movq T_SRC(%r12), %r14			# w2
+@@ -2173,4 +2446,5 @@ run_mul_mat_id:
+ 	subq $56, %rsp
+ 	movq %rdi, %rbx
++	call ahead_drain			# nothing issued ahead stays with the cards
+ 	movq T_SRC(%rbx), %r12			# src0
+ 	movq T_SRC+8(%rbx), %r13		# src1
+@@ -2719,4 +2993,5 @@ ggml_backend_phi_reg:
+ 	movl $-1, graph_left(%rip)
+ 	movl $-1, verbose_on(%rip)
++	movl $-1, ahead_on(%rip)
+ 1:	call tables_init
+ 	leaq phi_reg(%rip), %rbx
 diff --git a/host/asm/ggml-phi/glue.md b/host/asm/ggml-phi/glue.md
-index d839796..2950a3f 100644
+index d839796..8af727a 100644
 --- a/host/asm/ggml-phi/glue.md
 +++ b/host/asm/ggml-phi/glue.md
 @@ -30,5 +30,5 @@ hands out a backend from a pool of eight (`BE_SLOT`, `BE_USED`).
@@ -3361,6 +4248,75 @@ index d839796..2950a3f 100644
 +  the message the C gave; off while `PHI_GGML_STREAM` is on, since
 +  `K_FFN` names resident slices).
  - views, reshapes, permutes and transposes are ggml's own and pass.
+ 
+@@ -89,4 +90,68 @@ the feed-forward's host part), with `w_elapsed_ms` giving C's `%.3f`
+ of the elapsed milliseconds.
+ 
++## A multiply issued ahead of its node (`PHI_GGML_AHEAD`, 2026-11-09)
++
++ggml hands this backend one sub-graph at a time, and a model's graph
++puts other backends' nodes between two multiplies that read the same
++activations (a layer's `attn_qkv` and `attn_gate` both read `attn_norm`;
++`attn_q`, `attn_v` and `attn_k` likewise): the second is begun only
++after the first one's result has been copied to the GPU, worked on
++there and the scheduler has come back, though its input was there all
++along. With `PHI_GGML_AHEAD=1` the cards do not wait for that.
++
++| step | where | what |
++| --- | --- | --- |
++| learn | `run_mul_mat`, on entry | under the weight of the multiply before this one (`ah_prev`), `ah_succ` keeps this one's weight, activations' address, rows, columns, row stride, card type and `keep`: 2048 entries of 64 bytes by the weight's address (`ah_slot`: eight places tried) |
++| issue ahead | `run_mul_mat`, after `phi_ggml_end` | when the entry under this weight names activations at the address this multiply read: the activations copied to `ah_copy`, `phi_ggml_begin` for that multiply at once, its arguments kept (`ah_a`, `ah_x`, `ah_n`, `ah_nb_b`, `ah_m`, `ah_nr`), `ah_valid` set; the return to ggml leaves its request with the cards |
++| take | `run_mul_mat`, on entry, `ah_valid` set | the node's weight, its activations' address, their count and stride, its rows, and the activations' bytes against `ah_copy` (`repe cmpsb`): all equal, the node skips `phi_ggml_begin` and goes to its host ranges and `phi_ggml_end` |
++| drop | `ahead_drain` | any difference: `phi_ggml_end` into `ah_drain`, and the node runs as it always did; also at the top of `run_ffn`, `run_id_pair` and `run_mul_mat_id`, which ring the cards themselves |
++
++What makes it safe:
++
++- A wrong guess costs a multiply, never a result: the node's request is
++  the one issued ahead only when every argument and every byte of its
++  input is what that request was begun with.
++- `phi_ggml_begin` takes the backend's lock and drops it before it
++  returns (`backend.S`, `begin_common`); between it and `phi_ggml_end`
++  the multiply lives in the backend's statics, as it does inside
++  `run_mul_mat`, and nothing else enters the backend while a graph is
++  computed.
++- The window's doorbell lock stays taken from the request to its reply
++  (`../common/window.md`). Its only other user is a DMA router's fault
++  handler, which is asked for a card's rows when a batch is computed on
++  a GPU from the host's mapping; this backend declines those batches
++  whole, so no fault of that kind falls inside a pass that has a
++  multiply outstanding.
++- A multiply is begun ahead only when its activations are at the
++  address the finished one read, so none is left outstanding at the end
++  of a pass: the next pass's first multiply reads another tensor.
++- It needs `PHI_GGML_OFFLOAD` (`ahead_enabled` says so and stays off
++  without it): outside the offload `phi_ggml_end` times a multiply from
++  its `phi_ggml_begin` and judges the tensor by it, and a request left
++  running across ggml's other work would be counted against its tensor.
++
++The copy is 1 MiB and the drop buffer 8 MiB (`AH_COPY_MAX`,
++`AH_DRAIN_MAX`); a multiply whose activations or results would not fit
++is not begun ahead. `ah_report` says the two counts at 256 multiplies
++taken and then every 16384 (`ahead: N multiplies were with the cards
++before their node arrived, M begun ahead were not what came`).
++
++Measured on card 0 with a 27 B Q4_0 model, one server, the GPU doing
++every node but the multiplies, the cards holding every row of 60
++layers, 64 tokens a run, four runs each, the plain runs first:
++
++| | plain | `PHI_GGML_AHEAD=1` |
++| --- | --- | --- |
++| 64 tokens | 25.979, 25.703, 25.423, 24.791 s | 24.802, 24.055, 24.061, 24.019 s |
++| tokens a second | 2.425 to 2.541 | 2.540 to 2.623 |
++| the card's compute time | 20.09 to 20.18 s | 20.04 to 20.09 s |
++| the output at temperature 0, 24 tokens with the top five log-probabilities of each | the reference (two runs equal) | the same bytes (two runs) |
++
++The mean falls from 25.474 to 24.234 s (5.1 %) with the card's compute
++time unchanged: the time between its multiplies is what shrank, about
++19 ms a token. 16384 multiplies had been taken and none dropped when
++the count was last said. The two sets were not interleaved, and their
++ranges touch (24.791 and 24.802 s).
++
+ ## The host's rows
  
 diff --git a/host/asm/ggml-phi/imports.list b/host/asm/ggml-phi/imports.list
 index f318856..5f96201 100644
@@ -3685,6 +4641,20 @@ index 93f858b..2fa1d4c 100755
 +    PHI_VPU_ARGS="-S 1 -C $((cores - 2)) -T 2 -R 128 -s 1000" "$vpu" -c "$card" start "$cores" > "$logs/worker-$1.txt" 2>&1
  }
  # NAME EXPECTED_OK EXTRA_ENV BIN [ARGS]: a fresh worker, the program under
+diff --git a/scripts/phi-ggml.md b/scripts/phi-ggml.md
+index 2afd9dc..176baff 100644
+--- a/scripts/phi-ggml.md
++++ b/scripts/phi-ggml.md
+@@ -55,4 +55,9 @@ every one; `tools/expert-placement.md` makes the file from a run with
+ `PHI_GGML_SPIN_US` (the wait for a card spins this many microseconds,
+ then sleeps between looks; unset, it spins throughout),
++`PHI_GGML_AHEAD` (1, with the offload: when a multiply is done, the one
++that followed its weight last time is begun at once if it reads the same
++activations, so the cards work while the host and a GPU handle the
++result before; a guess that is wrong is dropped and costs no result:
++`host/asm/ggml-phi/glue.md`),
+ `PHI_GGML_JUDGE` (0: no tensor is moved by its timings; with
+ `PHI_GGML_PP_ADAPT=0` the same request gives the same output),
 diff --git a/scripts/phi-vpu.md b/scripts/phi-vpu.md
 index a71e5ac..6f0dcd6 100644
 --- a/scripts/phi-vpu.md
@@ -3788,12 +4758,400 @@ index 6a556d6..82e072e 100644
 +    { "GGML_TYPE_Q4_0", GGML_TYPE_Q4_0 },
      { "GGML_TYPE_Q8_0", GGML_TYPE_Q8_0 },
      { "GGML_TYPE_Q4_K", GGML_TYPE_Q4_K },
+diff --git a/tools/q4_0-bench.S b/tools/q4_0-bench.S
+new file mode 100644
+index 0000000..f0b4438
+--- /dev/null
++++ b/tools/q4_0-bench.S
+@@ -0,0 +1,258 @@
++# q4_0-bench.S: cycles per call of the Q4_0 one-row kernels and of their parts,
++# one thread, every operand in the first-level cache (the stride argument
++# is 0, so the kernels' prefetches hit the lines they are working on).
++# Static, no libc; prints "name cycles-per-call" lines. Runs on the card.
++	.include "mvex.inc"
++
++	.set N, 200000
++
++	.bss
++	.balign 64
++wblk:	.skip 4096			# a weight superblock (and what follows it)
++xs:	.skip 4096			# activations / a prepared superblock
++acc:	.skip 512
++scratch:	.skip 512
++line:	.skip 64
++
++	.data
++	.balign 64
++consts:	.float 16.0, 4.0, 2.0
++	.float 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125, 0.00390625
++	.float 8.0
++	.fill 4, 4, 0
++
++	.text
++# say(rsi name, rax value): "name value\n" to standard output.
++say:
++	pushq %rbx
++	pushq %r12
++	movq %rax, %r12
++	leaq line(%rip), %rbx
++	xorl %ecx, %ecx
++1:	movb (%rsi,%rcx), %al
++	testb %al, %al
++	jz 2f
++	movb %al, (%rbx,%rcx)
++	incq %rcx
++	jmp 1b
++2:	movb $' ', (%rbx,%rcx)
++	incq %rcx
++	leaq 20(%rbx,%rcx), %rdi		# digits written backwards from here
++	movq %rdi, %r8
++	movq %r12, %rax
++	movl $10, %r9d
++3:	xorl %edx, %edx
++	divq %r9
++	addb $'0', %dl
++	decq %rdi
++	movb %dl, (%rdi)
++	testq %rax, %rax
++	jnz 3b
++4:	cmpq %r8, %rdi
++	jae 5f
++	movb (%rdi), %al
++	movb %al, (%rbx,%rcx)
++	incq %rcx
++	incq %rdi
++	jmp 4b
++5:	movb $'\n', (%rbx,%rcx)
++	incq %rcx
++	movl $1, %eax
++	movl $1, %edi
++	movq %rbx, %rsi
++	movq %rcx, %rdx
++	syscall
++	popq %r12
++	popq %rbx
++	ret
++
++# TIME name, body: the body N times between two rdtsc, cycles per pass said.
++	.macro TIME name
++	.section .rodata
++7:	.asciz "\name"
++	.text
++	leaq 7b(%rip), %r15
++	movl $N, %r14d
++	rdtsc
++	shlq $32, %rdx
++	orq %rdx, %rax
++	movq %rax, %r13
++	.endm
++	.macro TIME_END
++	decl %r14d
++	jnz 8b
++	rdtsc
++	shlq $32, %rdx
++	orq %rdx, %rax
++	subq %r13, %rax
++	xorl %edx, %edx
++	movl $N, %ecx
++	divq %rcx
++	movq %r15, %rsi
++	call say
++	.endm
++	.macro ARGS
++	leaq wblk(%rip), %rdi
++	leaq xs(%rip), %rsi
++	leaq scratch(%rip), %rcx
++	leaq acc(%rip), %r8
++	leaq consts(%rip), %r9
++	.endm
++
++	.globl _start
++_start:
++	andq $-64, %rsp
++	# weights: bytes 0x53 (lo 3, hi 5), scales a float16 1.0 (0x3c00) per block
++	leaq wblk(%rip), %rdi
++	movl $4096, %ecx
++	movb $0x53, %al
++	rep stosb
++	leaq wblk(%rip), %rdi
++	xorl %ecx, %ecx
++1:	movw $0x3c00, (%rdi,%rcx)
++	addq $18, %rcx
++	cmpq $1152, %rcx
++	jb 1b
++
++	TIME "phi_q4_0_1_(old,_114_ops)"
++8:	ARGS
++	pushq $0
++	call phi_q4_0_1
++	addq $8, %rsp
++	TIME_END
++
++
++	TIME "phi_q4_0_row1p_one_superblock_(6_prefetch)"
++8:	ARGS
++	movl $1, %edx
++	xorl %ecx, %ecx				# no jump: the prefetch stays on these lines
++	call phi_q4_0_row1p
++	TIME_END
++
++	TIME "empty_call_and_args"
++8:	ARGS
++	call nothing
++	TIME_END
++
++	TIME "16_unpack_loads_uint8_(4_lo_then_4_hi)"
++8:	ARGS
++	.irp g, 0, 72
++	VLOADUNPACKLPS zmm8, rdi, (\g+2), conv=CV_U8
++	VLOADUNPACKLPS zmm9, rdi, (\g+20), conv=CV_U8
++	VLOADUNPACKLPS zmm10, rdi, (\g+38), conv=CV_U8
++	VLOADUNPACKLPS zmm11, rdi, (\g+56), conv=CV_U8
++	VLOADUNPACKHPS zmm8, rdi, (\g+66), conv=CV_U8
++	VLOADUNPACKHPS zmm9, rdi, (\g+84), conv=CV_U8
++	VLOADUNPACKHPS zmm10, rdi, (\g+102), conv=CV_U8
++	VLOADUNPACKHPS zmm11, rdi, (\g+120), conv=CV_U8
++	.endr
++	TIME_END
++
++	TIME "8_unpack_lo_only_uint8"
++8:	ARGS
++	.irp g, 0, 72
++	VLOADUNPACKLPS zmm8, rdi, (\g+2), conv=CV_U8
++	VLOADUNPACKLPS zmm9, rdi, (\g+20), conv=CV_U8
++	VLOADUNPACKLPS zmm10, rdi, (\g+38), conv=CV_U8
++	VLOADUNPACKLPS zmm11, rdi, (\g+56), conv=CV_U8
++	.endr
++	TIME_END
++
++	TIME "8_aligned_loads_uint8_(vmovaps)"
++8:	ARGS
++	.irp g, 0, 64
++	VMOVAPS zmm8, rdi, (\g), conv=CV_U8
++	VMOVAPS zmm9, rdi, (\g+16), conv=CV_U8
++	VMOVAPS zmm10, rdi, (\g+32), conv=CV_U8
++	VMOVAPS zmm11, rdi, (\g+48), conv=CV_U8
++	.endr
++	TIME_END
++
++	TIME "8_vbroadcastss_float16"
++8:	ARGS
++	.irp g, 0, 72
++	VBROADCASTSS zmm16, rdi, (\g), conv=CV_F16
++	VBROADCASTSS zmm17, rdi, (\g+18), conv=CV_F16
++	VBROADCASTSS zmm18, rdi, (\g+36), conv=CV_F16
++	VBROADCASTSS zmm19, rdi, (\g+54), conv=CV_F16
++	.endr
++	TIME_END
++
++	TIME "8_vmulps_1to16_and_8_vrndfxpntps"
++8:	ARGS
++	.rept 2
++	VMULPS zmm12, zmm8, r9, 24, conv=CV_1TO16
++	VMULPS zmm13, zmm9, r9, 24, conv=CV_1TO16
++	VMULPS zmm14, zmm10, r9, 24, conv=CV_1TO16
++	VMULPS zmm15, zmm11, r9, 24, conv=CV_1TO16
++	VRNDFXPNTPS zmm12, zmm12, 1
++	VRNDFXPNTPS zmm13, zmm13, 1
++	VRNDFXPNTPS zmm14, zmm14, 1
++	VRNDFXPNTPS zmm15, zmm15, 1
++	.endr
++	TIME_END
++
++	TIME "8_vmulps_1to16_only"
++8:	ARGS
++	.rept 2
++	VMULPS zmm12, zmm8, r9, 24, conv=CV_1TO16
++	VMULPS zmm13, zmm9, r9, 24, conv=CV_1TO16
++	VMULPS zmm14, zmm10, r9, 24, conv=CV_1TO16
++	VMULPS zmm15, zmm11, r9, 24, conv=CV_1TO16
++	.endr
++	TIME_END
++
++	TIME "16_fma_with_memory_operands"
++8:	ARGS
++	.irp g, 0, 512
++	VMULPS zmm8, zmm8, rsi, (\g)
++	VMULPS zmm9, zmm9, rsi, (\g+128)
++	VMULPS zmm10, zmm10, rsi, (\g+256)
++	VMULPS zmm11, zmm11, rsi, (\g+384)
++	VFMADD231PS zmm8, zmm12, rsi, (\g+64)
++	VFMADD231PS zmm9, zmm13, rsi, (\g+192)
++	VFMADD231PS zmm10, zmm14, rsi, (\g+320)
++	VFMADD231PS zmm11, zmm15, rsi, (\g+448)
++	.endr
++	TIME_END
++
++	TIME "8_vsubps_4to16"
++8:	ARGS
++	.irp g, 0, 64
++	VSUBPS zmm8, zmm8, rsi, (1024+\g), conv=CV_4TO16
++	VSUBPS zmm9, zmm9, rsi, (1040+\g), conv=CV_4TO16
++	VSUBPS zmm10, zmm10, rsi, (1056+\g), conv=CV_4TO16
++	VSUBPS zmm11, zmm11, rsi, (1072+\g), conv=CV_4TO16
++	.endr
++	TIME_END
++
++	TIME "8_fma_register"
++8:	ARGS
++	.rept 2
++	VFMADD231PS zmm0, zmm8, zmm16
++	VFMADD231PS zmm1, zmm9, zmm17
++	VFMADD231PS zmm2, zmm10, zmm18
++	VFMADD231PS zmm3, zmm11, zmm19
++	.endr
++	TIME_END
++
++	TIME "8_prefetches_of_lines_in_L1"
++8:	ARGS
++	VPREFETCH0 rdi, 0
++	VPREFETCH0 rdi, 64
++	VPREFETCH0 rdi, 128
++	VPREFETCH0 rdi, 192
++	VPREFETCH1 rdi, 0
++	VPREFETCH1 rdi, 64
++	VPREFETCH1 rdi, 128
++	VPREFETCH1 rdi, 192
++	TIME_END
++
++	movl $60, %eax
++	xorl %edi, %edi
++	syscall
++
++nothing:
++	ret
++
++	.include "q4_0.S"		# tools/q4_0-kernels.c's output (q4_0-bench.sh makes it)
+diff --git a/tools/q4_0-bench.md b/tools/q4_0-bench.md
+new file mode 100644
+index 0000000..a5f0449
+--- /dev/null
++++ b/tools/q4_0-bench.md
+@@ -0,0 +1,62 @@
++# q4_0-bench.S, q4_0-bench.sh
++
++Two card programs that time the Q4_0 one-row kernels outside the
++worker, and the script that builds and runs them. They exist because
++the service's own numbers could not say why a kernel with a third
++fewer instructions was no faster (`card/vpu/rows.md`, "Q4_0 against one
++row": the answer was in the worker's trace, but these ruled out the
++instructions and the memory first).
++
++```
++tools/q4_0-bench.sh OUT_DIR [CARD]
++```
++
++The card must have no other program on it (a parked worker is fine; a
++serving one is not). The script generates the kernels
++(`tools/q4_0-kernels.c`), builds, puts three binaries in the card's
++`/tmp`, runs them through `phi`, and removes them.
++
++## q4_0-bench.S
++
++One thread, 200000 calls of each case between two `rdtsc`, every
++operand in the first-level cache (a kernel's stride argument is 0, so
++its prefetches hit the lines it is working on). It prints
++`name cycles` lines; the name's underscores stand for spaces. Static,
++no C library: `_start`, `write` and `exit` by system call.
++
++Measured on card 0 (a 7120A), 2026-11-09, the script run twice
++(`OUT_DIR/q4_0-bench.log`; a run takes 3.5 s in all):
++
++| case | cycles a call |
++| --- | --- |
++| `phi_q4_0_1`, one superblock (114 vector operations) | 306, 306 |
++| `phi_q4_0_row1p`, one superblock (72 and six prefetches) | 204, 204 |
++| an empty call with its five arguments | 11, 11 |
++| 16 unpack loads `{uint8}` (four low halves, then four high) | 40, 40 |
++| 8 low halves only | 24, 24 |
++| 8 aligned `vmovaps {uint8}` | 24, 24 |
++| 8 `vbroadcastss {float16}` | 24, 24 |
++| 8 `vmulps {1to16}` and 8 `vrndfxpntps` | 40, 40 |
++| 8 `vmulps {1to16}` | 24, 24 |
++| 16 multiplies and FMAs with memory operands | 40, 40 |
++| 8 `vsubps {4to16}` | 24, 24 |
++| 8 register FMAs | 24, 24 |
++| 8 prefetches of lines already in the cache | 24, 24 |
++
++The row kernel measured 196 and 201 before it had its jump argument
++(the compare and the add that steer the prefetch pointer are the
++difference), and `phi_q4_0_1` 324 in one earlier run.
++
++Eight vector operations of any kind are about 13 cycles past the call:
++a lone thread issues one about every other cycle, and nothing here is
++slower than that.
++
++## The streams
++
++`q4_0-stream.S` (its own document) is run alone for the prefetch
++distances and, built with an 8 MiB buffer, as one to four streams on
++each of 40 cores, pinned with the card's `taskset` to hardware threads
++in the pool's order (0, 3, 1, 2). Each stream is a process with a
++prepared row of its own, which the worker's threads of a core do not
++have (`q4_0-stream.md` has the numbers and what they do and do not say
++about the worker).
+diff --git a/tools/q4_0-bench.sh b/tools/q4_0-bench.sh
+new file mode 100755
+index 0000000..cc484e4
+--- /dev/null
++++ b/tools/q4_0-bench.sh
+@@ -0,0 +1,50 @@
++#!/usr/bin/env bash
++# q4_0-bench.sh OUT_DIR [CARD]: builds the two Q4_0 one-row benchmarks
++# (q4_0-bench.S: the kernels and their parts on first-level-cache data;
++# q4_0-stream.S: the row kernel streaming a weight buffer at several
++# prefetch distances) and runs them on a card through `phi`. Needs GNU
++# as and ld, tcc, and a card with no other program on it.
++#
++#   OUT_DIR/q4_0-bench.log    cycles per call
++#   OUT_DIR/q4_0-stream.log   tenths of a cycle per superblock
++#   OUT_DIR/q4_0-many.log     the row kernel as 1 to 4 streams a core on 40 cores
++set -euo pipefail
++out=${1:?usage: q4_0-bench.sh OUT_DIR [CARD]}
++card=${2:-0}
++here=$(cd "$(dirname "$0")" && pwd)
++vpu=$here/../card/vpu
++mkdir -p "$out"
++tcc -run "$here/q4_0-kernels.c" > "$out/q4_0.S"
++
++# the row kernel alone, then one copy per prefetch pair (0: none)
++awk '/^# phi_q4_0_row1p:/ { p = 1 } p { print } /size phi_q4_0_row1p,/ { p = 0 }' "$out/q4_0.S" > "$out/row.S"
++variant() {     # name, first-level distance, second-level distance
++    sed -e "s/phi_q4_0_row1p/$1/g" "$out/row.S" | awk -v a="$2" -v b="$3" '
++        /lea 576\(%rdi\), %r10/ { printf "    lea %d(%%rdi), %%r10\n", (a == 0 ? 576 : a); next }
++        /VPREFETCH0 r10, / { if (a == 0) next }
++        /VPREFETCH1 rdi, / { if (b == 0) next; split($0, f, ","); printf "\tVPREFETCH1 rdi, %d\n", f[2] - 2304 + b; next }
++        { print }'
++}
++{ variant kv_none 0 0; variant kv_576_2304 576 2304; variant kv_288_1152 288 1152
++  variant kv_1152_4608 1152 4608; variant kv_1152_8640 1152 8640; variant kv_2304_11520 2304 11520
++  variant kv_0_2304 0 2304; variant kv_576_0 576 0; } > "$out/q4_0-variants.S"
++
++build() {       # source, binary, extra assembler arguments
++    as --64 "${@:3}" -I "$vpu" -I "$out" -o "$out/$2.o" "$here/$1"
++    ld -static -nostdlib -e _start -z noexecstack -o "$out/$2" "$out/$2.o"
++}
++build q4_0-bench.S q4_0-bench
++build q4_0-stream.S q4_0-stream
++build q4_0-stream.S q4_0-stream8 --defsym BIG=8388608
++
++for b in q4_0-bench q4_0-stream q4_0-stream8; do
++    phi -c "$card" put "$out/$b" "/tmp/$b" < /dev/null > /dev/null
++done
++phi -c "$card" run sh -c 'chmod +x /tmp/q4_0-bench; /tmp/q4_0-bench' < /dev/null > "$out/q4_0-bench.log"
++phi -c "$card" run sh -c 'chmod +x /tmp/q4_0-stream; /tmp/q4_0-stream' < /dev/null > "$out/q4_0-stream.log"
++# 1 to 4 streams on each of 40 cores (hardware threads in the pool's order 0, 3, 1, 2)
++phi -c "$card" run sh -c 'chmod +x /tmp/q4_0-stream8
++for per in 1 2 3 4; do i=0; while [ $i -lt 40 ]; do n=0; for h in 1 4 2 3; do n=$((n + 1)); if [ $n -le $per ]; then taskset -c $((4 * i + h)) /tmp/q4_0-stream8 > /tmp/o.$i.$h & fi; done; i=$((i + 1)); done; wait
++echo "$per a core:"; cat /tmp/o.* | grep pf_576_2304_step1; rm -f /tmp/o.*; done' < /dev/null > "$out/q4_0-many.log"
++phi -c "$card" run sh -c 'rm -f /tmp/q4_0-bench /tmp/q4_0-stream /tmp/q4_0-stream8' < /dev/null
++tail -n 3 "$out/q4_0-bench.log"
 diff --git a/tools/q4_0-kernels.c b/tools/q4_0-kernels.c
 new file mode 100644
-index 0000000..3e32d56
+index 0000000..05145f2
 --- /dev/null
 +++ b/tools/q4_0-kernels.c
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,222 @@
 +/* q4_0-kernels.c: prints the six Q4_0 kernels of card/vpu/kernels.S.
 + *
 + *   tcc -run tools/q4_0-kernels.c > q4_0.S
@@ -3907,6 +5265,99 @@ index 0000000..3e32d56
 +    printf("    ret\n    .size %s, .-%s\n", name, name);
 +}
 +
++/* phi_q4_0_row1p(row rdi, prepared rsi, ns rdx, acc r8, consts r9): a
++ * whole Q4_0 weight row of ns superblocks against one prepared
++ * activation row (card/vpu/rows.S, q4_0_prepare): per superblock 1152
++ * bytes, for block i the vectors x0 = x[32 i..] at 128 i and
++ * y = x[32 i + 16..] - 16 x0 at 128 i + 64, and four floats p at
++ * 1024 + 16 i with 4 sum(p) = 8 sum(x[32 i..32 i + 31]). With b the
++ * block's bytes and hi = floor(b / 16),
++ *
++ *   sum (lo - 8) x0 + (hi - 8) x1  =  sum b x0 + hi y - p{4to16}
++ *
++ * so neither the low nibble nor the q - 8 is computed, and the scale is
++ * one vbroadcastss of its float16: nine vector operations a block where
++ * phi_q4_0_1 has thirteen and a serial chain of sixteen masked loads.
++ * The row is one sequential stream: the lines 576 bytes ahead to the
++ * first-level cache, the lines 2304 bytes ahead to the second. The four
++ * accumulators stay in registers across the row; their sum is added to
++ * the sixteen lanes at acc (so a row may be given in segments).
++ *
++ * rcx is the jump: the distance from the end of these ns superblocks to
++ * the start of the ones the caller gives next (0 when they follow on,
++ * as a thread's whole rows do; a row's distance less 144 ns for a
++ * segment of each row). The first-level prefetch runs four superblocks
++ * ahead through r10 and takes the jump when four are left, so the last
++ * four prefetches of a call fetch the next call's first four. Keeps
++ * every general register but rax, rdx, rsi, rdi, r10. */
++static void kernel_prepared(void)
++{
++    const char *name = "phi_q4_0_row1p";
++    printf("# %s: a Q4_0 weight row, or a segment of one, against 1 prepared activation row\n", name);
++    printf("    .globl %s\n    .type %s, @function\n%s:\n", name, name, name);
++    printf("\tVMOVAPS zmm0, r8, 0\t# vmovaps zmm0, [r8+0]\n");
++    for (int a = 1; a < 4; a++)
++        printf("\tVPXORD zmm%d, zmm%d, zmm%d\t# vpxord zmm%d, zmm%d, zmm%d\n", a, a, a, a, a, a);
++    printf("    lea 576(%%rdi), %%r10\n    cmp $4, %%rdx\n    ja 1f\n    add %%rcx, %%r10\n");
++    printf("1:\n");
++    for (int d = 0; d < 192; d += 64)
++        printf("\tVPREFETCH0 r10, %d\t# vprefetch0 [r10+%d]\n", d, d);
++    for (int d = 0; d < 192; d += 64)
++        printf("\tVPREFETCH1 rdi, %d\t# vprefetch1 [rdi+%d]\n", 2304 + d, 2304 + d);
++
++    /* two batches of four blocks, every stage for the whole batch: zmm8..11
++     * the bytes and then the block's sum, zmm12..15 the high nibbles,
++     * zmm16..19 the scales */
++    for (int g = 0; g < 2; g++) {
++        for (int j = 0; j < 4; j++) {
++            int o = 18 * (4 * g + j) + 2;
++            printf("\tVLOADUNPACKLPS zmm%d, rdi, %d, conv=CV_U8\t# vloadunpacklps zmm%d, [rdi+%d]{uint8}\n",
++                   8 + j, o, 8 + j, o);
++        }
++        for (int j = 0; j < 4; j++) {
++            int o = 18 * (4 * g + j) + 2 + 64;
++            printf("\tVLOADUNPACKHPS zmm%d, rdi, %d, conv=CV_U8\t# vloadunpackhps zmm%d, [rdi+%d]{uint8}\n",
++                   8 + j, o, 8 + j, o);
++        }
++        for (int j = 0; j < 4; j++) {   /* the block's scale, to every lane */
++            int o = 18 * (4 * g + j);
++            printf("\tVBROADCASTSS zmm%d, rdi, %d, conv=CV_F16\t# vbroadcastss zmm%d, [rdi+%d]{float16}\n",
++                   16 + j, o, 16 + j, o);
++        }
++        for (int j = 0; j < 4; j++)     /* b * 2^-4 */
++            printf("\tVMULPS zmm%d, zmm%d, r9, 24, conv=CV_1TO16\t# vmulps zmm%d, zmm%d, [r9+24]{1to16}\n",
++                   12 + j, 8 + j, 12 + j, 8 + j);
++        for (int j = 0; j < 4; j++) {   /* b x0 */
++            int o = 128 * (4 * g + j);
++            printf("\tVMULPS zmm%d, zmm%d, rsi, %d\t# vmulps zmm%d, zmm%d, [rsi+%d]\n",
++                   8 + j, 8 + j, o, 8 + j, 8 + j, o);
++        }
++        for (int j = 0; j < 4; j++)     /* the floor: the high nibble */
++            printf("\tVRNDFXPNTPS zmm%d, zmm%d, 1\t# vrndfxpntps zmm%d, zmm%d, 1\n",
++                   12 + j, 12 + j, 12 + j, 12 + j);
++        for (int j = 0; j < 4; j++) {   /* + hi y */
++            int o = 128 * (4 * g + j) + 64;
++            printf("\tVFMADD231PS zmm%d, zmm%d, rsi, %d\t# vfmadd231ps zmm%d, zmm%d, [rsi+%d]\n",
++                   8 + j, 12 + j, o, 8 + j, 12 + j, o);
++        }
++        for (int j = 0; j < 4; j++) {   /* - p */
++            int o = 1024 + 16 * (4 * g + j);
++            printf("\tVSUBPS zmm%d, zmm%d, rsi, %d, conv=CV_4TO16\t# vsubps zmm%d, zmm%d, [rsi+%d]{4to16}\n",
++                   8 + j, 8 + j, o, 8 + j, 8 + j, o);
++        }
++        for (int j = 0; j < 4; j++)     /* times the scale, into four accumulators */
++            printf("\tVFMADD231PS zmm%d, zmm%d, zmm%d\t# vfmadd231ps zmm%d, zmm%d, zmm%d\n",
++                   j, 8 + j, 16 + j, j, 8 + j, 16 + j);
++    }
++    printf("    add $144, %%rdi\n    add $144, %%r10\n    add $1152, %%rsi\n    dec %%rdx\n");
++    printf("    cmp $4, %%rdx\n    jne 2f\n    add %%rcx, %%r10\n2:\n    test %%rdx, %%rdx\n    jnz 1b\n");
++    printf("\tVADDPS zmm0, zmm0, zmm1\t# vaddps zmm0, zmm0, zmm1\n");
++    printf("\tVADDPS zmm2, zmm2, zmm3\t# vaddps zmm2, zmm2, zmm3\n");
++    printf("\tVADDPS zmm0, zmm0, zmm2\t# vaddps zmm0, zmm0, zmm2\n");
++    printf("\tVMOVAPS_ST r8, 0, zmm0\t# vmovaps [r8+0], zmm0\n");
++    printf("    ret\n    .size %s, .-%s\n", name, name);
++}
++
 +int main(void)
 +{
 +    printf("# The Q4_0 kernels (2026-11-09): the output of tools/q4_0-kernels.c.\n"
@@ -3919,22 +5370,25 @@ index 0000000..3e32d56
 +                printf("\n");           /* a blank line between kernels, none after the last */
 +            kernel(rows, half);
 +        }
++    printf("\n");
++    kernel_prepared();
 +    return 0;
 +}
 diff --git a/tools/q4_0-kernels.md b/tools/q4_0-kernels.md
 new file mode 100644
-index 0000000..ff05358
+index 0000000..25944b1
 --- /dev/null
 +++ b/tools/q4_0-kernels.md
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,90 @@
 +# q4_0-kernels.c
 +
-+Prints the six Q4_0 kernels of `card/vpu/kernels.S`: `phi_q4_0_1`,
++Prints the seven Q4_0 kernels of `card/vpu/kernels.S`: `phi_q4_0_1`,
 +`phi_q4_0_4`, `phi_q4_0_8` and their float16-activation twins
-+`phi_q4_0_1h`, `phi_q4_0_4h`, `phi_q4_0_8h`, in that file's line format
++`phi_q4_0_1h`, `phi_q4_0_4h`, `phi_q4_0_8h`, and `phi_q4_0_row1p` (below,
++"The prepared row"), in that file's line format
 +(the `mvex.inc` macro that assembles, a tab, the instruction in Intel
 +syntax as a comment). Its output was appended to `kernels.S` on
-+2026-11-09; the program stays as the record of how those 1263 lines were
++2026-11-09; the program stays as the record of how those 1371 lines were
 +made and as the way to make them again.
 +
 +```
@@ -3977,6 +5431,30 @@ index 0000000..ff05358
 +eight-row kernels. A stage is written for the whole batch of four blocks
 +before the next stage, so dependent instructions sit a batch apart.
 +
++## The prepared row
++
++`phi_q4_0_row1p(row rdi, prepared rsi, ns rdx, jump rcx, acc r8, consts r9)`
++takes `ns` superblocks of a weight row (the whole row, or a segment of
++it) against one activation row that
++`card/vpu/rows.S` (`q4_0_prepare`) has rewritten, and is what a
++one-row request runs, for rows of up to 32768 weights
++(`card/vpu/rows.md`, "Q4_0 against one row"). The identity, the
++prepared layout and the measurements are in `card/vpu/kernels.md`,
++"Q4_0, one row, prepared". What the generator emits (`kernel_prepared`):
++
++| step | instructions |
++| --- | --- |
++| the accumulators | `vmovaps zmm0, [r8]`, zmm1..3 cleared, once a row |
++| the stream | three `vprefetch0` through `r10`, which starts at `rdi + 576`, advances with the row and takes the jump (`rcx`: the distance from the end of these superblocks to the ones the caller gives next, 0 when they follow on) when four superblocks are left; three `vprefetch1` at `rdi + 2304`; each superblock |
++| per batch of four blocks | four `vloadunpacklps` then four `vloadunpackhps` `{uint8}` (zmm8..11); four `vbroadcastss {float16}` of the scales (zmm16..19); `vmulps` by 2^-4 into zmm12..15; `vmulps zmm8.., [rsi + 128 i]`; `vrndfxpntps` round down; `vfmadd231ps zmm8.., zmm12.., [rsi + 128 i + 64]`; `vsubps zmm8.., [rsi + 1024 + 16 i]{4to16}`; `vfmadd231ps` into zmm0..3 by the scale |
++| the loop | `rdi` + 144, `r10` + 144, `rsi` + 1152, `rdx` - 1 |
++| the end | the four accumulators added (zmm0 began as `[r8]`, so a row given in segments accumulates), stored to `[r8]` |
++
++The two halves of an unpack pair are a batch apart (the high half
++merges into the register the low half wrote), and so is every other
++dependent pair. It keeps every general register but `rax`, `rdx`,
++`rsi`, `rdi` and `r10`.
++
 +## Checks
 +
 +- Assembled alone with `mvex.inc`: 11136 bytes of text, six symbols.
@@ -3987,6 +5465,240 @@ index 0000000..ff05358
 +  mixture, several-matrix and fused feed-forward case ok. The card's
 +  compute time at 4096 x 5120: float32 activations 139.3 GFLOP/s at one
 +  row, 246.4 at eight, 251.3 at sixty-four; float16 126.4, 452.9, 490.3.
++- The row kernel (2026-11-09): the worker with it is 272904 bytes
++  (`card/vpu/build.sh`, audit `0 illegal, 0 suspect, 8349 KNC vector`);
++  `matmul-check --only q4_0` passes with `--act 0` and `--act 1` at 57,
++  114, 121, 181 and 241 threads; its cycle counts and the service's
++  times are in `card/vpu/kernels.md` and `tools/q4_0-bench.md`.
+diff --git a/tools/q4_0-stream.S b/tools/q4_0-stream.S
+new file mode 100644
+index 0000000..d89adcc
+--- /dev/null
++++ b/tools/q4_0-stream.S
+@@ -0,0 +1,129 @@
++# q4_0-stream.S: the whole-row Q4_0 kernel streaming a weight buffer (BIG
++# bytes, 64 MiB unless the assembler is given --defsym BIG=) on
++# one thread, rows of 20 superblocks (2880 bytes), against one prepared
++# activation row in the first-level cache; cycles per superblock for each
++# prefetch variant, rows consecutive and every other row.
++	.include "mvex.inc"
++	.ifndef BIG
++	.set BIG, 67108864
++	.endif
++	.set ROWB, 2880
++	.bss
++	.balign 4096
++big:	.skip BIG + 65536
++	.balign 64
++prep:	.skip 23040
++acc:	.skip 64
++line:	.skip 64
++	.data
++	.balign 64
++consts:	.float 16.0, 4.0, 2.0
++	.float 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125, 0.00390625
++	.float 8.0
++	.fill 4, 4, 0
++	.text
++say:
++	pushq %rbx
++	pushq %r12
++	movq %rax, %r12
++	leaq line(%rip), %rbx
++	xorl %ecx, %ecx
++1:	movb (%rsi,%rcx), %al
++	testb %al, %al
++	jz 2f
++	movb %al, (%rbx,%rcx)
++	incq %rcx
++	jmp 1b
++2:	movb $' ', (%rbx,%rcx)
++	incq %rcx
++	leaq 20(%rbx,%rcx), %rdi
++	movq %rdi, %r8
++	movq %r12, %rax
++	movl $10, %r9d
++3:	xorl %edx, %edx
++	divq %r9
++	addb $'0', %dl
++	decq %rdi
++	movb %dl, (%rdi)
++	testq %rax, %rax
++	jnz 3b
++4:	cmpq %r8, %rdi
++	jae 5f
++	movb (%rdi), %al
++	movb %al, (%rbx,%rcx)
++	incq %rcx
++	incq %rdi
++	jmp 4b
++5:	movb $'\n', (%rbx,%rcx)
++	incq %rcx
++	movl $1, %eax
++	movl $1, %edi
++	movq %rbx, %rsi
++	movq %rcx, %rdx
++	syscall
++	popq %r12
++	popq %rbx
++	ret
++
++# STREAM name, kern, step: the rows of big, every step-th, through kern;
++# cycles per superblock, in tenths.
++	.macro STREAM name, kern, step
++	.section .rodata
++7:	.asciz "\name"
++	.text
++	leaq big(%rip), %r12
++	leaq big + BIG(%rip), %r14
++	xorl %r15d, %r15d
++	rdtsc
++	shlq $32, %rdx
++	orq %rdx, %rax
++	movq %rax, %r13
++8:	movq %r12, %rdi
++	leaq prep(%rip), %rsi
++	movl $20, %edx
++	leaq acc(%rip), %r8
++	leaq consts(%rip), %r9
++	movl $ROWB * (\step - 1), %ecx		# the jump to the next row taken
++	call \kern
++	incq %r15
++	addq $ROWB * \step, %r12
++	cmpq %r14, %r12
++	jb 8b
++	rdtsc
++	shlq $32, %rdx
++	orq %rdx, %rax
++	subq %r13, %rax
++	imulq $10, %rax, %rax
++	imulq $20, %r15, %rcx
++	xorl %edx, %edx
++	divq %rcx
++	leaq 7b(%rip), %rsi
++	call say
++	.endm
++
++	.globl _start
++_start:
++	andq $-64, %rsp
++	leaq big(%rip), %rdi
++	movl $BIG + 65536, %ecx
++	movb $0x53, %al
++	rep stosb
++	leaq prep(%rip), %rdi			# written, so it is 23040 bytes of its own and not the shared zero page
++	movl $23040 / 4, %ecx
++	movl $0x3f800000, %eax
++	rep stosl
++	STREAM "none_step1", kv_none, 1
++	STREAM "pf_576_2304_step1", kv_576_2304, 1
++	STREAM "pf_288_1152_step1", kv_288_1152, 1
++	STREAM "pf_1152_4608_step1", kv_1152_4608, 1
++	STREAM "pf_1152_8640_step1", kv_1152_8640, 1
++	STREAM "pf_2304_11520_step1", kv_2304_11520, 1
++	STREAM "pf_L2only_2304_step1", kv_0_2304, 1
++	STREAM "pf_L1only_576_step1", kv_576_0, 1
++	STREAM "none_step2", kv_none, 2
++	STREAM "pf_576_2304_step2", kv_576_2304, 2
++	STREAM "pf_1152_8640_step2", kv_1152_8640, 2
++	movl $60, %eax
++	xorl %edi, %edi
++	syscall
++	.include "q4_0-variants.S"	# q4_0-bench.sh: the row kernel at each prefetch distance
+diff --git a/tools/q4_0-stream.md b/tools/q4_0-stream.md
+new file mode 100644
+index 0000000..6948d0a
+--- /dev/null
++++ b/tools/q4_0-stream.md
+@@ -0,0 +1,88 @@
++# q4_0-stream.S
++
++`phi_q4_0_row1p` streaming a weight buffer on one thread: rows of 20
++superblocks (2880 bytes, a row of 5120 Q4_0 weights) against one
++prepared activation row, the buffer written first so its pages are its
++own. It prints, per case, tenths of a cycle per superblock. The cases
++are the row kernel at eight prefetch settings (`q4_0-variants.S`, made
++by `tools/q4_0-bench.sh` from the generator's output by rewriting the
++two displacements), over consecutive rows and over every other row.
++
++```
++as --64 [--defsym BIG=8388608] -I card/vpu -I OUT_DIR -o q4_0-stream.o tools/q4_0-stream.S
++```
++
++`BIG` is the buffer, 64 MiB unless given. Built and run by
++`tools/q4_0-bench.sh` (`tools/q4_0-bench.md`).
++
++Measured on card 0 (a 7120A), 2026-11-09, `tools/q4_0-bench.sh` run
++twice (`OUT_DIR/q4_0-stream.log`), a buffer of 4 KiB pages, cycles a
++superblock:
++
++| first-level prefetch, second-level prefetch | consecutive rows | every other row |
++| --- | --- | --- |
++| none, none | 248.6, 249.9 | 311.9, 314.4 |
++| +576, +2304 (as built) | 202.2, 203.6 | 226.7, 228.7 |
++| +288, +1152 | 201.7, 202.7 | |
++| +1152, +4608 | 221.8, 203.9 | |
++| +1152, +8640 | 202.0, 204.5 | 289.2, 292.6 |
++| +2304, +11520 | 203.8, 224.6 | |
++| none, +2304 | 245.7, 247.1 | |
++| +576, none | 195.6, 200.3 | |
++
++The first-level prefetch is what hides the stream, at any of the
++distances tried; the second-level one adds nothing to it. One case in
++each pass is about 20 cycles above its other pass (221.8, 224.6), a
++different case each time: run-to-run noise of that size exists here.
++
++Every other row costs the kernel as built 24.5 to 25.1 cycles a
++superblock more than consecutive rows. The kernel is told the jump to
++the next row it will take and turns its prefetch pointer four
++superblocks before a row's end, which is the +576 distance; a variant
++that prefetches further ahead (+1152) has already run past the row by
++then and pays 87 to 88 cycles. The service gives a thread consecutive
++rows wherever it can.
++
++## Several streams on a core
++
++Built with an 8 MiB buffer, one to four processes on each of 40 cores
++(`OUT_DIR/q4_0-many.log`; the median of the streams, both runs):
++
++| streams a core | cycles a superblock, each | superblocks per 1000 cycles, a core |
++| --- | --- | --- |
++| 1 | 201.3, 200.5 | 4.97, 4.99 |
++| 2 | 560.5, 560.5 | 3.57, 3.57 |
++| 3 | 639.2, 638.4 | 4.69, 4.70 |
++| 4 | 721.0, 719.6 | 5.55, 5.56 |
++
++Two streams on a core do less together than one alone. Each process
++has its own prepared row of 23040 bytes, so two put 46080 bytes of
++activations through a 32 KiB first-level cache and every superblock's
++eighteen lines of activations come from the second level. This is the
++reason the worker keeps one prepared row a core, written by both of
++its threads (`card/vpu/rows.md`, "Q4_0 against one row"), and it is
++not the worker's case: there the two threads read the same 23040
++bytes. In the first run one of the 40 single streams took 549.6 (the
++others 199.6 to 206.6); the cause is not established, and the second
++run's slowest was 207.9.
++
++## With the activations free
++
++An earlier build of this program did not write its prepared row. An
++unwritten row is one zero page shared by every process, 4 KiB of cache
++where a real row is 23040 bytes, so those runs measured the stream
++with the activations costing nothing (the same day, two passes):
++
++| | consecutive rows | every other row |
++| --- | --- | --- |
++| none, none | 237.3, 237.2 | 320.6, 321.6 |
++| +576, +2304, before the jump argument | 186.4, 186.4 | 263.4, 263.7 |
++| none, +2304 | 230.6, 230.7 | |
++
++A real row therefore costs one stream about 16 cycles a superblock
++(186.4 against 202.2 to 203.6). As many such streams at once, one a
++core: 8 streams 187.4 each, 28 streams 184.2, 57 streams 184.3. On 40
++cores: one a core 185.6 each (5.39 superblocks per 1000 cycles a
++core), two 200.7 (9.96), three 275.3 (10.90), four 368.4 (10.86).
++The worker's two threads of a core, sharing one real row, lie between
++this table and the one above; neither run is that case.
 diff --git a/tools/vpu-layout-check.c b/tools/vpu-layout-check.c
 index dade4d7..79ade7e 100644
 --- a/tools/vpu-layout-check.c
